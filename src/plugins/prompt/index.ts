@@ -8,6 +8,7 @@
 
 import { definePlugin } from "../../kernel";
 import type { PluginContext } from "../../kernel/types";
+import type { HookBusService } from "../hooks";
 
 export interface PromptSection {
   /** Stable name; later sections with the same name replace earlier ones. */
@@ -30,12 +31,13 @@ class PromptServiceImpl implements PromptService {
   constructor(private readonly ctx: PluginContext) {}
 
   async assemble(): Promise<string> {
+    const hooks = this.ctx.get("hooks") as HookBusService;
     // No built-in sections: contributors push theirs via the waterfall.
     const payload: PromptAssemble = {
       cwd: this.ctx.cwd,
       sections: [],
     };
-    const assembled = await this.ctx.waterfall<PromptAssemble>("prompt/assemble", payload);
+    const assembled = await hooks.waterfall<PromptAssemble>("prompt/assemble", payload);
 
     // Deduplicate by name keeping the last occurrence, then join into markdown sections.
     const byName = new Map<string, PromptSection>();
@@ -55,6 +57,7 @@ function capitalize(name: string): string {
 
 export const promptPlugin = definePlugin({
   name: "prompt",
+  inject: ["hooks"],
   provides: ["systemPrompt"],
   apply(ctx: PluginContext) {
     return ctx.effect(() => ctx.provide("systemPrompt", new PromptServiceImpl(ctx)), "prompt.provide");

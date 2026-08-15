@@ -20,6 +20,7 @@ import type { SessionHandle, SessionService } from "../session";
 import type { ToolRegistry } from "../tools/registry";
 import type { LlmService } from "../llm";
 import type { PromptService } from "../prompt";
+import type { HookBusService } from "../hooks";
 
 export type AgentEvent =
   | { type: "agent_start"; sessionId?: string; model?: string }
@@ -76,6 +77,7 @@ class AgentServiceImpl implements AgentService {
   }
 
   async *run(options: AgentRunOptions): AsyncIterable<AgentEvent> {
+    const hooks = this.ctx.get("hooks") as HookBusService;
     const llm = this.ctx.get("llm") as LlmService;
     const tools = this.ctx.get("tools") as ToolRegistry;
     const prompt = this.ctx.get("systemPrompt") as PromptService;
@@ -115,7 +117,7 @@ class AgentServiceImpl implements AgentService {
         if (text) await this.record(session, messages, { role: "user", content: `[steering] ${text}` });
       }
 
-      const request = await this.ctx.waterfall<BeforeLoopRequest>("loop/before-request", {
+      const request = await hooks.waterfall<BeforeLoopRequest>("loop/before-request", {
         messages: [...messages],
         systemPrompt,
         tools: toolSchemas,
@@ -133,7 +135,7 @@ class AgentServiceImpl implements AgentService {
         const error = turn.error;
         if (error.code === "context_overflow" && !compacted) {
           // Give compaction plugins one shot at trimming the history.
-          const compactedPayload = await this.ctx.waterfall<LoopCompact>("loop/compact", {
+          const compactedPayload = await hooks.waterfall<LoopCompact>("loop/compact", {
             messages: [...messages],
           });
           if (compactedPayload.messages.length < messages.length) {
@@ -306,7 +308,7 @@ function sleep(ms: number): Promise<void> {
 
 export const loopPlugin = definePlugin({
   name: "loop",
-  inject: ["llm", "tools", "systemPrompt"],
+  inject: ["hooks", "llm", "tools", "systemPrompt"],
   provides: ["agent"],
   apply(ctx: PluginContext) {
     return ctx.effect(() => ctx.provide("agent", new AgentServiceImpl(ctx)), "loop.provide");

@@ -15,6 +15,7 @@
 
 import { definePlugin } from "../../kernel";
 import type { PluginContext } from "../../kernel/types";
+import type { HookBusService } from "../hooks";
 import type { PromptAssemble } from "../prompt";
 import { isWithinWorkspace, resolveToolPath } from "../tools/builtin/paths";
 import type { BeforeToolCall, ToolCategory } from "../tools/registry";
@@ -147,17 +148,18 @@ function blockedInPlan(category: ToolCategory): boolean {
 
 export const permissionPlugin = definePlugin<PermissionPluginConfig>({
   name: "permission",
-  inject: ["tools"],
+  inject: ["hooks", "tools"],
   provides: ["permission"],
   apply(ctx: PluginContext, config: PermissionPluginConfig = {}) {
     const service = new PermissionServiceImpl(config.mode ?? "default");
     return ctx.effect(() => {
+      const hooks = ctx.get("hooks") as HookBusService;
       const disposeService = ctx.provide("permission", service);
-      const disposeSection = ctx.hook<PromptAssemble>("prompt/assemble", async (event, next) => {
+      const disposeSection = hooks.hook<PromptAssemble>("prompt/assemble", async (event, next) => {
         event.sections.push({ name: "permissions", content: permissionSection(service.mode()) });
         return next(event);
       });
-      const disposeHook = ctx.hook<BeforeToolCall>("tools/before-call", async (event, next) => {
+      const disposeHook = hooks.hook<BeforeToolCall>("tools/before-call", async (event, next) => {
         const category = event.tool?.category ?? "write";
         const mode = service.mode();
 

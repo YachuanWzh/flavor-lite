@@ -9,7 +9,6 @@
 export { Context, Runtime, definePlugin, silentLogger, errorMessage } from "./kernel";
 export type {
   Disposer,
-  EventMap,
   HookMap,
   KernelOptions,
   Logger,
@@ -24,9 +23,13 @@ export type { Message, ToolCall } from "./shared/messages";
 export { messageFootprint, messageText, sanitizeHistory } from "./shared/messages";
 
 // capability plugins
+export { hooksPlugin } from "./plugins/hooks";
+export type { HookBusService } from "./plugins/hooks";
+
 export { llmPlugin, type LlmPluginConfig, type LlmService, type ProviderEntry, type StreamOptions } from "./plugins/llm";
 export { OpenAIAdapter, finalizeToolCall, type OpenAIAdapterOptions } from "./plugins/llm/openai";
 export { AnthropicAdapter, type AnthropicAdapterOptions } from "./plugins/llm/anthropic";
+export { anthropicProviderPlugin, openaiProviderPlugin, type ProviderPluginConfig } from "./plugins/llm/providers";
 export { ProviderError, normalizeProviderError, parseModelRef } from "./plugins/llm/types";
 export type { ModelAdapter, ModelEvent, ModelRequest, ModelToolSchema, ProviderErrorCode, WireMessage } from "./plugins/llm/types";
 
@@ -63,4 +66,5 @@ export { loadConfig, loadDotEnv } from "./host/config";
 export type { FlavorConfig } from "./host/config";
 export { runRepl } from "./host/repl";
 export type { ReplOptions } from "./host/repl";
-export { TerminalInteraction } from "./host/interaction";
+export { TerminalInteraction, terminalInteractionPlugin } from "./host/interaction";
+export type { TerminalInteractionOptions, TerminalInteractionPluginConfig } from "./host/interaction";

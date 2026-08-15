@@ -11,6 +11,7 @@
 import { definePlugin } from "../../kernel";
 import type { PluginContext } from "../../kernel/types";
 import { messageFootprint, type Message } from "../../shared/messages";
+import type { HookBusService } from "../hooks";
 import type { BeforeLoopRequest, LoopCompact } from "../loop";
 
 export interface CompactionPluginConfig {
@@ -58,20 +59,21 @@ export function compactMessages(messages: Message[], keepTail: number): Message[
 export const compactionPlugin = definePlugin<CompactionPluginConfig>({
   name: "compaction",
   // The loop plugin provides "agent"; depending on it keeps hook registration ordered.
-  inject: ["agent"],
+  inject: ["hooks", "agent"],
   apply(ctx: PluginContext, config: CompactionPluginConfig = {}) {
     const budget = config.budget ?? DEFAULT_BUDGET;
     const keepTail = config.keepTail ?? DEFAULT_KEEP_TAIL;
 
     return ctx.effect(() => {
-      const disposeProactive = ctx.hook<BeforeLoopRequest>("loop/before-request", async (event, next) => {
+      const hooks = ctx.get("hooks") as HookBusService;
+      const disposeProactive = hooks.hook<BeforeLoopRequest>("loop/before-request", async (event, next) => {
         if (footprint(event.messages) > budget) {
           event.messages = compactMessages(event.messages, keepTail);
           ctx.logger.debug(`compaction trimmed history to ${footprint(event.messages)} chars`);
         }
         return next(event);
       });
-      const disposeReactive = ctx.hook<LoopCompact>("loop/compact", async (event, next) => {
+      const disposeReactive = hooks.hook<LoopCompact>("loop/compact", async (event, next) => {
         event.messages = compactMessages(event.messages, Math.max(4, Math.floor(keepTail / 2)));
         return next(event);
       });

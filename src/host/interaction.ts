@@ -1,10 +1,13 @@
 /**
- * Terminal implementation of the `interaction` capability seam.
- * Permission prompts pause the REPL by closing/reopening readline control:
- * the agent loop awaits these answers while the host keeps rendering events.
+ * Terminal implementation of the `interaction` capability seam, plus its
+ * plugin wrapper. Permission prompts pause the REPL by closing/reopening
+ * readline control: the agent loop awaits these answers while the host
+ * keeps rendering events.
  */
 
 import * as readline from "node:readline/promises";
+import { definePlugin } from "../kernel";
+import type { PluginContext } from "../kernel/types";
 import type { InteractionService } from "../plugins/permission";
 
 export interface TerminalInteractionOptions {
@@ -36,3 +39,14 @@ export class TerminalInteraction implements InteractionService {
     return typeof answer === "string" && /^(y|yes)$/i.test(answer);
   }
 }
+
+export type TerminalInteractionPluginConfig = TerminalInteractionOptions;
+
+/** Mounts the terminal interaction as the `interaction` service. */
+export const terminalInteractionPlugin = definePlugin<TerminalInteractionPluginConfig>({
+  name: "interaction",
+  provides: ["interaction"],
+  apply(ctx: PluginContext, config: TerminalInteractionPluginConfig = {}) {
+    return ctx.effect(() => ctx.provide("interaction", new TerminalInteraction(config)), "interaction.provide");
+  },
+});

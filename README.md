@@ -45,10 +45,12 @@ FLAVOR_OPENAI_MODEL=deepseek-chat
 
 ```
 src/
-  kernel/      mini-Cordis: Context (services/events/waterfall/effects) + Runtime (topo-sort)
+  kernel/      mini-Cordis: Context (services/effects only) + Runtime (topo-sort)
   shared/      provider-neutral Message model
   plugins/
-    llm/         capability seam: adapter registry, "provider:model" refs, pure fetch SSE
+    hooks/       the waterfall bus as a plugin: provides the `hooks` service
+    llm/         capability seam: adapter registry, "provider:model" refs, pure fetch SSE;
+                 provider plugins (provider:openai / provider:anthropic) self-register adapters from credentials
     tools/       capability seam: ToolRegistry + before/after-call waterfalls + 7 builtin tools
     permission/  plan|default|acceptEdits|bypass + hard dangerous-command blocks (a tools hook) + mode-aware prompt section
     session/     JSONL persistence under .flavor/sessions (model-visible ⇔ logged)
@@ -69,7 +71,9 @@ src/
 |---|---|
 | Context is a service repository | `ctx.provide/get/tryGet` by stable key |
 | Registrations are reversible effects | `ctx.effect()` → disposers unwind in reverse |
-| Waterfall = around-middleware | `ctx.hook(name, (value, next) => ...)`; skip `next()` to short-circuit |
+| Waterfall = around-middleware | the `hooks` plugin provides it: `hooks.hook(name, (value, next) => ...)`; skip `next()` to short-circuit |
+| Everything is a plugin | even the hook bus is a plugin — unmount `hooks` and no hook point exists |
+| Provider discovery is delegated | bootstrap mounts provider plugins; each self-registers if credentials exist, and the generic "no provider" check counts third-party plugins too |
 | Plugins, not loop changes | permissions, compaction, guides all attach to seams/hooks |
 | System prompt is runtime-derived | every section is a plugin contribution (`prompt/assemble`); unmount the plugin, lose the section |
 | Model-visible ⇔ logged | session JSONL fully reconstructs any conversation |
@@ -77,7 +81,7 @@ src/
 
 ### Extension points
 
-- Services: `llm`, `tools`, `permission`, `interaction`, `session`, `systemPrompt`, `agent`, `commands`, `skills`
+- Services: `hooks`, `llm`, `tools`, `permission`, `interaction`, `session`, `systemPrompt`, `agent`, `commands`, `skills`
 - Waterfall hooks: `tools/before-call`, `tools/after-call`, `prompt/assemble`, `loop/before-request`, `loop/compact`
 
 A plugin looks like this:
@@ -87,10 +91,10 @@ import { definePlugin } from "flavor-lite";
 
 export const myPlugin = definePlugin({
   name: "my-plugin",
-  inject: ["tools"],            // load order is derived from this
+  inject: ["hooks", "tools"],    // load order is derived from this
   apply(ctx) {
     return ctx.effect(() => {
-      const dispose = ctx.hook("tools/before-call", async (event, next) => {
+      const dispose = ctx.get("hooks").hook("tools/before-call", async (event, next) => {
         ctx.logger.info(`tool ${event.toolCall.name} starting`);
         return next(event);
       });

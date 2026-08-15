@@ -4,7 +4,7 @@
  * Faithful (but minimal) port of the Cordis ideas used by deepseek-harness:
  * - a context is a repository of services addressed by stable key
  * - registrations are reversible effects
- * - typed events via declaration merging on `ServiceMap` / `EventMap`
+ * - typed services/hooks via declaration merging on `ServiceMap` / `HookMap`
  */
 
 export type Disposer = () => void | Promise<void>;
@@ -20,10 +20,6 @@ export type Disposer = () => void | Promise<void>;
  */
 // eslint-disable-next-line @typescript-eslint/no-empty-interface
 export interface ServiceMap {}
-
-/** Event payloads extended by plugins through declaration merging. */
-// eslint-disable-next-line @typescript-eslint/no-empty-interface
-export interface EventMap {}
 
 /** Waterfall hook payloads extended by plugins through declaration merging. */
 // eslint-disable-next-line @typescript-eslint/no-empty-interface
@@ -89,22 +85,6 @@ export interface PluginContext {
   /** Resolve an optional service without failing. */
   tryGet<K extends keyof ServiceMap>(key: K): ServiceMap[K] | undefined;
   tryGet(key: string): unknown;
-
-  /** Fire-and-forget observation, listeners run in registration order. */
-  emit<K extends keyof EventMap>(name: K, payload: EventMap[K]): void;
-  emit(name: string, payload?: unknown): void;
-
-  /** Observe an event. Returns a disposer. */
-  on<K extends keyof EventMap>(name: K, listener: (payload: EventMap[K]) => void | Promise<void>): Disposer;
-  on(name: string, listener: (payload: unknown) => void | Promise<void>): Disposer;
-
-  /** Around-middleware pipeline. Listeners must call next() to delegate. */
-  waterfall<K extends keyof HookMap>(name: K, value: HookMap[K]): Promise<HookMap[K]>;
-  waterfall<T>(name: string, value: T): Promise<T>;
-
-  /** Register an around-middleware listener. Returns a disposer. */
-  hook<K extends keyof HookMap>(name: K, listener: WaterfallListener<HookMap[K]>): Disposer;
-  hook<T>(name: string, listener: WaterfallListener<T>): Disposer;
 
   /**
    * Track a reversible registration owned by the current plugin scope.

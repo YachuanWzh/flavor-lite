@@ -94,11 +94,11 @@ function shellSection(): string {
 
 export const shellToolPlugin: Plugin = definePlugin({
   name: "tool:shell",
-  inject: ["tools"],
+  inject: ["hooks", "tools"],
   apply(ctx) {
     return ctx.effect(() => {
       const disposeTool = ctx.get("tools").register(shellTool);
-      const disposeSection = ctx.hook<PromptAssemble>("prompt/assemble", async (event, next) => {
+      const disposeSection = ctx.get("hooks").hook<PromptAssemble>("prompt/assemble", async (event, next) => {
         event.sections.push({ name: "shell", content: shellSection() });
         return next(event);
       });

@@ -48,10 +48,11 @@ function environmentSection(ctx: PluginContext): string {
 function contribute(pluginName: string, sectionName: string, content: (ctx: PluginContext) => string): Plugin {
   return definePlugin({
     name: pluginName,
+    inject: ["hooks"],
     apply(ctx: PluginContext) {
       return ctx.effect(
         () =>
-          ctx.hook<PromptAssemble>("prompt/assemble", async (event, next) => {
+          ctx.get("hooks").hook<PromptAssemble>("prompt/assemble", async (event, next) => {
             const text = content(ctx);
             if (text.trim()) event.sections.push({ name: sectionName, content: text });
             return next(event);

@@ -41,12 +41,12 @@ const INIT_TASK = [
 
 export const initPlugin = definePlugin({
   name: "init",
-  inject: ["commands"],
+  inject: ["hooks", "commands"],
   apply(ctx: PluginContext) {
     return ctx.effect(() => {
       const commands = ctx.get("commands") as CommandsService;
 
-      const disposeSection = ctx.hook<PromptAssemble>("prompt/assemble", async (event, next) => {
+      const disposeSection = ctx.get("hooks").hook<PromptAssemble>("prompt/assemble", async (event, next) => {
         const guidePath = await findGuide(ctx.cwd);
         if (guidePath) {
           const raw = await readFile(guidePath, "utf-8");

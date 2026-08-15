@@ -11,7 +11,7 @@
 import { createAgent } from "./host/bootstrap";
 import { runRepl } from "./host/repl";
 import { renderEvent, yellow } from "./host/render";
-import { TerminalInteraction } from "./host/interaction";
+import { terminalInteractionPlugin } from "./host/interaction";
 import { PERMISSION_MODES, type PermissionMode } from "./plugins/permission";
 
 interface CliArgs {
@@ -96,10 +96,8 @@ async function main(): Promise<void> {
 
   if (args.prompt) {
     // One-shot: same plugin stack, one turn, no REPL chrome.
-    const handle = createAgent({
-      config: overrides,
-      interaction: new TerminalInteraction(),
-    });
+    const handle = createAgent({ config: overrides });
+    handle.runtime.use(terminalInteractionPlugin);
     try {
       const sessions = handle.runtime.ctx.get("session") as import("./plugins/session").SessionService;
       const resumeId =

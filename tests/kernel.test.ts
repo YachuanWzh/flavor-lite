@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { Runtime, definePlugin, type PluginContext } from "../src/kernel";
+import { hooksPlugin, type HookBusService } from "../src/plugins/hooks";
 
 describe("kernel runtime", () => {
   it("activates plugins in dependency order regardless of mount order", () => {
@@ -80,25 +81,36 @@ describe("kernel runtime", () => {
   });
 
   it("runs waterfall listeners as around-middleware and supports short-circuit", async () => {
-    const runtime = Runtime.create();
+    const runtime = Runtime.create().use(hooksPlugin);
+    runtime.start();
+    const hooks = runtime.ctx.get("hooks") as HookBusService;
     const trace: string[] = [];
-    runtime.ctx.hook<number>("double", async (value, next) => {
+    hooks.hook<number>("double", async (value, next) => {
       trace.push("outer-in");
       const result = await next(value + 1);
       trace.push("outer-out");
       return result * 10;
     });
-    runtime.ctx.hook<number>("double", (value) => {
+    hooks.hook<number>("double", (value) => {
       trace.push("short-circuit");
       return value + 100; // never calls next()
     });
-    runtime.ctx.hook<number>("double", () => {
+    hooks.hook<number>("double", () => {
       trace.push("unreachable");
       return 0;
     });
 
-    const result = await runtime.ctx.waterfall<number>("double", 1);
+    const result = await hooks.waterfall<number>("double", 1);
     expect(trace).toEqual(["outer-in", "short-circuit", "outer-out"]);
     expect(result).toBe((1 + 1 + 100) * 10);
+  });
+
+  it("fails loud when a plugin injects hooks but the hooks plugin is not mounted", () => {
+    const needy = definePlugin({
+      name: "needy",
+      inject: ["hooks"],
+      apply() {},
+    });
+    expect(() => Runtime.create().use(needy).start()).toThrow(/requires service "hooks"/);
   });
 });

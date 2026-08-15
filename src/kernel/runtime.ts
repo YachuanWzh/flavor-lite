@@ -82,7 +82,6 @@ export class Runtime {
     for (const { plugin, config } of plugins) {
       const result = plugin.apply(this.ctx, config as never);
       this.activeDisposers.push({ name: plugin.name, dispose: result });
-      this.ctx.emit("plugin/activated", { name: plugin.name });
     }
   }
 

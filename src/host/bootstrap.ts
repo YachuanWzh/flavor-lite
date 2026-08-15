@@ -5,13 +5,12 @@
  */
 
 import { Runtime, type Logger, type Plugin } from "../kernel";
-import { AnthropicAdapter } from "../plugins/llm/anthropic";
-import { llmPlugin, type LlmPluginConfig } from "../plugins/llm";
-import { OpenAIAdapter } from "../plugins/llm/openai";
-import type { ModelAdapter } from "../plugins/llm/types";
+import { hooksPlugin } from "../plugins/hooks";
+import { llmPlugin, type LlmService } from "../plugins/llm";
+import { anthropicProviderPlugin, openaiProviderPlugin } from "../plugins/llm/providers";
 import { builtinTools, toolsPlugin } from "../plugins/tools";
 import { guidancePlugins } from "../plugins/guidance";
-import { permissionPlugin, type InteractionService, type PermissionMode } from "../plugins/permission";
+import { permissionPlugin, type PermissionMode } from "../plugins/permission";
 import { sessionPlugin } from "../plugins/session";
 import { promptPlugin } from "../plugins/prompt";
 import { loopPlugin, type AgentEvent, type AgentRunOptions, type AgentService } from "../plugins/loop";
@@ -26,9 +25,7 @@ export interface BootstrapOptions {
   /** Config overrides; merged over files + env (see host/config). */
   config?: FlavorConfig;
   logger?: Logger;
-  /** Terminal approval provider; without it, non-bypass writes are blocked. */
-  interaction?: InteractionService;
-  /** Extra plugins mounted after the defaults. */
+  /** Extra plugins mounted after the defaults (custom providers, policies, hosts). */
   plugins?: Array<{ plugin: Plugin<never>; config?: never }>;
 }
 
@@ -50,38 +47,16 @@ export function createAgent(options: BootstrapOptions = {}): AgentHandle {
     ...(options.logger ? { logger: options.logger } : {}),
   });
 
-  // LLM providers: mount adapters for whatever credentials are present.
-  const providers: LlmPluginConfig["providers"] = {};
-  if (config.openai?.apiKey) {
-    providers.openai = {
-      adapter: new OpenAIAdapter({
-        apiKey: config.openai.apiKey,
-        baseURL: config.openai.baseURL ?? "https://api.openai.com/v1",
-      }) satisfies ModelAdapter,
-      ...(config.openai.model ? { defaultModel: config.openai.model } : {}),
-    };
-  }
-  if (config.anthropic?.apiKey) {
-    providers.anthropic = {
-      adapter: new AnthropicAdapter({
-        apiKey: config.anthropic.apiKey,
-        ...(config.anthropic.baseURL ? { baseURL: config.anthropic.baseURL } : {}),
-      }) satisfies ModelAdapter,
-      ...(config.anthropic.model ? { defaultModel: config.anthropic.model } : {}),
-    };
-  }
-  if (Object.keys(providers).length === 0) {
-    // Fail loud at startup, never mid-conversation.
-    throw new Error(
-      "No model provider configured. Set OPENAI_API_KEY or ANTHROPIC_API_KEY (see .env.example).",
-    );
-  }
-
   runtime
+    .use(hooksPlugin)
     .use(llmPlugin, {
-      providers,
       ...(config.model ? { model: config.model } : {}),
     })
+    // Provider discovery is delegated to plugins: each self-registers its
+    // adapter when credentials exist and skips otherwise. The composition
+    // root never touches adapters or environment variables.
+    .use(openaiProviderPlugin, config.openai ?? {})
+    .use(anthropicProviderPlugin, config.anthropic ?? {})
     .use(toolsPlugin);
   // Guidance first so its sections lead the prompt; permission and tool
   // plugins contribute their own sections where they mount.
@@ -99,8 +74,13 @@ export function createAgent(options: BootstrapOptions = {}): AgentHandle {
   for (const extra of options.plugins ?? []) runtime.use(extra.plugin, extra.config);
   runtime.start();
 
-  if (options.interaction) {
-    runtime.ctx.provide("interaction", options.interaction);
+  // Generic provider check: whichever plugins registered adapters count,
+  // built-in or third-party. Fail loud at startup, never mid-conversation.
+  const llm = runtime.ctx.get("llm") as LlmService;
+  if (llm.providers().length === 0) {
+    throw new Error(
+      "No model provider configured. Set OPENAI_API_KEY or ANTHROPIC_API_KEY (see .env.example), or mount a provider plugin.",
+    );
   }
 
   const agent = runtime.ctx.get("agent") as AgentService;

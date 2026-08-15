@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { Runtime, definePlugin } from "../src/kernel";
+import { hooksPlugin } from "../src/plugins/hooks";
 import { toolsPlugin, type Tool, type ToolRegistry } from "../src/plugins/tools";
 import { permissionPlugin, type InteractionService, type PermissionService } from "../src/plugins/permission";
 import type { PermissionMode } from "../src/plugins/permission";
@@ -42,7 +43,7 @@ const testToolsPlugin = definePlugin({
 
 function mount(mode: PermissionMode, interaction?: InteractionService): Runtime {
   const runtime = Runtime.create({ cwd: "/tmp/flavor-lite-permission-test" });
-  runtime.use(toolsPlugin).use(testToolsPlugin).use(permissionPlugin, { mode });
+  runtime.use(hooksPlugin).use(toolsPlugin).use(testToolsPlugin).use(permissionPlugin, { mode });
   runtime.start();
   if (interaction) runtime.ctx.provide("interaction", interaction);
   return runtime;

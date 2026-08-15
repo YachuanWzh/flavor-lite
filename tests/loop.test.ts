@@ -3,6 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { Runtime, definePlugin } from "../src/kernel";
+import { hooksPlugin } from "../src/plugins/hooks";
 import { llmPlugin, type LlmService } from "../src/plugins/llm";
 import type { ModelAdapter, ModelEvent, ModelRequest } from "../src/plugins/llm/types";
 import { toolsPlugin, type ToolRegistry } from "../src/plugins/tools";
@@ -65,6 +66,7 @@ describe("agent loop plugin", () => {
   function mount(script: ModelEvent[][], requests: ModelRequest[], withSession = false, repeatLast = false): Runtime {
     runtime = Runtime.create({ cwd: dir });
     runtime
+      .use(hooksPlugin)
       .use(llmPlugin, {
         providers: { fake: { adapter: scriptedAdapter(script, requests, repeatLast), defaultModel: "fake-1" } },
       })

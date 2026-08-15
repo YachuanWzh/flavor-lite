@@ -3,6 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { Runtime, definePlugin } from "../src/kernel";
+import { hooksPlugin, type HookBusService } from "../src/plugins/hooks";
 import { promptPlugin, type PromptAssemble, type PromptService } from "../src/plugins/prompt";
 import { environmentPlugin, guidancePlugins, identityPlugin } from "../src/plugins/guidance";
 import { permissionPlugin } from "../src/plugins/permission";
@@ -34,14 +35,14 @@ describe("prompt assembly", () => {
 
   it("is empty when no contributor is mounted", async () => {
     runtime = Runtime.create({ cwd: dir });
-    runtime.use(promptPlugin);
+    runtime.use(hooksPlugin).use(promptPlugin);
     runtime.start();
     expect(await assemble()).toBe("");
   });
 
   it("keeps section order = contributor mount order", async () => {
     runtime = Runtime.create({ cwd: dir });
-    runtime.use(promptPlugin);
+    runtime.use(hooksPlugin).use(promptPlugin);
     for (const plugin of guidancePlugins) runtime.use(plugin);
     runtime.start();
 
@@ -59,7 +60,7 @@ describe("prompt assembly", () => {
 
   it("loses a section when its plugin is not mounted", async () => {
     runtime = Runtime.create({ cwd: dir });
-    runtime.use(promptPlugin).use(identityPlugin); // security/tasks/environment omitted
+    runtime.use(hooksPlugin).use(promptPlugin).use(identityPlugin); // security/tasks/environment omitted
     runtime.start();
 
     const prompt = await assemble();
@@ -72,10 +73,11 @@ describe("prompt assembly", () => {
   it("deduplicates by name, keeping the last occurrence", async () => {
     const first = definePlugin({
       name: "dup:first",
+      inject: ["hooks"],
       apply(ctx) {
         return ctx.effect(
           () =>
-            ctx.hook<PromptAssemble>("prompt/assemble", async (event, next) => {
+            (ctx.get("hooks") as HookBusService).hook<PromptAssemble>("prompt/assemble", async (event, next) => {
               event.sections.push({ name: "note", content: "first version" });
               return next(event);
             }),
@@ -85,10 +87,11 @@ describe("prompt assembly", () => {
     });
     const second = definePlugin({
       name: "dup:second",
+      inject: ["hooks"],
       apply(ctx) {
         return ctx.effect(
           () =>
-            ctx.hook<PromptAssemble>("prompt/assemble", async (event, next) => {
+            (ctx.get("hooks") as HookBusService).hook<PromptAssemble>("prompt/assemble", async (event, next) => {
               event.sections.push({ name: "note", content: "second version" });
               return next(event);
             }),
@@ -98,7 +101,7 @@ describe("prompt assembly", () => {
     });
 
     runtime = Runtime.create({ cwd: dir });
-    runtime.use(promptPlugin).use(first).use(second);
+    runtime.use(hooksPlugin).use(promptPlugin).use(first).use(second);
     runtime.start();
 
     const prompt = await assemble();
@@ -108,7 +111,7 @@ describe("prompt assembly", () => {
 
   it("permission plugin contributes a mode-aware section", async () => {
     runtime = Runtime.create({ cwd: dir });
-    runtime.use(toolsPlugin).use(promptPlugin).use(permissionPlugin, { mode: "plan" });
+    runtime.use(hooksPlugin).use(toolsPlugin).use(promptPlugin).use(permissionPlugin, { mode: "plan" });
     runtime.start();
 
     const prompt = await assemble();
@@ -118,7 +121,7 @@ describe("prompt assembly", () => {
 
   it("shell tool plugin contributes a platform-aware section", async () => {
     runtime = Runtime.create({ cwd: dir });
-    runtime.use(toolsPlugin).use(promptPlugin).use(shellToolPlugin);
+    runtime.use(hooksPlugin).use(toolsPlugin).use(promptPlugin).use(shellToolPlugin);
     runtime.start();
 
     const prompt = await assemble();
@@ -129,7 +132,7 @@ describe("prompt assembly", () => {
 
   it("environment section stays runtime-derived", async () => {
     runtime = Runtime.create({ cwd: dir });
-    runtime.use(promptPlugin).use(environmentPlugin);
+    runtime.use(hooksPlugin).use(promptPlugin).use(environmentPlugin);
     runtime.start();
 
     const prompt = await assemble();

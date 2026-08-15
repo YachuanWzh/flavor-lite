@@ -9,6 +9,7 @@ import { definePlugin } from "../../kernel";
 import type { PluginContext } from "../../kernel/types";
 import type { ToolCall } from "../../shared/messages";
 import type { ModelToolSchema } from "../llm/types";
+import type { HookBusService } from "../hooks";
 
 export type ToolCategory = "read" | "write" | "shell" | "control";
 
@@ -91,9 +92,10 @@ class ToolRegistryImpl implements ToolRegistry {
   }
 
   async execute(toolCall: ToolCall, execCtx: ToolExecuteContext): Promise<ToolResult> {
+    const hooks = this.ctx.get("hooks") as HookBusService;
     const tool = this.tools.get(toolCall.name);
 
-    const before = await this.ctx.waterfall<BeforeToolCall>("tools/before-call", {
+    const before = await hooks.waterfall<BeforeToolCall>("tools/before-call", {
       toolCall,
       tool,
       args: toolCall.args,
@@ -116,7 +118,7 @@ class ToolRegistryImpl implements ToolRegistry {
       };
     }
 
-    const after = await this.ctx.waterfall<AfterToolCall>("tools/after-call", {
+    const after = await hooks.waterfall<AfterToolCall>("tools/after-call", {
       toolCall,
       args: before.args,
       result,
@@ -127,6 +129,7 @@ class ToolRegistryImpl implements ToolRegistry {
 
 export const toolsPlugin = definePlugin({
   name: "tools",
+  inject: ["hooks"],
   provides: ["tools"],
   apply(ctx: PluginContext) {
     return ctx.effect(() => ctx.provide("tools", new ToolRegistryImpl(ctx)), "tools.provide");

@@ -71,13 +71,13 @@ class SkillsServiceImpl implements SkillsService {
 
 export const skillsPlugin = definePlugin({
   name: "skills",
-  inject: ["systemPrompt"],
+  inject: ["hooks", "systemPrompt"],
   provides: ["skills"],
   apply(ctx: PluginContext) {
     return ctx.effect(() => {
       const service = new SkillsServiceImpl(ctx);
       const disposeService = ctx.provide("skills", service);
-      const disposeHook = ctx.hook<PromptAssemble>("prompt/assemble", async (event, next) => {
+      const disposeHook = ctx.get("hooks").hook<PromptAssemble>("prompt/assemble", async (event, next) => {
         const skills = await service.discover();
         if (skills.length > 0) {
           const lines = skills.map((skill) => `- **${skill.name}**: ${skill.description} (skill file: ${skill.path})`);

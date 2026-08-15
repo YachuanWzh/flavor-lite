@@ -41,7 +41,11 @@ export interface LlmService {
 }
 
 export interface LlmPluginConfig {
-  providers: Record<string, { adapter: ModelAdapter; defaultModel?: string }>;
+  /**
+   * Pre-registered adapters. The default composition leaves this empty and
+   * lets provider plugins self-register; tests and SDK users may seed it.
+   */
+  providers?: Record<string, { adapter: ModelAdapter; defaultModel?: string }>;
   /** Default model ref, "provider:model" form. */
   model?: string;
 }
@@ -51,7 +55,7 @@ class LlmServiceImpl implements LlmService {
   private defaultModelRef: string | undefined;
 
   constructor(config: LlmPluginConfig) {
-    for (const [key, entry] of Object.entries(config.providers)) {
+    for (const [key, entry] of Object.entries(config.providers ?? {})) {
       this.adapters.set(key, { adapter: entry.adapter, defaultModel: entry.defaultModel });
     }
     this.defaultModelRef = config.model;
@@ -139,7 +143,7 @@ function toWireMessage(message: Message): WireMessage {
 export const llmPlugin = definePlugin<LlmPluginConfig>({
   name: "llm",
   provides: ["llm"],
-  apply(ctx: PluginContext, config: LlmPluginConfig) {
+  apply(ctx: PluginContext, config: LlmPluginConfig = {}) {
     return ctx.effect(() => ctx.provide("llm", new LlmServiceImpl(config)), "llm.provide");
   },
 });

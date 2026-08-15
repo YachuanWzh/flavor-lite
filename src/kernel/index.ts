@@ -4,7 +4,6 @@ export {
   definePlugin,
   silentLogger,
   type Disposer,
-  type EventMap,
   type HookMap,
   type KernelOptions,
   type Logger,

@@ -7,7 +7,7 @@
 import * as readline from "node:readline";
 import type { AgentHandle } from "./bootstrap";
 import { bold, dim, renderEvent, yellow } from "./render";
-import { TerminalInteraction } from "./interaction";
+import { terminalInteractionPlugin } from "./interaction";
 import type { LlmService } from "../plugins/llm";
 import type { CommandsService } from "../plugins/commands";
 import { PERMISSION_MODES, type PermissionService, type PermissionMode } from "../plugins/permission";
@@ -37,11 +37,12 @@ export async function runRepl(handle: AgentHandle, options: ReplOptions = {}): P
   registerHostCommands(handle, sessionRef);
 
   const rl = readline.createInterface({ input: process.stdin, output: process.stdout, terminal: process.stdout.isTTY });
-  const interaction = new TerminalInteraction({
+  // Interaction is a plugin, not a side-channel provide; mounting after
+  // start() activates it immediately.
+  handle.runtime.use(terminalInteractionPlugin, {
     onBeforeAsk: () => rl.pause(),
     onAfterAsk: () => rl.resume(),
   });
-  ctx.provide("interaction", interaction);
 
   printBanner(handle, session, permission.mode());
 
