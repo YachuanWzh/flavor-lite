@@ -1,0 +1,6 @@
+node_modules/
+dist/
+*.tgz
+.env
+.flavor/sessions/
+.DS_Store
