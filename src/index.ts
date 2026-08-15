@@ -21,7 +21,7 @@ export type {
 
 // shared model
 export type { Message, ToolCall } from "./shared/messages";
-export { messageFootprint, messageText } from "./shared/messages";
+export { messageFootprint, messageText, sanitizeHistory } from "./shared/messages";
 
 // capability plugins
 export { llmPlugin, type LlmPluginConfig, type LlmService, type ProviderEntry, type StreamOptions } from "./plugins/llm";
@@ -41,6 +41,8 @@ export type { SessionHandle, SessionHeader, SessionInfo, SessionLine, SessionPlu
 
 export { promptPlugin } from "./plugins/prompt";
 export type { PromptAssemble, PromptSection, PromptService } from "./plugins/prompt";
+
+export { identityPlugin, securityPlugin, tasksPlugin, environmentPlugin, guidancePlugins } from "./plugins/guidance";
 
 export { loopPlugin } from "./plugins/loop";
 export type { AgentEvent, AgentRunOptions, AgentService, BeforeLoopRequest, LoopCompact } from "./plugins/loop";

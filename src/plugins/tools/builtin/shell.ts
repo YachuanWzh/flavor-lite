@@ -4,8 +4,10 @@
  */
 
 import { spawn } from "node:child_process";
+import { platform } from "node:os";
 import { definePlugin } from "../../../kernel";
 import type { Plugin } from "../../../kernel/types";
+import type { PromptAssemble } from "../../prompt";
 import { truncateOutput } from "./paths";
 import type { Tool } from "../registry";
 
@@ -83,10 +85,27 @@ export const shellTool: Tool = {
   },
 };
 
+/** Platform-aware shell note; only exists while the shell tool is mounted. */
+function shellSection(): string {
+  return platform() === "win32"
+    ? "Shell commands run through cmd.exe on Windows. The user's interactive shell is PowerShell: it has no `&&` separator, use `;` instead. Prefer simple, portable commands."
+    : "Shell commands run through $SHELL (POSIX). The tool is non-interactive: commands that wait for input will fail.";
+}
+
 export const shellToolPlugin: Plugin = definePlugin({
   name: "tool:shell",
   inject: ["tools"],
   apply(ctx) {
-    return ctx.effect(() => ctx.get("tools").register(shellTool), "tool:shell.register");
+    return ctx.effect(() => {
+      const disposeTool = ctx.get("tools").register(shellTool);
+      const disposeSection = ctx.hook<PromptAssemble>("prompt/assemble", async (event, next) => {
+        event.sections.push({ name: "shell", content: shellSection() });
+        return next(event);
+      });
+      return () => {
+        disposeSection();
+        disposeTool();
+      };
+    }, "tool:shell.install");
   },
 });

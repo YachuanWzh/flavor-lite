@@ -177,6 +177,37 @@ describe("agent loop plugin", () => {
     expect(end).toMatchObject({ reason: "max_iterations", iterations: 2 });
   });
 
+  it("records placeholder results for aborted tool calls so the session stays wire-valid", async () => {
+    const requests: ModelRequest[] = [];
+    const rt = mount(
+      [
+        [
+          { type: "tool_call", toolCall: { id: "t1", name: "Echo", args: { text: "a" } } },
+          { type: "tool_call", toolCall: { id: "t2", name: "Echo", args: { text: "b" } } },
+          { type: "done", stopReason: "tool_calls" },
+        ],
+      ],
+      requests,
+      true,
+    );
+    const aborter = new AbortController();
+    const agent = rt.ctx.get("agent") as AgentService;
+    let sessionId: string | undefined;
+    for await (const event of agent.run({ input: "work", signal: aborter.signal })) {
+      if (event.type === "agent_start") sessionId = event.sessionId;
+      if (event.type === "tool_end") aborter.abort(); // abort after the first result
+    }
+
+    const sessions = rt.ctx.get("session") as SessionService;
+    const handle = await sessions.open(sessionId!);
+    const messages = handle.messages();
+    // user, assistant(tool_calls), executed t1, placeholder for t2
+    expect(messages.map((message) => message.role)).toEqual(["user", "assistant", "tool", "tool"]);
+    const placeholder = messages[3]!;
+    expect(placeholder).toMatchObject({ role: "tool", toolCallId: "t2", isError: true });
+    expect(placeholder.content).toMatch(/aborted/i);
+  });
+
   it("resolves model refs through the llm service", () => {
     const requests: ModelRequest[] = [];
     const rt = mount([], requests);

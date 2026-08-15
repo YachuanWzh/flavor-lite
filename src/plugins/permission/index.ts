@@ -15,6 +15,7 @@
 
 import { definePlugin } from "../../kernel";
 import type { PluginContext } from "../../kernel/types";
+import type { PromptAssemble } from "../prompt";
 import { isWithinWorkspace, resolveToolPath } from "../tools/builtin/paths";
 import type { BeforeToolCall, ToolCategory } from "../tools/registry";
 
@@ -102,6 +103,27 @@ class PermissionServiceImpl implements PermissionService {
   }
 }
 
+/** Prompt section reflecting the live mode; re-read on every assemble. */
+function permissionSection(mode: PermissionMode): string {
+  switch (mode) {
+    case "plan":
+      return [
+        "- Permission mode is plan (read-only): write and shell tool calls are blocked.",
+        "- Investigate and propose changes; do not attempt edits.",
+      ].join("\n");
+    case "bypass":
+      return [
+        "- Permission mode is bypass: tool calls run without approval.",
+        "- Still avoid destructive or irreversible commands unless the user explicitly asks.",
+      ].join("\n");
+    default:
+      return [
+        `- Permission mode is ${mode}: some tool calls need user approval before they run.`,
+        "- Prefer reversible actions; avoid destructive commands unless the user explicitly asks.",
+      ].join("\n");
+  }
+}
+
 export interface PermissionPluginConfig {
   mode?: PermissionMode;
 }
@@ -131,6 +153,10 @@ export const permissionPlugin = definePlugin<PermissionPluginConfig>({
     const service = new PermissionServiceImpl(config.mode ?? "default");
     return ctx.effect(() => {
       const disposeService = ctx.provide("permission", service);
+      const disposeSection = ctx.hook<PromptAssemble>("prompt/assemble", async (event, next) => {
+        event.sections.push({ name: "permissions", content: permissionSection(service.mode()) });
+        return next(event);
+      });
       const disposeHook = ctx.hook<BeforeToolCall>("tools/before-call", async (event, next) => {
         const category = event.tool?.category ?? "write";
         const mode = service.mode();
@@ -173,6 +199,7 @@ export const permissionPlugin = definePlugin<PermissionPluginConfig>({
       });
       return () => {
         disposeHook();
+        disposeSection();
         disposeService();
       };
     }, "permission.install");

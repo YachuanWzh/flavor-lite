@@ -13,7 +13,7 @@
 
 import { definePlugin } from "../../kernel";
 import type { PluginContext } from "../../kernel/types";
-import type { Message, ToolCall } from "../../shared/messages";
+import { sanitizeHistory, type Message, type ToolCall } from "../../shared/messages";
 import { ProviderError, normalizeProviderError } from "../llm/types";
 import type { ModelToolSchema } from "../llm/types";
 import type { SessionHandle, SessionService } from "../session";
@@ -120,6 +120,9 @@ class AgentServiceImpl implements AgentService {
         systemPrompt,
         tools: toolSchemas,
       });
+      // Wire-level repair: aborts, torn sessions, or compaction cuts may leave
+      // dangling tool_calls; providers reject those, so clean them right here.
+      request.messages = sanitizeHistory(request.messages);
 
       const channel = new EventChannel();
       const turnPromise = this.requestTurn(llm, request, options, channel);
@@ -163,7 +166,18 @@ class AgentServiceImpl implements AgentService {
       }
 
       for (const toolCall of turn.toolCalls) {
-        if (options.signal?.aborted) break;
+        if (options.signal?.aborted) {
+          // Log a placeholder so every tool_call stays answered: the session
+          // remains wire-valid for resume and the next request.
+          await this.record(session, messages, {
+            role: "tool",
+            toolCallId: toolCall.id,
+            name: toolCall.name,
+            content: "Aborted by user before execution.",
+            isError: true,
+          });
+          continue;
+        }
         yield { type: "tool_start", toolCall };
         const result = await tools.execute(toolCall, {
           cwd: this.ctx.cwd,

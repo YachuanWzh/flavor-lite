@@ -50,9 +50,10 @@ src/
   plugins/
     llm/         capability seam: adapter registry, "provider:model" refs, pure fetch SSE
     tools/       capability seam: ToolRegistry + before/after-call waterfalls + 7 builtin tools
-    permission/  plan|default|acceptEdits|bypass + hard dangerous-command blocks (a tools hook)
+    permission/  plan|default|acceptEdits|bypass + hard dangerous-command blocks (a tools hook) + mode-aware prompt section
     session/     JSONL persistence under .flavor/sessions (model-visible ⇔ logged)
-    prompt/      system prompt assembly from sections via prompt/assemble waterfall
+    prompt/      pure assembler: runs prompt/assemble over empty sections, dedupes, joins
+    guidance/    identity/security/tasks/environment as unmountable prompt-section plugins
     loop/        the agent loop as a plugin: streaming, steering, retries, compaction hook
     compaction/  proactive + reactive history trimming (loop hooks, no loop changes)
     skills/      SKILL.md discovery → prompt section
@@ -70,6 +71,7 @@ src/
 | Registrations are reversible effects | `ctx.effect()` → disposers unwind in reverse |
 | Waterfall = around-middleware | `ctx.hook(name, (value, next) => ...)`; skip `next()` to short-circuit |
 | Plugins, not loop changes | permissions, compaction, guides all attach to seams/hooks |
+| System prompt is runtime-derived | every section is a plugin contribution (`prompt/assemble`); unmount the plugin, lose the section |
 | Model-visible ⇔ logged | session JSONL fully reconstructs any conversation |
 | Fail loud | missing providers, duplicate services, cycles, bad config throw at startup |
 

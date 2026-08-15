@@ -10,6 +10,7 @@ import { llmPlugin, type LlmPluginConfig } from "../plugins/llm";
 import { OpenAIAdapter } from "../plugins/llm/openai";
 import type { ModelAdapter } from "../plugins/llm/types";
 import { builtinTools, toolsPlugin } from "../plugins/tools";
+import { guidancePlugins } from "../plugins/guidance";
 import { permissionPlugin, type InteractionService, type PermissionMode } from "../plugins/permission";
 import { sessionPlugin } from "../plugins/session";
 import { promptPlugin } from "../plugins/prompt";
@@ -82,6 +83,9 @@ export function createAgent(options: BootstrapOptions = {}): AgentHandle {
       ...(config.model ? { model: config.model } : {}),
     })
     .use(toolsPlugin);
+  // Guidance first so its sections lead the prompt; permission and tool
+  // plugins contribute their own sections where they mount.
+  for (const guidance of guidancePlugins) runtime.use(guidance);
   for (const toolPlugin of builtinTools) runtime.use(toolPlugin);
   runtime
     .use(permissionPlugin, { ...(config.mode ? { mode: config.mode as PermissionMode } : {}) })
