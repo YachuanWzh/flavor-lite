@@ -10,6 +10,7 @@ import { bold, dim, renderEvent, yellow } from "./render";
 import { terminalInteractionPlugin } from "./interaction";
 import type { LlmService } from "../plugins/llm";
 import type { CommandsService } from "../plugins/commands";
+import type { PluginsLoaderService } from "../plugins/plugins";
 import { PERMISSION_MODES, type PermissionService, type PermissionMode } from "../plugins/permission";
 import type { SessionHandle, SessionService } from "../plugins/session";
 
@@ -35,6 +36,11 @@ export async function runRepl(handle: AgentHandle, options: ReplOptions = {}): P
     },
   };
   registerHostCommands(handle, sessionRef);
+
+  // Disk plugins load after start() so they can inject every default
+  // service; failures are isolated per plugin and shown in the banner.
+  const loader = ctx.tryGet("pluginsLoader") as PluginsLoaderService | undefined;
+  if (loader) await loader.init();
 
   const rl = readline.createInterface({ input: process.stdin, output: process.stdout, terminal: process.stdout.isTTY });
   // Interaction is a plugin, not a side-channel provide; mounting after
@@ -127,6 +133,15 @@ function printBanner(handle: AgentHandle, session: SessionHandle, mode: Permissi
   const llm = handle.runtime.ctx.get("llm") as LlmService;
   console.log(bold("flavor-lite") + dim(" — everything is a plugin"));
   console.log(dim(`model ${llm.defaultRef() ?? "unset"} · mode ${mode} · session ${session.id}`));
+  const loader = handle.runtime.ctx.tryGet("pluginsLoader") as PluginsLoaderService | undefined;
+  const statuses = loader?.list() ?? [];
+  if (statuses.length > 0) {
+    const loaded = statuses.filter((status) => status.status === "loaded").length;
+    console.log(dim(`plugins ${loaded}/${statuses.length} loaded (/plugin list)`));
+    for (const status of statuses) {
+      if (status.status === "error") console.log(yellow(`  plugin "${status.name}" failed: ${status.error}`));
+    }
+  }
   console.log(dim("type /help for commands; input while running becomes steering") + "\n");
 }
 

@@ -13,6 +13,17 @@ import { runRepl } from "./host/repl";
 import { renderEvent, yellow } from "./host/render";
 import { terminalInteractionPlugin } from "./host/interaction";
 import { PERMISSION_MODES, type PermissionMode } from "./plugins/permission";
+import type { PluginsLoaderService } from "./plugins/plugins";
+
+/** Discover and mount disk plugins (.flavorlite/plugins); failures stay isolated. */
+async function initDiskPlugins(handle: ReturnType<typeof createAgent>): Promise<void> {
+  const loader = handle.runtime.ctx.tryGet("pluginsLoader") as PluginsLoaderService | undefined;
+  if (!loader) return;
+  await loader.init();
+  for (const status of loader.list()) {
+    if (status.status === "error") console.error(yellow(`plugin "${status.name}" failed: ${status.error}`));
+  }
+}
 
 interface CliArgs {
   model?: string;
@@ -99,6 +110,7 @@ async function main(): Promise<void> {
     const handle = createAgent({ config: overrides });
     handle.runtime.use(terminalInteractionPlugin);
     try {
+      await initDiskPlugins(handle);
       const sessions = handle.runtime.ctx.get("session") as import("./plugins/session").SessionService;
       const resumeId =
         args.resume === undefined ? undefined : args.resume === "latest" ? await sessions.latest() : args.resume;

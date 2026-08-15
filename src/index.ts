@@ -58,6 +58,14 @@ export type { SkillInfo, SkillsService } from "./plugins/skills";
 export { commandsPlugin } from "./plugins/commands";
 export type { Command, CommandsService } from "./plugins/commands";
 export { initPlugin } from "./plugins/init";
+export { pluginsLoaderPlugin } from "./plugins/plugins";
+export type {
+  PluginLoadStatus,
+  PluginManifest,
+  PluginsLoaderConfig,
+  PluginsLoaderService,
+  PluginStatus,
+} from "./plugins/plugins";
 
 // host composition
 export { createAgent } from "./host/bootstrap";

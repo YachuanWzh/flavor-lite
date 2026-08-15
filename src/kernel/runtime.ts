@@ -16,10 +16,16 @@ interface MountedPlugin {
   config: unknown;
 }
 
+interface ActivePlugin extends MountedPlugin {
+  dispose: Disposer | void;
+  /** Ids of effects registered during apply(): scoped for unmount. */
+  effectIds: number[];
+}
+
 export class Runtime {
   readonly ctx: Context;
   private pending: MountedPlugin[] = [];
-  private activeDisposers: { name: string; dispose: Disposer | void }[] = [];
+  private active: ActivePlugin[] = [];
   private started = false;
   private disposed = false;
 
@@ -62,26 +68,56 @@ export class Runtime {
     return this;
   }
 
+  /**
+   * Unmount the first active plugin with this name: run its disposer,
+   * release every effect it registered during apply(), and forget it.
+   * Services it provided vanish as their registrations unwind, so a later
+   * use() of a same-named plugin can re-provide them (hot reload). Effects
+   * must be registered synchronously inside apply() to be scoped correctly.
+   * Returns true when a plugin was unmounted.
+   */
+  async unmount(name: string): Promise<boolean> {
+    if (this.disposed) throw new Error("runtime is disposed");
+    const index = this.active.findIndex((entry) => entry.plugin.name === name);
+    if (index < 0) return false;
+    const entry = this.active[index];
+    if (!entry) return false;
+    this.active.splice(index, 1);
+    try {
+      if (entry.dispose) await entry.dispose();
+    } finally {
+      await this.ctx.releaseEffects(entry.effectIds);
+    }
+    return true;
+  }
+
+  /** Names of currently active plugins, in activation order. */
+  activePlugins(): string[] {
+    return this.active.map((entry) => entry.plugin.name);
+  }
+
   /** Tear down plugin disposers in reverse activation order, then the context. */
   async dispose(): Promise<void> {
     if (this.disposed) return;
     this.disposed = true;
-    for (const { name, dispose } of this.activeDisposers.reverse()) {
-      if (!dispose) continue;
+    for (const entry of this.active.reverse()) {
+      if (!entry.dispose) continue;
       try {
-        await dispose();
+        await entry.dispose();
       } catch (error) {
-        this.ctx.logger.warn(`plugin "${name}" failed during dispose: ${error instanceof Error ? error.message : error}`);
+        this.ctx.logger.warn(`plugin "${entry.plugin.name}" failed during dispose: ${error instanceof Error ? error.message : error}`);
       }
     }
-    this.activeDisposers = [];
+    this.active = [];
     await this.ctx.dispose();
   }
 
   private activate(plugins: MountedPlugin[]): void {
     for (const { plugin, config } of plugins) {
+      const existing = new Set(this.ctx.effectIds());
       const result = plugin.apply(this.ctx, config as never);
-      this.activeDisposers.push({ name: plugin.name, dispose: result });
+      const effectIds = this.ctx.effectIds().filter((id) => !existing.has(id));
+      this.active.push({ plugin, config, dispose: result, effectIds });
     }
   }
 

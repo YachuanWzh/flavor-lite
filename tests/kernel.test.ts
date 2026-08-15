@@ -113,4 +113,50 @@ describe("kernel runtime", () => {
     });
     expect(() => Runtime.create().use(needy).start()).toThrow(/requires service "hooks"/);
   });
+
+  it("unmount runs the disposer, releases effects, and allows remount", async () => {
+    const events: string[] = [];
+    const makePlugin = (value: string) =>
+      definePlugin({
+        name: "svc",
+        provides: ["svc"],
+        apply(ctx) {
+          events.push(`apply-${value}`);
+          return ctx.effect(() => ctx.provide("svc", value), "svc.provide");
+        },
+      });
+    const runtime = Runtime.create();
+    runtime.use(makePlugin("v1")).start();
+    expect(runtime.ctx.get("svc")).toBe("v1");
+
+    expect(await runtime.unmount("svc")).toBe(true);
+    expect(runtime.ctx.tryGet("svc")).toBeUndefined();
+
+    runtime.use(makePlugin("v2")); // runtime already started: activates immediately
+    expect(runtime.ctx.get("svc")).toBe("v2");
+    expect(events).toEqual(["apply-v1", "apply-v2"]);
+    expect(await runtime.unmount("missing")).toBe(false);
+  });
+
+  it("unmount releases only the unmounted plugin's effects regardless of order", async () => {
+    const runtime = Runtime.create();
+    const a = definePlugin({
+      name: "a",
+      provides: ["a-svc"],
+      apply(ctx) {
+        return ctx.effect(() => ctx.provide("a-svc", "A"), "a.provide");
+      },
+    });
+    const b = definePlugin({
+      name: "b",
+      provides: ["b-svc"],
+      apply(ctx) {
+        return ctx.effect(() => ctx.provide("b-svc", "B"), "b.provide");
+      },
+    });
+    runtime.use(a).use(b).start();
+    await runtime.unmount("a"); // first-mounted plugin: must not touch b's effects
+    expect(runtime.ctx.tryGet("a-svc")).toBeUndefined();
+    expect(runtime.ctx.get("b-svc")).toBe("B");
+  });
 });

@@ -18,6 +18,7 @@ import { compactionPlugin } from "../plugins/compaction";
 import { skillsPlugin } from "../plugins/skills";
 import { commandsPlugin } from "../plugins/commands";
 import { initPlugin } from "../plugins/init";
+import { pluginsLoaderPlugin } from "../plugins/plugins";
 import { loadConfig, type FlavorConfig } from "./config";
 
 export interface BootstrapOptions {
@@ -70,7 +71,11 @@ export function createAgent(options: BootstrapOptions = {}): AgentHandle {
     .use(compactionPlugin, {})
     .use(skillsPlugin)
     .use(commandsPlugin)
-    .use(initPlugin);
+    .use(initPlugin)
+    // Disk plugin discovery (.flavorlite/plugins). Mounts last so loaded
+    // plugins can inject every default service; hosts call init() after
+    // start() since discovery is async.
+    .use(pluginsLoaderPlugin, { runtime });
   for (const extra of options.plugins ?? []) runtime.use(extra.plugin, extra.config);
   runtime.start();
 

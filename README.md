@@ -107,6 +107,24 @@ export const myPlugin = definePlugin({
 Mount it via `createAgent({ plugins: [{ plugin: myPlugin }] })` or build your
 own stack with `Runtime.create().use(...).start()`.
 
+### Disk plugins (hot reload)
+
+No SDK import needed: drop a plugin directory into `.flavorlite/plugins/`
+(project) or `~/.flavorlite/plugins/` (user-global) and it is discovered at
+startup. Each directory holds a `flavor-plugin.json` manifest and an ESM
+entry whose default export is a plain plugin object — full contract in
+[`docs/plugin-dev.md`](docs/plugin-dev.md).
+
+```text
+› /plugin new my-plugin     scaffold a plugin dir from the template
+› /plugin reload my-plugin  edit index.js, hot reload — no restart
+› /plugin list              load status; broken plugins are isolated as "error"
+```
+
+Coding agents: the `create-flavor-plugin` skill (`.flavorlite/skills/`)
+teaches this workflow, so an agent can develop and hot-load a compliant
+plugin end to end.
+
 ## Usage
 
 | Command | Effect |
@@ -116,6 +134,7 @@ own stack with `Runtime.create().use(...).start()`.
 | `/model [provider:model]` | show or switch model |
 | `/permissions [mode]` | show or switch permission mode |
 | `/sessions`, `/resume [id]`, `/new` | session management |
+| `/plugin list`, `/plugin reload [name]`, `/plugin new <name>` | disk plugin management with hot reload |
 | input while running | becomes a **steering** message for the next model request |
 | `Ctrl+C` while running | aborts the current turn (second press exits) |
 
@@ -129,7 +148,7 @@ Configuration merges from (low → high): `~/.flavor/config.json`,
 ## Development
 
 ```bash
-npm test          # 26 tests: kernel, loop, permission, session, compaction
+npm test          # 55 tests: kernel, loop, permission, session, compaction, plugins loader
 npm run typecheck # strict + noUncheckedIndexedAccess
 npm run build     # tsup → dist/ (index + cli)
 ```

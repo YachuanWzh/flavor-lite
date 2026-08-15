@@ -7,6 +7,7 @@
 import type { Disposer, Logger, PluginContext } from "./types";
 
 interface EffectRecord {
+  id: number;
   label: string;
   dispose: Disposer | void;
 }
@@ -17,6 +18,7 @@ export class Context implements PluginContext {
 
   private services = new Map<string, unknown>();
   private effects: EffectRecord[] = [];
+  private nextEffectId = 0;
   private disposed = false;
 
   constructor(options: { cwd: string; logger: Logger }) {
@@ -62,8 +64,38 @@ export class Context implements PluginContext {
     this.assertActive("effect");
     const result = setup();
     const dispose = typeof result === "function" ? (result as unknown as Disposer) : undefined;
-    this.effects.push({ label: label ?? setup.name ?? "effect", dispose });
+    this.effects.push({ id: this.nextEffectId++, label: label ?? setup.name ?? "effect", dispose });
     return result;
+  }
+
+  /** Ids of the currently tracked effects (the runtime scopes plugins with this). */
+  effectIds(): number[] {
+    return this.effects.map((record) => record.id);
+  }
+
+  /**
+   * Unwind exactly the given effect records (reverse registration order) and
+   * remove them from the stack. Runtime.unmount uses this to release
+   * everything a plugin registered via ctx.effect() during apply() —
+   * id-based, so unmount order between plugins never matters. Errors are
+   * warned, not thrown, so one bad disposer cannot strand the rest.
+   */
+  async releaseEffects(ids: number[]): Promise<void> {
+    const wanted = new Set(ids);
+    const kept: EffectRecord[] = [];
+    const released: EffectRecord[] = [];
+    for (const record of this.effects) {
+      (wanted.has(record.id) ? released : kept).push(record);
+    }
+    this.effects = kept;
+    for (const record of released.reverse()) {
+      if (!record.dispose) continue;
+      try {
+        await record.dispose();
+      } catch (error) {
+        this.logger.warn(`effect "${record.label}" failed during release: ${errorMessage(error)}`);
+      }
+    }
   }
 
   /** Unwind every effect in reverse registration order. Idempotent. */

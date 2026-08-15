@@ -1,0 +1,6 @@
+{
+  "name": "my-plugin",
+  "version": "0.1.0",
+  "entry": "index.js",
+  "description": "Describe what this plugin does."
+}
