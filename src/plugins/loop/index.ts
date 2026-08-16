@@ -63,6 +63,12 @@ export interface LoopCompact {
   messages: Message[];
 }
 
+/** Waterfall payload right before every agent_end, on every exit path. */
+export interface LoopAfterRun {
+  iterations: number;
+  reason: "finished" | "max_iterations" | "aborted";
+}
+
 const DEFAULT_MAX_ITERATIONS = 50;
 const WARN_RATIO = 0.8;
 const MAX_RETRIES = 3;
@@ -101,6 +107,7 @@ class AgentServiceImpl implements AgentService {
 
     while (iteration < maxIterations) {
       if (options.signal?.aborted) {
+        await this.afterRun(hooks, iteration, "aborted");
         yield { type: "agent_end", iterations: iteration, reason: "aborted" };
         return;
       }
@@ -148,6 +155,7 @@ class AgentServiceImpl implements AgentService {
           }
         }
         yield { type: "warning", message: `Model request failed (${error.code}): ${error.message}` };
+        await this.afterRun(hooks, iteration, "finished");
         yield { type: "agent_end", iterations: iteration, reason: "finished" };
         return;
       }
@@ -160,6 +168,7 @@ class AgentServiceImpl implements AgentService {
       yield { type: "message_end", message: assistantMessage };
 
       if (turn.toolCalls.length === 0) {
+        await this.afterRun(hooks, iteration, "finished");
         yield { type: "agent_end", iterations: iteration, reason: "finished" };
         return;
       }
@@ -196,7 +205,20 @@ class AgentServiceImpl implements AgentService {
       }
     }
 
+    await this.afterRun(hooks, iteration, "max_iterations");
     yield { type: "agent_end", iterations: iteration, reason: "max_iterations" };
+  }
+
+  /**
+   * Run the `loop/after-run` waterfall. Lifecycle listeners (router ejection,
+   * telemetry) must never break the loop, so failures are only warned.
+   */
+  private async afterRun(hooks: HookBusService, iterations: number, reason: LoopAfterRun["reason"]): Promise<void> {
+    try {
+      await hooks.waterfall<LoopAfterRun>("loop/after-run", { iterations, reason });
+    } catch (error) {
+      this.ctx.logger.warn(`loop/after-run hook failed: ${error instanceof Error ? error.message : String(error)}`);
+    }
   }
 
   /**
@@ -322,5 +344,6 @@ declare module "../../kernel/types" {
   interface HookMap {
     "loop/before-request": BeforeLoopRequest;
     "loop/compact": LoopCompact;
+    "loop/after-run": LoopAfterRun;
   }
 }

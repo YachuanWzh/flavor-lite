@@ -3,12 +3,12 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { Runtime, definePlugin } from "../src/kernel";
-import { hooksPlugin } from "../src/plugins/hooks";
+import { hooksPlugin, type HookBusService } from "../src/plugins/hooks";
 import { llmPlugin, type LlmService } from "../src/plugins/llm";
 import type { ModelAdapter, ModelEvent, ModelRequest } from "../src/plugins/llm/types";
 import { toolsPlugin, type ToolRegistry } from "../src/plugins/tools";
 import { promptPlugin } from "../src/plugins/prompt";
-import { loopPlugin, type AgentEvent, type AgentService } from "../src/plugins/loop";
+import { loopPlugin, type AgentEvent, type AgentService, type LoopAfterRun } from "../src/plugins/loop";
 import { sessionPlugin, type SessionService } from "../src/plugins/session";
 import type { Tool } from "../src/plugins/tools";
 
@@ -208,6 +208,80 @@ describe("agent loop plugin", () => {
     const placeholder = messages[3]!;
     expect(placeholder).toMatchObject({ role: "tool", toolCallId: "t2", isError: true });
     expect(placeholder.content).toMatch(/aborted/i);
+  });
+
+  describe("loop/after-run hook", () => {
+    function collectAfterRun(rt: Runtime): LoopAfterRun[] {
+      const seen: LoopAfterRun[] = [];
+      (rt.ctx.get("hooks") as HookBusService).hook("loop/after-run", async (event, next) => {
+        seen.push(event);
+        return next(event);
+      });
+      return seen;
+    }
+
+    it("fires once with reason finished on a normal run", async () => {
+      const requests: ModelRequest[] = [];
+      const rt = mount(
+        [[{ type: "text_delta", text: "done" }, { type: "done", stopReason: "end" }]],
+        requests,
+      );
+      const seen = collectAfterRun(rt);
+      const agent = rt.ctx.get("agent") as AgentService;
+      for await (const _ of agent.run({ input: "hi" })) {
+        /* drain */
+      }
+      expect(seen).toEqual([{ iterations: 1, reason: "finished" }]);
+    });
+
+    it("fires with reason aborted before agent_end when the signal is already aborted", async () => {
+      const requests: ModelRequest[] = [];
+      const rt = mount([], requests);
+      const seen = collectAfterRun(rt);
+      const aborter = new AbortController();
+      aborter.abort();
+      const agent = rt.ctx.get("agent") as AgentService;
+      const events: AgentEvent[] = [];
+      for await (const event of agent.run({ input: "hi", signal: aborter.signal })) events.push(event);
+      expect(seen).toEqual([{ iterations: 0, reason: "aborted" }]);
+      expect(events.at(-1)).toMatchObject({ type: "agent_end", reason: "aborted" });
+    });
+
+    it("fires with reason max_iterations when the model keeps calling tools", async () => {
+      const requests: ModelRequest[] = [];
+      const rt = mount(
+        [
+          [
+            { type: "tool_call", toolCall: { id: "t1", name: "Echo", args: { text: "spin" } } },
+            { type: "done", stopReason: "tool_calls" },
+          ],
+        ],
+        requests,
+        false,
+        true, // model repeats the same tool call forever
+      );
+      const seen = collectAfterRun(rt);
+      const agent = rt.ctx.get("agent") as AgentService;
+      for await (const _ of agent.run({ input: "spin", maxIterations: 2 })) {
+        /* drain */
+      }
+      expect(seen).toEqual([{ iterations: 2, reason: "max_iterations" }]);
+    });
+
+    it("survives a throwing after-run listener: the run still ends cleanly", async () => {
+      const requests: ModelRequest[] = [];
+      const rt = mount(
+        [[{ type: "text_delta", text: "done" }, { type: "done", stopReason: "end" }]],
+        requests,
+      );
+      (rt.ctx.get("hooks") as HookBusService).hook("loop/after-run", async () => {
+        throw new Error("lifecycle listener blew up");
+      });
+      const agent = rt.ctx.get("agent") as AgentService;
+      const events: AgentEvent[] = [];
+      for await (const event of agent.run({ input: "hi" })) events.push(event);
+      expect(events.at(-1)).toMatchObject({ type: "agent_end", reason: "finished" });
+    });
   });
 
   it("resolves model refs through the llm service", () => {

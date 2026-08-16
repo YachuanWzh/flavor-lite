@@ -8,14 +8,19 @@
 import { definePlugin } from "../../kernel";
 import type { Disposer, HookMap, PluginContext, WaterfallListener } from "../../kernel/types";
 
+export interface HookOptions {
+  /** Run before every listener registered so far (outermost in the chain). */
+  prepend?: boolean;
+}
+
 export interface HookBusService {
   /** Around-middleware pipeline. Listeners must call next() to delegate. */
   waterfall<K extends keyof HookMap>(name: K, value: HookMap[K]): Promise<HookMap[K]>;
   waterfall<T>(name: string, value: T): Promise<T>;
 
   /** Register an around-middleware listener. Returns a disposer. */
-  hook<K extends keyof HookMap>(name: K, listener: WaterfallListener<HookMap[K]>): Disposer;
-  hook<T>(name: string, listener: WaterfallListener<T>): Disposer;
+  hook<K extends keyof HookMap>(name: K, listener: WaterfallListener<HookMap[K]>, options?: HookOptions): Disposer;
+  hook<T>(name: string, listener: WaterfallListener<T>, options?: HookOptions): Disposer;
 }
 
 class HookBus implements HookBusService {
@@ -32,9 +37,12 @@ class HookBus implements HookBusService {
     return dispatch(value);
   }
 
-  hook<T>(name: string, listener: WaterfallListener<T>): Disposer {
+  hook<T>(name: string, listener: WaterfallListener<T>, options: HookOptions = {}): Disposer {
     const list = (this.hooks.get(name) ?? []) as WaterfallListener<unknown>[];
-    list.push(listener as WaterfallListener<unknown>);
+    // Prepend is for routers/policies that must observe the payload before
+    // every other listener (they become the outermost middleware).
+    if (options.prepend) list.unshift(listener as WaterfallListener<unknown>);
+    else list.push(listener as WaterfallListener<unknown>);
     this.hooks.set(name, list);
     return () => {
       const index = list.indexOf(listener as WaterfallListener<unknown>);

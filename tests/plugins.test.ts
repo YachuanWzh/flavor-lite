@@ -1,7 +1,7 @@
 import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { Runtime } from "../src/kernel";
 import { hooksPlugin } from "../src/plugins/hooks";
 import { toolsPlugin, type ToolRegistry } from "../src/plugins/tools";
@@ -60,7 +60,7 @@ describe("plugins loader", () => {
       .use(toolsPlugin)
       .use(commandsPlugin)
       .use(promptPlugin)
-      .use(pluginsLoaderPlugin, { runtime, roots: [pluginsRoot] });
+      .use(pluginsLoaderPlugin, { runtime, roots: [pluginsRoot], watch: false });
     runtime.start();
     loader = runtime.ctx.get("pluginsLoader") as PluginsLoaderService;
   }
@@ -213,5 +213,213 @@ export default {
 
     const unknown = await commands.execute("/plugin reload ghost");
     expect(unknown).toMatch(/error|not found/);
+  });
+
+  it("topologically sorts eager plugins so providers mount before consumers", async () => {
+    // "a-consumer" sorts before "z-provider" on disk, yet needs its service.
+    await writePlugin(
+      "a-consumer",
+      { name: "a-consumer" },
+      `
+export default {
+  name: "a-consumer",
+  inject: ["zservice"],
+  apply(ctx) {
+    return ctx.effect(() => ctx.get("tools").register({
+      name: "consumer_tool",
+      description: "uses zservice",
+      category: "read",
+      inputSchema: { type: "object" },
+      async execute() { return { content: ctx.get("zservice").value }; },
+    }), "a-consumer.install");
+  },
+};
+`,
+    );
+    await writePlugin(
+      "z-provider",
+      { name: "z-provider" },
+      `
+export default {
+  name: "z-provider",
+  provides: ["zservice"],
+  apply(ctx) {
+    return ctx.effect(() => ctx.provide("zservice", { value: "from-z" }), "z-provider.provide");
+  },
+};
+`,
+    );
+    createStack();
+    await loader.init();
+
+    const byName = new Map(loader.list().map((entry) => [entry.name, entry]));
+    expect(byName.get("a-consumer")?.status).toBe("loaded");
+    expect(byName.get("z-provider")?.status).toBe("loaded");
+
+    const tools = runtime.ctx.get("tools") as ToolRegistry;
+    const result = await tools.execute({ id: "t1", name: "consumer_tool", args: {} }, { cwd: tmp });
+    expect(result.content).toBe("from-z");
+  });
+
+  it("fails loud when an eager plugin depends on a dynamic plugin", async () => {
+    await writePlugin(
+      "dyn-prov",
+      { name: "dyn-prov", activation: "dynamic", provides: ["dynsvc"] },
+      `export default { name: "dyn-prov", provides: ["dynsvc"], apply(ctx) {
+        return ctx.effect(() => ctx.provide("dynsvc", {}), "dyn-prov.provide");
+      } };`,
+    );
+    await writePlugin(
+      "eager-user",
+      { name: "eager-user" },
+      `export default { name: "eager-user", inject: ["dynsvc"], apply(ctx) { ctx.get("dynsvc"); } };`,
+    );
+    createStack();
+    await loader.init();
+
+    const byName = new Map(loader.list().map((entry) => [entry.name, entry]));
+    expect(byName.get("eager-user")?.status).toBe("error");
+    expect(byName.get("eager-user")?.error).toMatch(/activation to "eager"/);
+    // The dynamic plugin stays catalogued, never mounted.
+    expect(byName.get("dyn-prov")?.status).toBe("unloaded");
+  });
+
+  it("keeps dynamic plugins unloaded until ensure() recalls them, and eject() returns them to the catalog", async () => {
+    await writePlugin(
+      "dyn-echo",
+      { name: "dyn-echo", activation: "dynamic", triggers: { tools: ["echo_tool"] } },
+      `
+export default {
+  name: "dyn-echo",
+  inject: ["tools"],
+  apply(ctx) {
+    return ctx.effect(() => ctx.get("tools").register({
+      name: "echo_tool", description: "echo", category: "read",
+      inputSchema: { type: "object" }, async execute() { return { content: "echo!" }; },
+    }), "dyn-echo.install");
+  },
+};
+`,
+    );
+    createStack();
+    await loader.init();
+    const tools = runtime.ctx.get("tools") as ToolRegistry;
+
+    expect(loader.list().find((entry) => entry.name === "dyn-echo")?.status).toBe("unloaded");
+    expect(tools.get("echo_tool")).toBeUndefined();
+    expect(loader.catalog().find((entry) => entry.name === "dyn-echo")?.triggers?.tools).toEqual(["echo_tool"]);
+
+    await loader.ensure("dyn-echo");
+    expect(loader.list().find((entry) => entry.name === "dyn-echo")?.status).toBe("loaded");
+    expect(tools.get("echo_tool")).toBeDefined();
+
+    await loader.eject("dyn-echo");
+    expect(loader.list().find((entry) => entry.name === "dyn-echo")?.status).toBe("unloaded");
+    expect(tools.get("echo_tool")).toBeUndefined();
+
+    await expect(loader.ensure("ghost")).rejects.toThrow(/not found/);
+  });
+
+  it("ensure() recursively loads manifest-declared dependencies", async () => {
+    await writePlugin(
+      "dyn-svc",
+      { name: "dyn-svc", activation: "dynamic", provides: ["svc"] },
+      `export default { name: "dyn-svc", provides: ["svc"], apply(ctx) {
+        return ctx.effect(() => ctx.provide("svc", { ok: true }), "dyn-svc.provide");
+      } };`,
+    );
+    await writePlugin(
+      "dyn-dep",
+      { name: "dyn-dep", activation: "dynamic" },
+      `export default { name: "dyn-dep", inject: ["svc"], apply(ctx) { ctx.get("svc"); } };`,
+    );
+    createStack();
+    await loader.init();
+
+    await loader.ensure("dyn-dep");
+
+    const byName = new Map(loader.list().map((entry) => [entry.name, entry]));
+    expect(byName.get("dyn-svc")?.status).toBe("loaded");
+    expect(byName.get("dyn-dep")?.status).toBe("loaded");
+  });
+
+  it("reload(name) force-loads a dynamic plugin", async () => {
+    await writePlugin(
+      "dyn-echo",
+      { name: "dyn-echo", activation: "dynamic" },
+      `export default { name: "dyn-echo", apply() {} };`,
+    );
+    createStack();
+    await loader.init();
+    expect(loader.list().find((entry) => entry.name === "dyn-echo")?.status).toBe("unloaded");
+
+    await loader.reload("dyn-echo");
+
+    expect(loader.list().find((entry) => entry.name === "dyn-echo")?.status).toBe("loaded");
+  });
+
+  describe("directory watching", () => {
+    function createWatchStack(): void {
+      runtime = Runtime.create({ cwd: tmp });
+      runtime
+        .use(hooksPlugin)
+        .use(toolsPlugin)
+        .use(commandsPlugin)
+        .use(promptPlugin)
+        .use(pluginsLoaderPlugin, { runtime, roots: [pluginsRoot], watch: true, watchDebounceMs: 20 });
+      runtime.start();
+      loader = runtime.ctx.get("pluginsLoader") as PluginsLoaderService;
+    }
+
+    it("catalogues a dynamic plugin dir created after init, without any reload", async () => {
+      createWatchStack();
+      await loader.init();
+      expect(loader.list()).toHaveLength(0);
+
+      await writePlugin(
+        "late",
+        { name: "late", activation: "dynamic", description: "arrives late" },
+        `export default { name: "late", apply() {} };`,
+      );
+
+      await vi.waitFor(() => {
+        const status = loader.list().find((entry) => entry.name === "late");
+        expect(status?.status).toBe("unloaded");
+        expect(status?.description).toBe("arrives late");
+      });
+    });
+
+    it("mounts a new eager plugin and drops a removed one", async () => {
+      createWatchStack();
+      await loader.init();
+
+      await writePlugin("demo", { name: "demo" }, demoEntry("v1"));
+      const tools = runtime.ctx.get("tools") as ToolRegistry;
+      await vi.waitFor(() => {
+        expect(loader.list().find((entry) => entry.name === "demo")?.status).toBe("loaded");
+        expect(tools.get("demo_tool")).toBeDefined();
+      });
+
+      await rm(join(pluginsRoot, "demo"), { recursive: true, force: true });
+      await vi.waitFor(() => {
+        expect(loader.list().find((entry) => entry.name === "demo")).toBeUndefined();
+        expect(tools.get("demo_tool")).toBeUndefined();
+      });
+    });
+
+    it("never touches a loaded plugin while syncing", async () => {
+      await writePlugin("demo", { name: "demo" }, demoEntry("v1"));
+      createWatchStack();
+      await loader.init();
+      expect(loader.list().find((entry) => entry.name === "demo")?.status).toBe("loaded");
+
+      // Editing the entry triggers sync, but the running instance stays mounted.
+      await writePlugin("demo", { name: "demo" }, demoEntry("v2"));
+      await new Promise((resolve) => setTimeout(resolve, 120));
+      expect(loader.list().find((entry) => entry.name === "demo")?.status).toBe("loaded");
+      const tools = runtime.ctx.get("tools") as ToolRegistry;
+      const result = await tools.execute({ id: "t1", name: "demo_tool", args: {} }, { cwd: tmp });
+      expect(result.content).toBe("demo v1"); // hot swap still requires /plugin reload
+    });
   });
 });

@@ -8,11 +8,14 @@
  *   (default `index.js`) whose default export is a Plugin or Plugin[].
  * - init() mounts everything once at startup; reload() unmounts and
  *   re-imports (cache-busted) so edits take effect without a restart.
+ * - Optional directory watching (default on): new plugins appear in the
+ *   catalog on their own and removed ones are unmounted; loaded plugins are
+ *   never touched by a sync, so an in-flight run is never disturbed.
  * - A broken plugin never crashes the host: it is marked `error` and the
  *   rest keeps running.
  */
 
-import { existsSync } from "node:fs";
+import { existsSync, watch, type FSWatcher } from "node:fs";
 import { mkdir, readdir, readFile, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { isAbsolute, join, resolve } from "node:path";
@@ -26,11 +29,36 @@ import { PLUGIN_TEMPLATE_FILES } from "./template";
 
 const MANIFEST_FILE = "flavor-plugin.json";
 
+const triggersSchema = z.object({
+  /** Case-insensitive substrings that recall the plugin (router L0). */
+  keywords: z.array(z.string()).optional(),
+  /** Regex sources, precompiled at load; an invalid one errors the plugin. */
+  patterns: z.array(z.string()).optional(),
+  /** Tool names the plugin registers; powers the router's tool fallback. */
+  tools: z.array(z.string()).optional(),
+  /** Command names the plugin registers. */
+  commands: z.array(z.string()).optional(),
+});
+
+export type PluginTriggers = z.infer<typeof triggersSchema>;
+
 const manifestSchema = z.object({
   name: z.string().min(1),
   version: z.string().optional(),
   entry: z.string().optional(),
   description: z.string().optional(),
+  /**
+   * eager (default): mounted at startup. dynamic: kept unloaded in the
+   * catalog until the router recalls it (or /plugin reload targets it).
+   */
+  activation: z.enum(["eager", "dynamic"]).default("eager"),
+  /** Routing hints for the router plugin; never affect activation itself. */
+  triggers: triggersSchema.optional(),
+  /**
+   * Service keys the plugins provide, declared so the loader can resolve
+   * cross-plugin dependencies without importing every candidate entry.
+   */
+  provides: z.array(z.string()).optional(),
   /** Passed as the `config` argument of every plugin's apply(). */
   config: z.record(z.string(), z.unknown()).optional(),
 });
@@ -46,9 +74,16 @@ export interface PluginStatus {
   dir: string;
   scope: "project" | "user";
   status: PluginLoadStatus;
+  /** dynamic plugins stay in the catalog until the router recalls them. */
+  activation: "eager" | "dynamic";
+  description?: string;
+  /** Routing hints from the manifest (router only). */
+  triggers?: PluginTriggers;
   error?: string;
   /** Service keys declared by the loaded plugins' `provides`. */
   provides: string[];
+  /** Service keys declared by the loaded plugins' `inject`. */
+  inject: string[];
 }
 
 export interface PluginsLoaderConfig {
@@ -56,6 +91,10 @@ export interface PluginsLoaderConfig {
   runtime: Runtime;
   /** Discovery roots, earliest shadows. Defaults to project + user dirs. */
   roots?: string[];
+  /** Watch the roots and sync the catalog on change. Default true. */
+  watch?: boolean;
+  /** Debounce window for watch events in ms. Default 250. */
+  watchDebounceMs?: number;
 }
 
 export interface PluginsLoaderService {
@@ -63,8 +102,14 @@ export interface PluginsLoaderService {
   init(): Promise<void>;
   /** Reload one plugin by name, or everything when omitted. */
   reload(name?: string): Promise<string[]>;
-  /** Status of every discovered plugin (loaded or errored). */
+  /** Status of every discovered plugin (loaded, unloaded, or errored). */
   list(): PluginStatus[];
+  /** Routing catalog for the router plugin: same data as list(). */
+  catalog(): PluginStatus[];
+  /** Load one plugin by name (recursing into its declared deps); no-op when loaded. */
+  ensure(name: string): Promise<void>;
+  /** Unload one loaded plugin; it returns to the catalog as unloaded. */
+  eject(name: string): Promise<void>;
   /** Scaffold a new plugin dir from the template. Returns the dir. */
   scaffold(name: string): Promise<string>;
 }
@@ -73,6 +118,12 @@ interface DiscoveredPlugin {
   dir: string;
   scope: "project" | "user";
   manifest: PluginManifest;
+}
+
+/** A discovered entry whose module was imported successfully. */
+interface ImportedEntry {
+  target: DiscoveredPlugin;
+  plugins: Plugin<unknown>[];
 }
 
 interface LoadedRecord {
@@ -93,27 +144,49 @@ function defaultRoots(cwd: string): Array<{ root: string; scope: "project" | "us
 class PluginsLoader implements PluginsLoaderService {
   private records = new Map<string, LoadedRecord>();
   private initialized = false;
+  /** Catalog of the last scan; ensure() resolves deps against it. */
+  private discoveredCache: DiscoveredPlugin[] = [];
+  private readonly watchEnabled: boolean;
+  private readonly watchDebounceMs: number;
+  private readonly watchedRoots = new Set<string>();
+  private watchers: FSWatcher[] = [];
+  private syncTimer: NodeJS.Timeout | undefined;
+  private syncing = false;
+  private dirty = false;
 
   constructor(
     private readonly ctx: PluginContext,
     private readonly runtime: Runtime,
     private readonly roots: Array<{ root: string; scope: "project" | "user" }>,
-  ) {}
+    watchEnabled = true,
+    watchDebounceMs = 250,
+  ) {
+    this.watchEnabled = watchEnabled;
+    this.watchDebounceMs = watchDebounceMs;
+  }
 
   async init(): Promise<void> {
     if (this.initialized) return;
     this.initialized = true;
     await this.reload();
+    this.startWatch();
   }
 
   async reload(name?: string): Promise<string[]> {
     const { discovered, scanErrors } = await this.scan();
+    this.discoveredCache = discovered;
 
     if (name !== undefined) {
       const target = discovered.find((entry) => entry.manifest.name === name);
       if (target) {
         await this.unload(name);
-        await this.load(target);
+        try {
+          await this.loadOne(target);
+        } catch (error) {
+          // Reload is an operator action: record the failure in the catalog
+          // instead of throwing, and leave the old version unmounted.
+          this.failImport(target, errorMessage(error));
+        }
         return [name];
       }
       const broken = scanErrors.find((entry) => entry.name === name || this.recordDirName(name) === entry.name);
@@ -129,12 +202,38 @@ class PluginsLoader implements PluginsLoaderService {
     for (const key of [...this.records.keys()]) await this.unload(key);
     this.records.clear();
     for (const errorStatus of scanErrors) this.records.set(errorStatus.name, { status: errorStatus, pluginNames: [] });
-    for (const target of discovered) await this.load(target);
+    await this.loadAll(discovered);
     return discovered.map((entry) => entry.manifest.name);
   }
 
   list(): PluginStatus[] {
     return [...this.records.values()].map((record) => record.status);
+  }
+
+  catalog(): PluginStatus[] {
+    return this.list();
+  }
+
+  async ensure(name: string): Promise<void> {
+    const record = this.records.get(name);
+    if (record?.status.status === "loaded") return;
+    let target = this.discoveredCache.find((entry) => entry.manifest.name === name);
+    if (!target) {
+      // No scan yet (or a new dir appeared): rescan once before giving up.
+      const { discovered } = await this.scan();
+      this.discoveredCache = discovered;
+      target = discovered.find((entry) => entry.manifest.name === name);
+    }
+    if (!target) {
+      throw new Error(`plugin "${name}" not found (searched: ${this.roots.map((entry) => entry.root).join(", ")})`);
+    }
+    await this.loadOne(target);
+  }
+
+  async eject(name: string): Promise<void> {
+    const record = this.records.get(name);
+    if (!record || record.status.status !== "loaded") return;
+    await this.unload(name);
   }
 
   async scaffold(name: string): Promise<string> {
@@ -147,7 +246,20 @@ class PluginsLoader implements PluginsLoaderService {
     for (const file of PLUGIN_TEMPLATE_FILES) {
       await writeFile(join(dir, file.path), file.render(name), "utf-8");
     }
+    // The root may not have existed when init() started watching.
+    this.startWatch();
     return dir;
+  }
+
+  /** Close all watchers and cancel any pending sync. Called on unmount. */
+  stopWatch(): void {
+    for (const watcher of this.watchers) watcher.close();
+    this.watchers = [];
+    this.watchedRoots.clear();
+    if (this.syncTimer) {
+      clearTimeout(this.syncTimer);
+      this.syncTimer = undefined;
+    }
   }
 
   /** Scan every root. Broken manifests become error statuses, never throws. */
@@ -175,8 +287,10 @@ class PluginsLoader implements PluginsLoaderService {
             dir,
             scope,
             status: "error",
+            activation: "eager",
             error: `invalid ${MANIFEST_FILE}: ${errorMessage(error)}`,
             provides: [],
+            inject: [],
           });
           continue;
         }
@@ -187,48 +301,140 @@ class PluginsLoader implements PluginsLoaderService {
     return { discovered: [...discovered.values()], scanErrors };
   }
 
-  private async load(target: DiscoveredPlugin): Promise<void> {
-    const { dir, scope, manifest } = target;
-    const base: PluginStatus = {
-      name: manifest.name,
-      version: manifest.version ?? "0.0.0",
-      dir,
-      scope,
-      status: "unloaded",
-      provides: [],
-    };
-    const fail = (error: string): void => {
-      this.records.set(manifest.name, { status: { ...base, status: "error", error }, pluginNames: [] });
-      this.ctx.logger.warn(`plugin "${manifest.name}" failed to load: ${error}`);
-    };
-
-    const entryPath = resolve(dir, manifest.entry ?? "index.js");
-    if (!existsSync(entryPath)) {
-      fail(`entry not found: ${manifest.entry ?? "index.js"}`);
-      return;
+  /**
+   * Full-reload load path: import every entry first, then activate eagers in
+   * dependency order (a plugin may inject a service another one needs, so
+   * scan order is not enough). Dynamic entries only join the catalog.
+   */
+  private async loadAll(discovered: DiscoveredPlugin[]): Promise<void> {
+    const imported: ImportedEntry[] = [];
+    for (const target of discovered) {
+      try {
+        imported.push({ target, plugins: await this.importEntry(target) });
+      } catch (error) {
+        this.failImport(target, errorMessage(error));
+      }
     }
+
+    // Services claimed by dynamic plugins: an eager plugin needing one of
+    // these could never be satisfied deterministically, so fail loud.
+    const dynamicProvides = new Map<string, string>();
+    for (const entry of imported) {
+      if (entry.target.manifest.activation !== "dynamic") continue;
+      for (const plugin of entry.plugins) {
+        for (const key of plugin.provides ?? []) dynamicProvides.set(key, entry.target.manifest.name);
+      }
+    }
+    const activeKeys = new Set(this.runtime.ctx.keys());
+
+    const eager: ImportedEntry[] = [];
+    for (const entry of imported) {
+      if (entry.target.manifest.activation === "dynamic") continue;
+      const blocked = entry.plugins
+        .flatMap((plugin) => plugin.inject ?? [])
+        .filter((key) => !activeKeys.has(key) && dynamicProvides.has(key));
+      const blocker = blocked[0];
+      if (blocker !== undefined) {
+        this.failImport(
+          entry.target,
+          `eager plugin requires service "${blocker}" provided by dynamic plugin "${dynamicProvides.get(blocker)}" ` +
+            `\u2014 set that plugin's activation to "eager"`,
+        );
+        continue;
+      }
+      eager.push(entry);
+    }
+
+    // Duplicate providers among eager disk plugins fail loud per plugin.
+    const provider = new Map<string, string>();
+    const unique: ImportedEntry[] = [];
+    for (const entry of eager) {
+      const keys = entry.plugins.flatMap((plugin) => plugin.provides ?? []);
+      const conflict = keys.find((key) => provider.has(key));
+      if (conflict !== undefined) {
+        this.failImport(entry.target, `service "${conflict}" is already provided by plugin "${provider.get(conflict)}"`);
+        continue;
+      }
+      for (const key of keys) provider.set(key, entry.target.manifest.name);
+      unique.push(entry);
+    }
+
+    for (const entry of this.topoSort(unique)) await this.mountEntry(entry);
+
+    // Dynamic entries: catalogued, not mounted \u2014 the router recalls them.
+    for (const entry of imported) {
+      if (entry.target.manifest.activation !== "dynamic") continue;
+      this.records.set(entry.target.manifest.name, {
+        status: this.baseStatus(entry.target, "unloaded", entry.plugins),
+        pluginNames: [],
+      });
+    }
+  }
+
+  /**
+   * Load one entry, resolving cross-plugin dependencies first: an inject key
+   * that is not active yet must come from a manifest-declared provider
+   * (`provides` in flavor-plugin.json), which is loaded recursively.
+   */
+  private async loadOne(target: DiscoveredPlugin, visiting: string[] = []): Promise<void> {
+    const { manifest } = target;
+    if (visiting.includes(manifest.name)) {
+      throw new Error(`plugin dependency cycle: ${[...visiting, manifest.name].join(" -> ")}`);
+    }
+    const plugins = await this.importEntry(target);
+
+    const byProvidedKey = new Map<string, DiscoveredPlugin>();
+    for (const candidate of this.discoveredCache) {
+      for (const key of candidate.manifest.provides ?? []) byProvidedKey.set(key, candidate);
+    }
+    const activeKeys = new Set(this.runtime.ctx.keys());
+    for (const plugin of plugins) {
+      for (const key of plugin.inject ?? []) {
+        if (activeKeys.has(key)) continue;
+        const providerTarget = byProvidedKey.get(key);
+        if (!providerTarget || providerTarget.manifest.name === manifest.name) continue;
+        if (this.records.get(providerTarget.manifest.name)?.status.status === "loaded") continue;
+        // A failed provider surfaces loudly via activation below.
+        await this.loadOne(providerTarget, [...visiting, manifest.name]).catch(() => {});
+      }
+    }
+
+    await this.mountEntry({ target, plugins });
+  }
+
+  /** Import and validate an entry without activating it. Throws on failure. */
+  private async importEntry(target: DiscoveredPlugin): Promise<Plugin<unknown>[]> {
+    const { dir, manifest } = target;
+    const entryPath = resolve(dir, manifest.entry ?? "index.js");
+    if (!existsSync(entryPath)) throw new Error(`entry not found: ${manifest.entry ?? "index.js"}`);
 
     let mod: unknown;
     try {
       // Cache-bust query so reload() re-reads the file from disk.
       mod = await import(`${pathToFileURL(entryPath).href}?v=${Date.now()}`);
     } catch (error) {
-      fail(`import failed: ${errorMessage(error)}`);
-      return;
+      throw new Error(`import failed: ${errorMessage(error)}`);
     }
+    const plugins = normalizeExport((mod as { default?: unknown }).default);
 
-    let plugins: Plugin<unknown>[];
-    try {
-      plugins = normalizeExport((mod as { default?: unknown }).default);
-    } catch (error) {
-      fail(errorMessage(error));
-      return;
+    // Trigger patterns must compile, or the plugin is unusable for routing.
+    for (const source of manifest.triggers?.patterns ?? []) {
+      try {
+        new RegExp(source);
+      } catch (error) {
+        throw new Error(`invalid triggers.patterns "${source}": ${errorMessage(error)}`);
+      }
     }
+    return plugins;
+  }
 
+  /** Activate an imported entry on the runtime; failures become error records. */
+  private async mountEntry(entry: ImportedEntry): Promise<void> {
+    const { target, plugins } = entry;
     const active = new Set(this.runtime.activePlugins());
     for (const plugin of plugins) {
       if (active.has(plugin.name)) {
-        fail(`plugin name "${plugin.name}" is already active (plugin names must be unique)`);
+        this.failImport(target, `plugin name "${plugin.name}" is already active (plugin names must be unique)`);
         return;
       }
     }
@@ -237,42 +443,202 @@ class PluginsLoader implements PluginsLoaderService {
     try {
       for (const plugin of plugins) {
         // Runtime is started at this point, so use() activates immediately.
-        this.runtime.use(plugin, manifest.config as never);
+        this.runtime.use(plugin, target.manifest.config as never);
         mounted.push(plugin.name);
       }
     } catch (error) {
       for (const mountedName of mounted.reverse()) await this.runtime.unmount(mountedName);
-      fail(`activation failed: ${errorMessage(error)}`);
+      this.failImport(target, `activation failed: ${errorMessage(error)}`);
       return;
     }
 
-    this.records.set(manifest.name, {
-      status: {
-        ...base,
-        status: "loaded",
-        provides: plugins.flatMap((plugin) => plugin.provides ?? []),
-      },
+    this.records.set(target.manifest.name, {
+      status: this.baseStatus(target, "loaded", plugins),
       pluginNames: mounted,
     });
+  }
+
+  /** Topological order over entries: inject keys pull providers forward. */
+  private topoSort(entries: ImportedEntry[]): ImportedEntry[] {
+    const provider = new Map<string, ImportedEntry>();
+    for (const entry of entries) {
+      for (const plugin of entry.plugins) {
+        for (const key of plugin.provides ?? []) provider.set(key, entry);
+      }
+    }
+    const existing = new Set(this.runtime.ctx.keys());
+    const order: ImportedEntry[] = [];
+    const state = new Map<ImportedEntry, "visiting" | "done">();
+    const visit = (entry: ImportedEntry, chain: string[]): void => {
+      const status = state.get(entry);
+      if (status === "done") return;
+      if (status === "visiting") {
+        throw new Error(`plugin dependency cycle: ${[...chain, entry.target.manifest.name].join(" -> ")}`);
+      }
+      state.set(entry, "visiting");
+      for (const plugin of entry.plugins) {
+        for (const key of plugin.inject ?? []) {
+          if (existing.has(key)) continue;
+          const upstream = provider.get(key);
+          if (!upstream) continue; // absent service fails loud at mount
+          visit(upstream, [...chain, entry.target.manifest.name]);
+        }
+      }
+      state.set(entry, "done");
+      order.push(entry);
+    };
+    for (const entry of entries) visit(entry, []);
+    return order;
+  }
+
+  private baseStatus(target: DiscoveredPlugin, status: PluginLoadStatus, plugins?: Plugin<unknown>[]): PluginStatus {
+    const { dir, scope, manifest } = target;
+    return {
+      name: manifest.name,
+      version: manifest.version ?? "0.0.0",
+      dir,
+      scope,
+      status,
+      activation: manifest.activation,
+      ...(manifest.description ? { description: manifest.description } : {}),
+      ...(manifest.triggers ? { triggers: manifest.triggers } : {}),
+      provides: plugins ? plugins.flatMap((plugin) => plugin.provides ?? []) : [],
+      inject: plugins ? [...new Set(plugins.flatMap((plugin) => plugin.inject ?? []))] : [],
+    };
+  }
+
+  private failImport(target: DiscoveredPlugin, error: string): void {
+    this.records.set(target.manifest.name, {
+      status: { ...this.baseStatus(target, "error"), error },
+      pluginNames: [],
+    });
+    this.ctx.logger.warn(`plugin "${target.manifest.name}" failed to load: ${error}`);
   }
 
   private async unload(name: string): Promise<void> {
     const record = this.records.get(name);
     if (!record) return;
-    for (const pluginName of record.pluginNames.reverse()) {
+    for (const pluginName of [...record.pluginNames].reverse()) {
       try {
         await this.runtime.unmount(pluginName);
       } catch (error) {
         this.ctx.logger.warn(`plugin "${pluginName}" failed during unmount: ${errorMessage(error)}`);
       }
     }
-    this.records.delete(name);
+    // Back to the catalog as unloaded: eject/reload can pick it up again.
+    this.records.set(name, {
+      status: { ...record.status, status: "unloaded", provides: [], inject: [] },
+      pluginNames: [],
+    });
   }
 
   /** Directory name of a previously loaded record, for matching scan errors. */
   private recordDirName(name: string): string | undefined {
     const dir = this.records.get(name)?.status.dir;
     return dir === undefined ? undefined : dir.split(/[\\/]/).pop();
+  }
+
+  /**
+   * Watch every root for plugin changes (idempotent per root). Recursive so
+   * edits inside a plugin dir are seen too; missing roots are skipped —
+   * scaffold() retries once it creates one.
+   */
+  private startWatch(): void {
+    if (!this.watchEnabled) return;
+    for (const { root } of this.roots) {
+      if (this.watchedRoots.has(root) || !existsSync(root)) continue;
+      try {
+        const watcher = watch(root, { recursive: true }, () => this.scheduleSync());
+        watcher.on("error", () => watcher.close());
+        this.watchers.push(watcher);
+        this.watchedRoots.add(root);
+      } catch {
+        /* unsupported or vanished root: catalog stays scan/reload driven */
+      }
+    }
+  }
+
+  private scheduleSync(): void {
+    if (this.syncTimer) clearTimeout(this.syncTimer);
+    this.syncTimer = setTimeout(() => {
+      this.syncTimer = undefined;
+      void this.sync();
+    }, this.watchDebounceMs);
+    // Watchers must never keep the process alive.
+    this.syncTimer.unref?.();
+  }
+
+  /**
+   * Reconcile the catalog with disk after a watch event:
+   * - new plugins enter the catalog (eagers mount, dynamics stay unloaded);
+   * - removed plugins are unmounted and dropped;
+   * - unloaded records refresh their metadata (manifest edits change routing);
+   * - loaded plugins are never touched, so an in-flight run stays intact
+   *   (use /plugin reload <name> to hot-swap one deliberately).
+   */
+  private async sync(): Promise<void> {
+    if (this.syncing) {
+      this.dirty = true;
+      return;
+    }
+    this.syncing = true;
+    try {
+      const { discovered, scanErrors } = await this.scan();
+      this.discoveredCache = discovered;
+      const seen = new Set<string>();
+
+      for (const errorStatus of scanErrors) {
+        seen.add(errorStatus.name);
+        const existing = this.records.get(errorStatus.name);
+        // A broken manifest must not yank a running plugin out mid-flight.
+        if (!existing || existing.status.status !== "loaded") {
+          this.records.set(errorStatus.name, { status: errorStatus, pluginNames: [] });
+        }
+      }
+
+      for (const target of discovered) {
+        const name = target.manifest.name;
+        seen.add(name);
+        const record = this.records.get(name);
+        if (!record) {
+          if (target.manifest.activation === "dynamic") {
+            this.records.set(name, { status: this.baseStatus(target, "unloaded"), pluginNames: [] });
+          } else {
+            try {
+              await this.loadOne(target);
+            } catch (error) {
+              this.failImport(target, errorMessage(error));
+            }
+          }
+        } else if (record.status.status !== "loaded") {
+          if (target.manifest.activation === "dynamic") {
+            // Refresh routing metadata (triggers/description) from the manifest.
+            this.records.set(name, { status: this.baseStatus(target, "unloaded"), pluginNames: [] });
+          } else {
+            // A repaired eager plugin should run: mount it like at startup.
+            try {
+              await this.loadOne(target);
+            } catch (error) {
+              this.failImport(target, errorMessage(error));
+            }
+          }
+        }
+      }
+
+      for (const name of [...this.records.keys()]) {
+        if (seen.has(name)) continue;
+        await this.unload(name);
+        this.records.delete(name);
+      }
+    } catch (error) {
+      this.ctx.logger.warn(`plugin watch sync failed: ${errorMessage(error)}`);
+    } finally {
+      this.syncing = false;
+      if (this.dirty) {
+        this.dirty = false;
+        this.scheduleSync();
+      }
+    }
   }
 }
 
@@ -318,7 +684,8 @@ function registerPluginCommand(ctx: PluginContext, loader: PluginsLoader): () =>
           if (statuses.length === 0) return "no plugins found (.flavorlite/plugins/ is empty)";
           return statuses
             .map((status) => {
-              const head = `  ${status.name.padEnd(16)} ${status.version.padEnd(8)} ${status.status.padEnd(7)} [${status.scope}]`;
+              const flags = `[${status.scope}]${status.activation === "dynamic" ? " [dynamic]" : ""}`;
+              const head = `  ${status.name.padEnd(16)} ${status.version.padEnd(8)} ${status.status.padEnd(8)} ${flags}`;
               const detail =
                 status.status === "error"
                   ? `\n    error: ${status.error}`
@@ -373,10 +740,17 @@ export const pluginsLoaderPlugin = definePlugin<PluginsLoaderConfig>({
           ? { root: isAbsolute(root) ? root : resolve(ctx.cwd, root), scope: "project" as const }
           : root,
       );
-      const loader = new PluginsLoader(ctx, config.runtime, roots);
+      const loader = new PluginsLoader(
+        ctx,
+        config.runtime,
+        roots,
+        config.watch ?? true,
+        config.watchDebounceMs ?? 250,
+      );
       const disposeService = ctx.provide("pluginsLoader", loader);
       const disposeCommand = registerPluginCommand(ctx, loader);
       return () => {
+        loader.stopWatch();
         disposeCommand();
         disposeService();
       };

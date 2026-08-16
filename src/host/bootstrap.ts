@@ -19,6 +19,7 @@ import { skillsPlugin } from "../plugins/skills";
 import { commandsPlugin } from "../plugins/commands";
 import { initPlugin } from "../plugins/init";
 import { pluginsLoaderPlugin } from "../plugins/plugins";
+import { routerPlugin } from "../plugins/router";
 import { loadConfig, type FlavorConfig } from "./config";
 
 export interface BootstrapOptions {
@@ -75,7 +76,10 @@ export function createAgent(options: BootstrapOptions = {}): AgentHandle {
     // Disk plugin discovery (.flavorlite/plugins). Mounts last so loaded
     // plugins can inject every default service; hosts call init() after
     // start() since discovery is async.
-    .use(pluginsLoaderPlugin, { runtime });
+    .use(pluginsLoaderPlugin, { runtime })
+    // On-demand recall + idle ejection for dynamic plugins. Mounted after
+    // the loader so its hooks wrap every request and tool call.
+    .use(routerPlugin);
   for (const extra of options.plugins ?? []) runtime.use(extra.plugin, extra.config);
   runtime.start();
 

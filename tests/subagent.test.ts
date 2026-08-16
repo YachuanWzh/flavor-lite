@@ -69,7 +69,7 @@ describe("subagent plugin", () => {
       .use(promptPlugin)
       .use(loopPlugin)
       .use(sessionPlugin)
-      .use(pluginsLoaderPlugin, { runtime, roots: [PLUGINS_ROOT] });
+      .use(pluginsLoaderPlugin, { runtime, roots: [PLUGINS_ROOT], watch: false });
     runtime.start();
     return runtime;
   }
@@ -80,8 +80,11 @@ describe("subagent plugin", () => {
     const loader = rt.ctx.get("pluginsLoader") as PluginsLoaderService;
     await loader.init();
 
+    // Dynamic activation: catalogued at init, mounted only when ensured.
     const status = loader.list().find((entry) => entry.name === "subagent");
-    expect(status?.status).toBe("loaded");
+    expect(status?.status).toBe("unloaded");
+    await loader.ensure("subagent");
+    expect(loader.list().find((entry) => entry.name === "subagent")?.status).toBe("loaded");
 
     // The spawn tool is registered and the guidance section is assembled.
     const tools = rt.ctx.get("tools") as ToolRegistry;
@@ -103,6 +106,7 @@ describe("subagent plugin", () => {
     );
     const loader = rt.ctx.get("pluginsLoader") as PluginsLoaderService;
     await loader.init();
+    await loader.ensure("subagent");
 
     const agent = rt.ctx.get("agent") as AgentService;
     const events: AgentEvent[] = [];
@@ -155,6 +159,7 @@ describe("subagent plugin", () => {
     );
     const loader = rt.ctx.get("pluginsLoader") as PluginsLoaderService;
     await loader.init();
+    await loader.ensure("subagent");
 
     const agent = rt.ctx.get("agent") as AgentService;
     const events: AgentEvent[] = [];

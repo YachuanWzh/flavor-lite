@@ -24,7 +24,7 @@ export { messageFootprint, messageText, sanitizeHistory } from "./shared/message
 
 // capability plugins
 export { hooksPlugin } from "./plugins/hooks";
-export type { HookBusService } from "./plugins/hooks";
+export type { HookBusService, HookOptions } from "./plugins/hooks";
 
 export { llmPlugin, type LlmPluginConfig, type LlmService, type ProviderEntry, type StreamOptions } from "./plugins/llm";
 export { OpenAIAdapter, finalizeToolCall, type OpenAIAdapterOptions } from "./plugins/llm/openai";
@@ -48,7 +48,7 @@ export type { PromptAssemble, PromptSection, PromptService } from "./plugins/pro
 export { identityPlugin, securityPlugin, tasksPlugin, environmentPlugin, guidancePlugins } from "./plugins/guidance";
 
 export { loopPlugin } from "./plugins/loop";
-export type { AgentEvent, AgentRunOptions, AgentService, BeforeLoopRequest, LoopCompact } from "./plugins/loop";
+export type { AgentEvent, AgentRunOptions, AgentService, BeforeLoopRequest, LoopAfterRun, LoopCompact } from "./plugins/loop";
 
 // feature plugins
 export { compactionPlugin, compactMessages } from "./plugins/compaction";
@@ -65,7 +65,10 @@ export type {
   PluginsLoaderConfig,
   PluginsLoaderService,
   PluginStatus,
+  PluginTriggers,
 } from "./plugins/plugins";
+export { routerPlugin, tokenize, fingerprint } from "./plugins/router";
+export type { RouterPluginConfig, RouterService } from "./plugins/router";
 
 // host composition
 export { createAgent } from "./host/bootstrap";

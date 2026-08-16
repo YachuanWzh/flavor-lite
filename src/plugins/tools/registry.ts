@@ -103,14 +103,17 @@ class ToolRegistryImpl implements ToolRegistry {
     if (before.block) {
       return { content: before.reason ?? `Tool "${toolCall.name}" was blocked by policy.`, isError: true };
     }
-    if (!tool) {
+    // A before-call hook (e.g. the router's L2 recall) may have mounted the
+    // tool mid-waterfall: re-resolve before giving up.
+    const resolved = tool ?? this.tools.get(toolCall.name);
+    if (!resolved) {
       const known = this.list().map((entry) => entry.name).join(", ") || "none";
       return { content: `Tool "${toolCall.name}" not found. Available tools: ${known}`, isError: true };
     }
 
     let result: ToolResult;
     try {
-      result = await tool.execute(before.args, execCtx);
+      result = await resolved.execute(before.args, execCtx);
     } catch (error) {
       result = {
         content: error instanceof Error ? error.message : String(error),
