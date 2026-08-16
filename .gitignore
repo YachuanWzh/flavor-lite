@@ -2,10 +2,7 @@ node_modules/
 dist/
 *.tgz
 .env
-.flavor/sessions/
 .DS_Store
-.flavor
-FLAVOR.md
 
 # 临时文件 / 构建产物
 *.log
@@ -14,3 +11,4 @@ FLAVOR.md
 *.tsbuildinfo
 coverage/
 .flavorlite
+.flavor

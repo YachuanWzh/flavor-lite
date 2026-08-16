@@ -1,8 +1,8 @@
 /**
  * Skills plugin: flavor-style SKILL.md discovery. Skills live in
- * `.flavor/skills/<name>/SKILL.md` (project), `.flavorlite/skills/<name>/`
- * (flavor-lite native) and `~/.flavor/skills/` (user-global). Only name +
- * description are injected into the system prompt; the model reads the full
+ * `.flavorlite/skills/<name>/SKILL.md` (project) and
+ * `~/.flavorlite/skills/` (user-global). Only name + description are
+ * injected into the system prompt; the model reads the full
  * SKILL.md via Read when a skill applies — keeps the prompt lean and startup
  * fast.
  */
@@ -43,9 +43,8 @@ class SkillsServiceImpl implements SkillsService {
 
   async discover(): Promise<SkillInfo[]> {
     const roots = [
-      join(this.ctx.cwd, ".flavor", "skills"),
       join(this.ctx.cwd, ".flavorlite", "skills"),
-      join(homedir(), ".flavor", "skills"),
+      join(homedir(), ".flavorlite", "skills"),
     ];
     const skills = new Map<string, SkillInfo>();
     for (const root of roots) {

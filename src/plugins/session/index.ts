@@ -1,5 +1,5 @@
 /**
- * Session plugin: append-only JSONL persistence under `.flavor/sessions/`.
+ * Session plugin: append-only JSONL persistence under `.flavorlite/sessions/`.
  * Follows dsh's rule "model-visible ⇔ logged": the loop appends every message
  * that can reach a model request, so a session file fully reconstructs state.
  */
@@ -113,7 +113,7 @@ class SessionServiceImpl implements SessionService {
   readonly dir: string;
 
   constructor(private readonly ctx: PluginContext) {
-    this.dir = join(ctx.cwd, ".flavor", "sessions");
+    this.dir = join(ctx.cwd, ".flavorlite", "sessions");
   }
 
   async create(options?: { model?: string }): Promise<SessionHandle> {

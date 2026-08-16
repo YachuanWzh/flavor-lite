@@ -78,7 +78,7 @@ flavor-lite/
 │   │   ├── llm/                  #   大模型能力缝：适配器注册表、OpenAI/Anthropic 适配器、SSE 解析
 │   │   ├── tools/                #   工具能力缝：工具注册表 + before/after 钩子 + 7 个内置工具
 │   │   ├── permission/           #   权限插件：4 种模式 + 危险命令硬拦截
-│   │   ├── session/              #   会话插件：.flavor/sessions 下的 JSONL 持久化
+│   │   ├── session/              #   会话插件：.flavorlite/sessions 下的 JSONL 持久化
 │   │   ├── prompt/               #   提示词插件：纯装配器，只负责拼接各插件贡献的节
 │   │   ├── guidance/             #   引导插件：身份/安全/任务/环境 四个提示词节
 │   │   ├── loop/                 #   智能体循环插件：流式、steering、重试、压缩钩子
@@ -224,7 +224,7 @@ export const myPlugin = definePlugin({
 
 ### 4. 会话插件（`plugins/session/`）——JSONL 持久化
 
-- 每个会话是一个文件：`.flavor/sessions/<时间戳>-<随机数>.jsonl`
+- 每个会话是一个文件：`.flavorlite/sessions/<时间戳>-<随机数>.jsonl`
 - 追加式写入，每行一个 JSON（header/message/title）
 - 打开时会**隔离损坏的行**（崩溃残留的截断行被跳过，不丢整个文件）
 - 提供 `create/open/latest/list` 服务，支持 `/sessions`、`/resume`、`/new` 命令
@@ -279,9 +279,9 @@ sanitizeHistory 修复历史
 
 ### 8. 其他插件
 
-- **skills**：扫描 `.flavor/skills/<name>/SKILL.md`（项目）和 `~/.flavor/skills/`（用户全局），只把技能的名字和描述注入提示词，模型用到时再用 Read 工具读全文——保持提示词精简
+- **skills**：扫描 `.flavorlite/skills/<name>/SKILL.md`（项目）和 `~/.flavorlite/skills/`（用户全局），只把技能的名字和描述注入提示词，模型用到时再用 Read 工具读全文——保持提示词精简
 - **commands**：斜杠命令注册表，`/model`、`/permissions`、`/sessions`、`/resume`、`/new`、`/help` 由宿主注册，`/init` 由 init 插件注册
-- **init**：FLAVOR.md 项目指南作为提示词节注入；`/init` 让 agent 自己探索项目并生成 `.flavor/FLAVOR.md`
+- **init**：FLAVOR.md 项目指南作为提示词节注入；`/init` 让 agent 自己探索项目并生成 `.flavorlite/FLAVOR.md`
 
 ---
 
@@ -302,8 +302,8 @@ llm → tools → guidance(4个) → 内置7工具 → permission → session
 
 配置来源从低到高合并：
 
-1. `~/.flavor/config.json`（用户全局）
-2. `.flavor/flavor.json`（项目）
+1. `~/.flavorlite/config.json`（用户全局）
+2. `.flavorlite/flavor.json`（项目）
 3. 环境变量 / `.env`（内置极简 .env 加载器，不覆盖已有环境变量）
 4. CLI 参数
 

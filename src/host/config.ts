@@ -1,7 +1,7 @@
 /**
  * Configuration: multi-source merge, validated with zod, fail loud.
- * Precedence (lowest → highest): user config (~/.flavor/config.json),
- * project config (.flavor/flavor.json), environment variables, CLI options.
+ * Precedence (lowest → highest): user config (~/.flavorlite/config.json),
+ * project config (.flavorlite/flavor.json), environment variables, CLI options.
  * A tiny .env loader keeps the dependency count at one (zod).
  */
 
@@ -113,10 +113,10 @@ function fromEnv(): FlavorConfig {
 export function loadConfig(cwd: string, overrides?: FlavorConfig): FlavorConfig {
   loadDotEnv(cwd);
   let merged: FlavorConfig = {};
-  const userConfig = readJsonFile(join(homedir(), ".flavor", "config.json"));
-  if (userConfig !== undefined) merged = deepMerge(merged, parseConfig(userConfig, "~/.flavor/config.json"));
-  const projectConfig = readJsonFile(join(cwd, ".flavor", "flavor.json"));
-  if (projectConfig !== undefined) merged = deepMerge(merged, parseConfig(projectConfig, ".flavor/flavor.json"));
+  const userConfig = readJsonFile(join(homedir(), ".flavorlite", "config.json"));
+  if (userConfig !== undefined) merged = deepMerge(merged, parseConfig(userConfig, "~/.flavorlite/config.json"));
+  const projectConfig = readJsonFile(join(cwd, ".flavorlite", "flavor.json"));
+  if (projectConfig !== undefined) merged = deepMerge(merged, parseConfig(projectConfig, ".flavorlite/flavor.json"));
   merged = deepMerge(merged, fromEnv());
   if (overrides) merged = deepMerge(merged, overrides);
   return merged;

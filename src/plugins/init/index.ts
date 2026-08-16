@@ -1,9 +1,9 @@
 /**
  * Init plugin: the project guide (FLAVOR.md) as a plugin.
- * - If `.flavor/FLAVOR.md` or `FLAVOR.md` exists at the project root, its
+ * - If `.flavorlite/FLAVOR.md` or `FLAVOR.md` exists at the project root, its
  *   content becomes a prompt section on every request.
  * - `/init` runs one agent turn that explores the project and writes
- *   `.flavor/FLAVOR.md`, so the guide itself is produced by the agent.
+ *   `.flavorlite/FLAVOR.md`, so the guide itself is produced by the agent.
  */
 
 import { access, readFile } from "node:fs/promises";
@@ -14,7 +14,7 @@ import type { AgentEvent } from "../loop";
 import type { PromptAssemble } from "../prompt";
 import type { CommandsService } from "../commands";
 
-const GUIDE_CANDIDATES = [".flavor/FLAVOR.md", "FLAVOR.md"];
+const GUIDE_CANDIDATES = [".flavorlite/FLAVOR.md", "FLAVOR.md"];
 
 async function findGuide(cwd: string): Promise<string | undefined> {
   for (const candidate of GUIDE_CANDIDATES) {
@@ -30,7 +30,7 @@ async function findGuide(cwd: string): Promise<string | undefined> {
 }
 
 const INIT_TASK = [
-  "Explore this project (structure, package manifests, entry points, tests, build/test commands) and create the project guide file .flavor/FLAVOR.md.",
+  "Explore this project (structure, package manifests, entry points, tests, build/test commands) and create the project guide file .flavorlite/FLAVOR.md.",
   "The guide is read by a coding agent on every session, so keep it under ~120 lines and factual:",
   "- one-paragraph project purpose",
   "- key directories and their roles",
@@ -60,7 +60,7 @@ export const initPlugin = definePlugin({
 
       const disposeCommand = commands.register({
         name: "init",
-        description: "Generate .flavor/FLAVOR.md by exploring the project",
+        description: "Generate .flavorlite/FLAVOR.md by exploring the project",
         async run() {
           const agent = ctx.tryGet("agent") as import("../loop").AgentService | undefined;
           if (!agent) return "The loop plugin is not mounted; /init needs the agent service.";

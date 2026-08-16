@@ -53,7 +53,7 @@ src/
                  provider plugins (provider:openai / provider:anthropic) self-register adapters from credentials
     tools/       capability seam: ToolRegistry + before/after-call waterfalls + 7 builtin tools
     permission/  plan|default|acceptEdits|bypass + hard dangerous-command blocks (a tools hook) + mode-aware prompt section
-    session/     JSONL persistence under .flavor/sessions (model-visible ⇔ logged)
+    session/     JSONL persistence under .flavorlite/sessions (model-visible ⇔ logged)
     prompt/      pure assembler: runs prompt/assemble over empty sections, dedupes, joins
     guidance/    identity/security/tasks/environment as unmountable prompt-section plugins
     loop/        the agent loop as a plugin: streaming, steering, retries, compaction hook
@@ -130,7 +130,7 @@ plugin end to end.
 | Command | Effect |
 |---|---|
 | `/help` | list commands |
-| `/init` | explore the project and write `.flavor/FLAVOR.md` |
+| `/init` | explore the project and write `.flavorlite/FLAVOR.md` |
 | `/model [provider:model]` | show or switch model |
 | `/permissions [mode]` | show or switch permission mode |
 | `/sessions`, `/resume [id]`, `/new` | session management |
@@ -142,8 +142,8 @@ Permission modes: `plan` (read-only) → `default` (ask per category) →
 `acceptEdits` → `bypass`. Hard-dangerous commands (`rm -rf /`, `mkfs`, fork
 bombs, ...) are blocked in **every** mode.
 
-Configuration merges from (low → high): `~/.flavor/config.json`,
-`.flavor/flavor.json`, environment / `.env`, CLI flags — see `.env.example`.
+Configuration merges from (low → high): `~/.flavorlite/config.json`,
+`.flavorlite/flavor.json`, environment / `.env`, CLI flags — see `.env.example`.
 
 ## Development
 

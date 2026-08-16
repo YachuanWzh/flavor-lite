@@ -46,7 +46,7 @@ Options:
   -r, --resume <id>      resume a previous session (default: latest)
   -h, --help             show this help
 
-Config sources (low → high): ~/.flavor/config.json, .flavor/flavor.json,
+Config sources (low → high): ~/.flavorlite/config.json, .flavorlite/flavor.json,
 environment (.env supported), CLI flags. See .env.example for API keys.`;
 
 function parseArgs(argv: string[]): CliArgs {

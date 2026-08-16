@@ -122,6 +122,13 @@ plugin loads):
 | `skills` | `discover()` | Skill discovery |
 | `interaction` | terminal ask/confirm (when mounted) | Interactive prompts |
 | `pluginsLoader` | `init/reload/list/scaffold` | Meta: manage plugins |
+| `repl` | `registerCompleter(provider)` → disposer | Add `/`-completion candidates in the REPL |
+
+`repl` exists only while the interactive REPL is running (not in one-shot
+`-p` mode) — resolve it with `ctx.tryGet("repl")` and no-op when absent.
+Candidates are `{ display, description?, completion? }`; the host renders
+them below the input line with the typed prefix highlighted and completes
+on Tab. See `.flavorlite/plugins/command-hints/` for a full example.
 
 ### Registering a tool
 

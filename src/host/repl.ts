@@ -8,6 +8,7 @@ import * as readline from "node:readline";
 import type { AgentHandle } from "./bootstrap";
 import { bold, dim, renderEvent, yellow } from "./render";
 import { terminalInteractionPlugin } from "./interaction";
+import { ReplCompletions } from "./completions";
 import type { LlmService } from "../plugins/llm";
 import type { CommandsService } from "../plugins/commands";
 import type { PluginsLoaderService } from "../plugins/plugins";
@@ -37,12 +38,27 @@ export async function runRepl(handle: AgentHandle, options: ReplOptions = {}): P
   };
   registerHostCommands(handle, sessionRef);
 
+  let busy = false;
+  let aborter: AbortController | undefined;
+  let closing = false;
+
+  // The readline interface is created before disk plugins load: the host
+  // owns the terminal, and plugins attach /-completion providers through
+  // the "repl" service once it is available.
+  const rl = readline.createInterface({ input: process.stdin, output: process.stdout, terminal: process.stdout.isTTY });
+  const repl = new ReplCompletions({
+    rl,
+    input: process.stdin,
+    output: process.stdout,
+    enabled: () => !busy,
+  });
+  const disposeRepl = ctx.provide("repl", repl);
+
   // Disk plugins load after start() so they can inject every default
   // service; failures are isolated per plugin and shown in the banner.
   const loader = ctx.tryGet("pluginsLoader") as PluginsLoaderService | undefined;
   if (loader) await loader.init();
 
-  const rl = readline.createInterface({ input: process.stdin, output: process.stdout, terminal: process.stdout.isTTY });
   // Interaction is a plugin, not a side-channel provide; mounting after
   // start() activates it immediately.
   handle.runtime.use(terminalInteractionPlugin, {
@@ -51,10 +67,6 @@ export async function runRepl(handle: AgentHandle, options: ReplOptions = {}): P
   });
 
   printBanner(handle, session, permission.mode());
-
-  let busy = false;
-  let aborter: AbortController | undefined;
-  let closing = false;
 
   const showPrompt = () => {
     if (busy) return; // no prompt while a turn streams
@@ -76,6 +88,7 @@ export async function runRepl(handle: AgentHandle, options: ReplOptions = {}): P
   rl.on("close", async () => {
     if (closing) return;
     closing = true;
+    disposeRepl();
     await handle.dispose();
     process.exit(0);
   });
