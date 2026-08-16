@@ -10,7 +10,7 @@
 
 import { createAgent } from "./host/bootstrap";
 import { runRepl } from "./host/repl";
-import { renderEvent, yellow } from "./host/render";
+import { renderEvent, yellow, type UiService } from "./host/render";
 import { terminalInteractionPlugin } from "./host/interaction";
 import { PERMISSION_MODES, type PermissionMode } from "./plugins/permission";
 import type { PluginsLoaderService } from "./plugins/plugins";
@@ -115,8 +115,11 @@ async function main(): Promise<void> {
       const resumeId =
         args.resume === undefined ? undefined : args.resume === "latest" ? await sessions.latest() : args.resume;
       const session = resumeId ? await sessions.open(resumeId) : undefined;
+      // A UI plugin may take over rendering (same seam as the REPL).
+      const ui = handle.runtime.ctx.tryGet("ui") as UiService | undefined;
       for await (const event of handle.run({ input: args.prompt, ...(session ? { session } : {}) })) {
-        renderEvent(event);
+        if (ui) ui.render(event);
+        else renderEvent(event);
       }
     } finally {
       await handle.dispose();

@@ -19,6 +19,51 @@ export const red = wrap(31);
 export const cyan = wrap(36);
 export const green = wrap(32);
 
+/** A plugin that failed to load, shown in the banner. */
+export interface UiPluginError {
+  name: string;
+  error: string;
+}
+
+/** Data the host hands to a UI plugin's banner renderer. */
+export interface UiBannerInfo {
+  /** flavor-lite version, e.g. "0.1.1". */
+  version?: string;
+  model: string;
+  mode: string;
+  sessionId: string;
+  plugins: {
+    loaded: number;
+    total: number;
+    errors: UiPluginError[];
+  };
+}
+
+/**
+ * Render seam for UI plugins. The host resolves the optional "ui" service
+ * once per turn and delegates event rendering to it when present, falling
+ * back to `renderEvent` otherwise. All methods are optional so a plugin may
+ * implement only the parts it cares about.
+ */
+export interface UiService {
+  /** Render one agent event. */
+  render(event: AgentEvent): void;
+  /** Render the echoed user input at the start of a turn. */
+  renderUserInput?(input: string): void;
+  /** Render the startup banner (model/mode/session/plugin status). */
+  renderBanner?(info: UiBannerInfo): void;
+  /** Render a caught turn-level error (model failure, aborted stream). */
+  renderError?(error: Error): void;
+  /** Render a non-fatal notice. */
+  renderNotice?(message: string): void;
+}
+
+declare module "../kernel/types" {
+  interface ServiceMap {
+    ui: UiService;
+  }
+}
+
 function toolCallSummary(toolCall: ToolCall): string {
   const primary = toolCall.args.path ?? toolCall.args.file_path ?? toolCall.args.command ?? toolCall.args.pattern ?? toolCall.args.query;
   if (typeof primary !== "string") return "";

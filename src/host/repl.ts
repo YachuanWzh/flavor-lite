@@ -6,7 +6,8 @@
 
 import * as readline from "node:readline";
 import type { AgentHandle } from "./bootstrap";
-import { bold, dim, renderEvent, yellow } from "./render";
+import { bold, dim, renderEvent, yellow, type UiBannerInfo, type UiService } from "./render";
+import { version } from "../../package.json";
 import { terminalInteractionPlugin } from "./interaction";
 import { ReplCompletions } from "./completions";
 import type { LlmService } from "../plugins/llm";
@@ -53,6 +54,10 @@ export async function runRepl(handle: AgentHandle, options: ReplOptions = {}): P
     enabled: () => !busy,
   });
   const disposeRepl = ctx.provide("repl", repl);
+
+  // Resolve the optional UI plugin service per turn: disk plugins mount
+  // after this function starts, so the service may appear at any time.
+  const resolveUi = (): UiService | undefined => ctx.tryGet("ui") as UiService | undefined;
 
   // Disk plugins load after start() so they can inject every default
   // service; failures are isolated per plugin and shown in the banner.
@@ -117,7 +122,11 @@ export async function runRepl(handle: AgentHandle, options: ReplOptions = {}): P
           const output = await commands.execute(line);
           if (output) console.log(output);
         } catch (error) {
-          console.log(yellow(`error: ${error instanceof Error ? error.message : String(error)}`));
+          const rendered = error instanceof Error ? error.message : String(error);
+          // A UI plugin may render errors with its own styling.
+          const activeUi = resolveUi();
+          activeUi?.renderError?.(error instanceof Error ? error : new Error(rendered));
+          if (!activeUi) console.log(yellow(`error: ${rendered}`));
         }
         showPrompt();
         return;
@@ -125,12 +134,21 @@ export async function runRepl(handle: AgentHandle, options: ReplOptions = {}): P
 
       busy = true;
       aborter = new AbortController();
+      const uiService = resolveUi();
+      if (uiService) {
+        // The echoed input is the visual start of a turn; without a UI
+        // plugin the readline prompt already showed what was typed.
+        uiService.renderUserInput?.(line);
+      }
       try {
         for await (const event of handle.run({ input: line, session: sessionRef.getSession(), signal: aborter.signal })) {
-          renderEvent(event);
+          if (uiService) uiService.render(event);
+          else renderEvent(event);
         }
       } catch (error) {
-        console.log(yellow(`error: ${error instanceof Error ? error.message : String(error)}`));
+        const rendered = error instanceof Error ? error.message : String(error);
+        uiService?.renderError?.(error instanceof Error ? error : new Error(rendered));
+        if (!uiService) console.log(yellow(`error: ${rendered}`));
       } finally {
         busy = false;
         aborter = undefined;
@@ -144,13 +162,30 @@ export async function runRepl(handle: AgentHandle, options: ReplOptions = {}): P
 
 function printBanner(handle: AgentHandle, session: SessionHandle, mode: PermissionMode): void {
   const llm = handle.runtime.ctx.get("llm") as LlmService;
-  console.log(bold("flavor-lite") + dim(" — everything is a plugin"));
-  console.log(dim(`model ${llm.defaultRef() ?? "unset"} · mode ${mode} · session ${session.id}`));
   const loader = handle.runtime.ctx.tryGet("pluginsLoader") as PluginsLoaderService | undefined;
   const statuses = loader?.list() ?? [];
+  const info: UiBannerInfo = {
+    version,
+    model: llm.defaultRef() ?? "unset",
+    mode,
+    sessionId: session.id,
+    plugins: {
+      loaded: statuses.filter((status) => status.status === "loaded").length,
+      total: statuses.length,
+      errors: statuses
+        .filter((status): status is typeof status & { error: string } => status.status === "error")
+        .map((status) => ({ name: status.name, error: status.error ?? "" })),
+    },
+  };
+  const ui = handle.runtime.ctx.tryGet("ui") as UiService | undefined;
+  if (ui?.renderBanner) {
+    ui.renderBanner(info);
+    return;
+  }
+  console.log(bold("flavor-lite") + dim(" — everything is a plugin"));
+  console.log(dim(`model ${info.model} · mode ${mode} · session ${session.id}`));
   if (statuses.length > 0) {
-    const loaded = statuses.filter((status) => status.status === "loaded").length;
-    console.log(dim(`plugins ${loaded}/${statuses.length} loaded (/plugin list)`));
+    console.log(dim(`plugins ${info.plugins.loaded}/${statuses.length} loaded (/plugin list)`));
     for (const status of statuses) {
       if (status.status === "error") console.log(yellow(`  plugin "${status.name}" failed: ${status.error}`));
     }
