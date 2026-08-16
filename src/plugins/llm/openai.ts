@@ -43,6 +43,12 @@ export class OpenAIAdapter implements ModelAdapter {
       }));
     }
     if (request.maxTokens !== undefined) body.max_tokens = request.maxTokens;
+    // Reasoning models (DeepSeek v4/think, ...) spend the max_tokens budget
+    // on chain-of-thought first; auxiliary callers can ask to skip it. The
+    // `thinking` field is a DeepSeek extension — other gateways ignore it,
+    // and OpenAI proper rejects unknown fields nowhere near as eagerly as
+    // returning empty content, so this stays opt-in per request.
+    if (request.thinking === "disabled") body.thinking = { type: "disabled" };
 
     let response: Response;
     try {

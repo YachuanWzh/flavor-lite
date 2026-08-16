@@ -23,6 +23,8 @@ export interface StreamOptions {
   tools?: ModelToolSchema[];
   maxTokens?: number;
   signal?: AbortSignal;
+  /** "disabled" skips reasoning-model chain-of-thought where supported. */
+  thinking?: "disabled" | "auto";
 }
 
 export interface LlmService {
@@ -118,6 +120,7 @@ class LlmServiceImpl implements LlmService {
       tools: options.tools ?? [],
       ...(options.maxTokens !== undefined ? { maxTokens: options.maxTokens } : {}),
       ...(options.signal ? { signal: options.signal } : {}),
+      ...(options.thinking ? { thinking: options.thinking } : {}),
     };
     yield* entry.adapter.stream(request);
   }

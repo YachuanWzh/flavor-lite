@@ -20,6 +20,14 @@ export interface ModelRequest {
   tools: ModelToolSchema[];
   maxTokens?: number;
   signal?: AbortSignal;
+  /**
+   * Reasoning-model hint. "disabled" asks the provider to skip chain-of-
+   * thought (e.g. DeepSeek `thinking.type`) — auxiliary subsystem calls
+   * (error analysis, compaction) want the tight JSON answer, not reasoning
+   * that eats the whole max_tokens budget and leaves `content` empty.
+   * Adapters without such a knob ignore it.
+   */
+  thinking?: "disabled" | "auto";
 }
 
 /** Wire-level message — already flattened for provider payloads. */
