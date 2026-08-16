@@ -65,9 +65,13 @@ export async function runRepl(handle: AgentHandle, options: ReplOptions = {}): P
   if (loader) await loader.init();
 
   // Interaction is a plugin, not a side-channel provide; mounting after
-  // start() activates it immediately.
+  // start() activates it immediately. Prompts take over the terminal, so a
+  // UI plugin's in-place animations are frozen for the duration of the ask.
   handle.runtime.use(terminalInteractionPlugin, {
-    onBeforeAsk: () => rl.pause(),
+    onBeforeAsk: () => {
+      rl.pause();
+      resolveUi()?.pauseAnimation?.();
+    },
     onAfterAsk: () => rl.resume(),
   });
 

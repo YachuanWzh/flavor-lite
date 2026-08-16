@@ -1,6 +1,12 @@
 /**
  * Shell tool: run a command in the workspace with a timeout and truncated
  * output. Non-interactive by design; interactive commands fail fast.
+ *
+ * Windows notes: the command is handed to cmd.exe verbatim (Node's automatic
+ * argument quoting would escape embedded double quotes into `\"`, which cmd
+ * does not understand, breaking e.g. `node -e "..."`). Timeouts and aborts
+ * kill the whole process tree — killing only cmd.exe would leave orphaned
+ * descendants holding the stdio pipes open, so 'close' would never fire.
  */
 
 import { spawn } from "node:child_process";
@@ -36,6 +42,11 @@ export const shellTool: Tool = {
     const shellArgs: [string, string[]] = isWindows
       ? ["cmd.exe", ["/d", "/s", "/c", command]]
       : [process.env.SHELL ?? "/bin/sh", ["-c", command]];
+    // Verbatim args on Windows (see module note); a detached process group on
+    // POSIX so the kill below reaches every descendant via kill(-pid).
+    const spawnOptions = isWindows
+      ? { windowsVerbatimArguments: true }
+      : { detached: true };
 
     return new Promise((resolvePromise) => {
       let stdout = "";
@@ -43,22 +54,70 @@ export const shellTool: Tool = {
       let settled = false;
       let stdoutBytes = 0;
       let stderrBytes = 0;
+      let graceTimer: ReturnType<typeof setTimeout> | undefined;
+      let killNote: string | undefined;
 
       const child = spawn(shellArgs[0], shellArgs[1], {
         cwd: ctx.cwd,
-        signal: ctx.signal,
         windowsHide: true,
         env: process.env,
+        ...spawnOptions,
       });
 
-      const timer = setTimeout(() => {
-        child.kill("SIGKILL");
-      }, timeout);
+      const timer = setTimeout(() => killTree(`[killed after ${timeout}ms timeout]`), timeout);
+
+      // Kill the whole tree, then settle on a grace timer in case orphaned
+      // descendants keep the stdio pipes open and 'close' never fires.
+      const killTree = (note: string) => {
+        if (settled) return;
+        killNote = note;
+        if (child.pid === undefined) {
+          try {
+            child.kill("SIGKILL");
+          } catch {
+            // not spawned yet / already gone
+          }
+        } else if (isWindows) {
+          const killer = spawn("taskkill", ["/pid", String(child.pid), "/T", "/F"], {
+            stdio: "ignore",
+            windowsHide: true,
+          });
+          killer.on("error", () => {
+            try {
+              child.kill("SIGKILL");
+            } catch {
+              // already gone
+            }
+          });
+        } else {
+          try {
+            process.kill(-child.pid, "SIGKILL");
+          } catch {
+            try {
+              child.kill("SIGKILL");
+            } catch {
+              // already gone
+            }
+          }
+        }
+        graceTimer = setTimeout(() => finish(null, note), 2_000);
+        graceTimer.unref?.();
+      };
+
+      // The loop aborts through the turn signal; spawn's built-in signal
+      // support would only kill cmd.exe, so drive the tree kill ourselves.
+      const onAbort = () => killTree("[aborted by user]");
+      if (ctx.signal) {
+        if (ctx.signal.aborted) onAbort();
+        else ctx.signal.addEventListener("abort", onAbort, { once: true });
+      }
 
       const finish = (code: number | null, note?: string) => {
         if (settled) return;
         settled = true;
         clearTimeout(timer);
+        if (graceTimer) clearTimeout(graceTimer);
+        ctx.signal?.removeEventListener("abort", onAbort);
         const parts: string[] = [];
         if (stdout.trim()) parts.push(stdout.trim());
         if (stderr.trim()) parts.push(`[stderr]\n${stderr.trim()}`);
@@ -77,10 +136,7 @@ export const shellTool: Tool = {
         if (stderrBytes <= MAX_OUTPUT_CHARS * 2) stderr += chunk.toString("utf-8");
       });
       child.on("error", (error) => finish(null, `[spawn error] ${error.message}`));
-      child.on("close", (code) => {
-        const timedOut = code === null && Date.now() >= timeout - 50;
-        finish(code, timedOut ? `[killed after ${timeout}ms timeout]` : undefined);
-      });
+      child.on("close", (code) => finish(code, killNote));
     });
   },
 };

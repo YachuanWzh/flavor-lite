@@ -158,6 +158,39 @@ describe("flavor-ui renderer", () => {
     expect(text).not.toContain("○");
   });
 
+  it("keeps every spinner frame on the same line (no ghost copies)", async () => {
+    const output = makeOutput();
+    const renderer = createRenderer({ output, color: false, tty: true, spinnerMs: 20 });
+
+    renderer.render(event.agentStart);
+    renderer.render(event.toolStart("Shell", { command: "npm test" }));
+    await new Promise((resolve) => setTimeout(resolve, 70)); // several frames
+    renderer.render(event.toolEnd("Shell", "ok", false));
+
+    // Animated frames rewrite the current line: none of them may end with a
+    // newline, otherwise each tick stacks another identical ghost line.
+    const frames = output.chunks.filter((chunk) => chunk.startsWith("\r\x1b[2K") && chunk.length > "\r\x1b[2K".length);
+    expect(frames.length).toBeGreaterThanOrEqual(3);
+    for (const frame of frames) {
+      expect(frame.endsWith("\n"), `frame leaks a newline: ${JSON.stringify(frame)}`).toBe(false);
+    }
+    expect(plain(output)).toContain("✓ Shell  npm test");
+  });
+
+  it("pauseAnimation freezes the spinner into a static pending card", () => {
+    const output = makeOutput();
+    const renderer = createRenderer({ output, color: false, tty: true });
+
+    renderer.render(event.agentStart);
+    renderer.render(event.toolStart("Shell", { command: "npm test" }));
+    renderer.pauseAnimation?.(); // e.g. a permission prompt takes the terminal
+    renderer.render(event.toolEnd("Shell", "ok", false));
+
+    const text = plain(output);
+    expect(text).toContain("○ Shell  npm test"); // frozen pending card
+    expect(text).toContain("✓ Shell  npm test"); // final result still lands
+  });
+
   it("plain style never animates, even on a TTY", () => {
     const output = makeOutput();
     const renderer = createRenderer({ output, color: false, tty: true, style: "plain" });

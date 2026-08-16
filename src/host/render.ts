@@ -56,6 +56,8 @@ export interface UiService {
   renderError?(error: Error): void;
   /** Render a non-fatal notice. */
   renderNotice?(message: string): void;
+  /** Pause in-place animations while the host owns the terminal (prompts). */
+  pauseAnimation?(): void;
 }
 
 declare module "../kernel/types" {
