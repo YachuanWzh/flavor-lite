@@ -93,7 +93,6 @@ class AgentServiceImpl implements AgentService {
     const session = options.session ?? (sessionService ? await sessionService.create() : undefined);
     const messages: Message[] = session ? [...session.messages()] : [];
     const systemPrompt = await prompt.assemble();
-    const toolSchemas = tools.schemas();
 
     yield { type: "agent_start", sessionId: session?.id, model: llm.defaultRef() };
 
@@ -124,10 +123,13 @@ class AgentServiceImpl implements AgentService {
         if (text) await this.record(session, messages, { role: "user", content: `[steering] ${text}` });
       }
 
+      // Re-snapshot tools per iteration: plugins recalled or mounted
+      // mid-run (router recall, L2 tool fallback) must stay visible in
+      // every following request, not only the iteration that mounted them.
       const request = await hooks.waterfall<BeforeLoopRequest>("loop/before-request", {
         messages: [...messages],
         systemPrompt,
-        tools: toolSchemas,
+        tools: tools.schemas(),
       });
       // Wire-level repair: aborts, torn sessions, or compaction cuts may leave
       // dangling tool_calls; providers reject those, so clean them right here.

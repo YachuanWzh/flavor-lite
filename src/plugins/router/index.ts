@@ -57,6 +57,9 @@ interface MemoryEntry {
   used: boolean;
 }
 
+/** Which funnel level recalled a plugin this run (feedback policy differs). */
+type RecallLevel = "L0" | "L1";
+
 interface CandidateMatchers {
   keywords: string[];
   patterns: RegExp[];
@@ -84,6 +87,32 @@ const STOPWORDS = new Set([
   "need", "how", "what",
 ]);
 
+/** Structural CJK characters with no topical identity. Bigrams touching
+ * them ("帮我", "我用", "这个", "一下") occur in nearly every Chinese
+ * request, so they are excluded from fingerprints — otherwise unrelated
+ * histories look "similar" and feedback adjustments misfire. */
+const CJK_STOP_CHARS = new Set([
+  "我", "你", "他", "她", "它", "们",
+  "帮", "请", "给", "让", "叫", "使", "被", "把",
+  "用", "要", "想", "能", "会", "可", "以", "需",
+  "这", "那", "个", "些", "样", "种", "点",
+  "一", "下",
+  "的", "了", "着", "过", "吗", "呢", "吧", "啊", "呀", "嘛", "哦", "嗯", "么",
+  "是", "在", "有", "和", "与", "或", "及", "对", "向", "从", "到", "去", "来",
+  "就", "都", "也", "只", "还", "又", "再", "很", "太", "更", "最", "子",
+]);
+
+function isSingleCjk(token: string): boolean {
+  return /^[\u4e00-\u9fff]$/.test(token);
+}
+
+function containsStopChar(token: string): boolean {
+  for (const char of token) {
+    if (CJK_STOP_CHARS.has(char)) return true;
+  }
+  return false;
+}
+
 /** Lowercase ascii words plus CJK single chars and bigrams. */
 export function tokenize(text: string): string[] {
   const tokens: string[] = [];
@@ -101,11 +130,12 @@ export function tokenize(text: string): string[] {
 }
 
 /** Stable input fingerprint: deduped sorted tokens, capped. Single CJK
- * chars are excluded — they are too common to be identity ("一", "个"
- * appear in almost every Chinese request and would match everything). */
+ * chars and bigrams built around structural chars are excluded — they are
+ * too common to be identity ("一", "个", "帮我", "这个" appear in almost
+ * every Chinese request and would match everything). */
 export function fingerprint(tokens: string[]): string[] {
   return [...new Set(tokens)]
-    .filter((token) => !/^[\u4e00-\u9fff]$/.test(token))
+    .filter((token) => !isSingleCjk(token) && !containsStopChar(token))
     .sort()
     .slice(0, FINGERPRINT_TOKENS);
 }
@@ -127,8 +157,10 @@ class Router implements RouterService {
   private index: RouterIndex | undefined;
   private memory: MemoryEntry[] = [];
   private memoryLoad: Promise<void> | undefined;
-  /** plugin name -> fingerprint of the input that recalled it this run. */
-  private recalledRun = new Map<string, string[]>();
+  /** plugin name -> fingerprint + recall level of the input that recalled it this run. */
+  private recalledRun = new Map<string, { fp: string[]; level: RecallLevel }>();
+  /** Last user input routed this run; repeats (one per iteration) skip routing. */
+  private lastRoutedInput: string | undefined;
   private usedToolsRun = new Set<string>();
   private l2UsedRun = new Set<string>();
 
@@ -160,6 +192,10 @@ class Router implements RouterService {
   }
 
   async route(input: string): Promise<string[]> {
+    return (await this.routeDetailed(input)).map((entry) => entry.name);
+  }
+
+  private async routeDetailed(input: string): Promise<Array<{ name: string; level: RecallLevel }>> {
     if (!this.enabled) return [];
     const index = this.buildIndex();
     if (index.candidates.length === 0) return [];
@@ -180,12 +216,14 @@ class Router implements RouterService {
     }
     if (l0.length > 0) {
       l0.sort((a, b) => b.hits - a.hits);
-      return l0.slice(0, this.maxActivate).map((entry) => entry.name);
+      return l0.slice(0, this.maxActivate).map((entry) => ({ name: entry.name, level: "L0" }));
     }
 
     // L1: inverted-index scoring with optional feedback adjustment.
     if (this.feedback) await this.ensureMemory();
-    const queryTokens = tokenize(input);
+    // Single CJK chars carry no identity ("分", "用" hit almost every
+    // Chinese doc); score only meaningful tokens, same policy as the index.
+    const queryTokens = tokenize(input).filter((token) => !isSingleCjk(token));
     const scores = new Map<string, number>();
     for (const token of queryTokens) {
       const postings = index.postings.get(token);
@@ -206,7 +244,7 @@ class Router implements RouterService {
       .filter(([, score]) => score >= this.minScore)
       .sort((a, b) => b[1] - a[1])
       .slice(0, this.maxActivate)
-      .map(([name]) => name);
+      .map(([name]) => ({ name, level: "L1" as const }));
   }
 
   /** loop/before-request (prepended): recall, mount, announce, refresh tools. */
@@ -214,29 +252,34 @@ class Router implements RouterService {
     if (!this.enabled) return;
     const input = lastUserInput(event.messages);
     if (!input) return;
+    // before-request fires once per iteration with the same user input; only
+    // the first pass routes. Re-routing would chase the already-loaded target
+    // with L1 noise (recalling junk mid-turn and poisoning feedback memory).
+    if (input === this.lastRoutedInput) return;
+    this.lastRoutedInput = input;
 
-    const recalled = await this.route(input);
+    const recalled = await this.routeDetailed(input);
     if (recalled.length === 0) return;
 
-    const mounted: string[] = [];
-    for (const name of recalled) {
+    const mounted: Array<{ name: string; level: RecallLevel }> = [];
+    for (const entry of recalled) {
       try {
-        await this.loader.ensure(name);
+        await this.loader.ensure(entry.name);
       } catch (error) {
-        this.ctx.logger.warn(`router failed to recall plugin "${name}": ${error instanceof Error ? error.message : String(error)}`);
+        this.ctx.logger.warn(`router failed to recall plugin "${entry.name}": ${error instanceof Error ? error.message : String(error)}`);
         continue;
       }
-      const status = this.loader.list().find((entry) => entry.name === name);
-      if (status?.status === "loaded") mounted.push(name);
+      const status = this.loader.list().find((candidate) => candidate.name === entry.name);
+      if (status?.status === "loaded") mounted.push(entry);
     }
     if (mounted.length === 0) return;
 
     const fp = fingerprint(tokenize(input));
-    for (const name of mounted) {
-      if (!this.recalledRun.has(name)) this.recalledRun.set(name, fp);
+    for (const entry of mounted) {
+      if (!this.recalledRun.has(entry.name)) this.recalledRun.set(entry.name, { fp, level: entry.level });
     }
     const summary = mounted
-      .map((name) => {
+      .map(({ name }) => {
         const status = this.loader.list().find((entry) => entry.name === name);
         return status?.description ? `${name}: ${status.description}` : name;
       })
@@ -245,7 +288,8 @@ class Router implements RouterService {
       role: "user",
       content: `[system] Plugins activated for this task: ${summary}. Their tools are now available.`,
     });
-    // The loop snapshots tool schemas at run start; refresh after mounting.
+    // Defense in depth: the loop re-snapshots tools per iteration, but a
+    // stale payload must never reach the model even if that changes.
     event.tools = this.tools.schemas();
   }
 
@@ -277,6 +321,7 @@ class Router implements RouterService {
       this.ctx.logger.warn(`router lifecycle failed: ${error instanceof Error ? error.message : String(error)}`);
     } finally {
       this.recalledRun.clear();
+      this.lastRoutedInput = undefined;
       this.usedToolsRun.clear();
       this.l2UsedRun.clear();
     }
@@ -331,9 +376,12 @@ class Router implements RouterService {
 
   private async recordFeedback(): Promise<void> {
     await this.ensureMemory();
-    for (const [name, fp] of this.recalledRun) {
+    for (const [name, record] of this.recalledRun) {
       const used = this.l2UsedRun.has(name) || this.pluginUsedByTools(name);
-      this.memory.push({ fp, plugin: name, used });
+      // An author-declared trigger (L0) is a precise recall: the model simply
+      // not calling the tool is no evidence against it, so never demote L0.
+      if (!used && record.level === "L0") continue;
+      this.memory.push({ fp: record.fp, plugin: name, used });
     }
     this.memory = this.memory.slice(-MEMORY_LIMIT);
     await mkdir(dirname(this.memoryPath), { recursive: true });
@@ -353,7 +401,7 @@ class Router implements RouterService {
       let overlap = 0;
       for (const token of entry.fp) {
         // Single CJK chars carry no identity; legacy entries may hold them.
-        if (/^[\u4e00-\u9fff]$/.test(token)) continue;
+        if (isSingleCjk(token)) continue;
         if (querySet.has(token)) overlap += 1;
       }
       // "Similar request" means sharing most of the fingerprint, not a couple
@@ -405,7 +453,11 @@ class Router implements RouterService {
         ...(candidate.triggers?.keywords ?? []),
       ].join(" ");
       const tf = new Map<string, number>();
-      for (const token of tokenize(text)) tf.set(token, (tf.get(token) ?? 0) + 1);
+      for (const token of tokenize(text)) {
+        // Same policy as query scoring: single CJK chars only add noise.
+        if (isSingleCjk(token)) continue;
+        tf.set(token, (tf.get(token) ?? 0) + 1);
+      }
       docs.set(candidate.name, tf);
 
       const patterns: RegExp[] = [];

@@ -169,6 +169,30 @@ describe("router plugin", () => {
     });
   });
 
+  describe("routing once per input", () => {
+    it("routes the same input once per run and again on the next run", async () => {
+      await writePlugin("dyn-echo", echoManifest, echoEntry);
+      createStack();
+      await loader.init();
+
+      const first = await recall("please echo this back");
+      expect(status("dyn-echo").status).toBe("loaded");
+      expect(first.messages.filter((message) => message.content.includes("Plugins activated"))).toHaveLength(1);
+
+      // Second iteration of the same run, same input: no re-routing, so no
+      // duplicate announcement and no junk recalled against the leftovers.
+      const second = await recall("please echo this back");
+      expect(second.messages.filter((message) => message.content.includes("Plugins activated"))).toHaveLength(0);
+
+      // After the run ends the same input routes again on a new turn.
+      await endRun();
+      expect(status("dyn-echo").status).toBe("unloaded");
+      const third = await recall("please echo this back");
+      expect(status("dyn-echo").status).toBe("loaded");
+      expect(third.messages.some((message) => message.content.includes("Plugins activated"))).toBe(true);
+    });
+  });
+
   describe("L1 inverted-index recall", () => {
     it("recalls on description token overlap above minScore", async () => {
       await writePlugin("weather", weatherManifest, weatherEntry);
@@ -188,6 +212,27 @@ describe("router plugin", () => {
       await recall("what is the weather forecast today");
 
       expect(status("weather").status).toBe("unloaded");
+    });
+
+    it("does not recall on single CJK char overlap alone", async () => {
+      // The keyword "分步" shares the single char "分" with the query; single
+      // CJK chars carry no identity and must not trigger a recall.
+      await writePlugin(
+        "planner",
+        {
+          name: "planner",
+          activation: "dynamic",
+          description: "任务规划与分步执行",
+          triggers: { keywords: ["任务规划", "分步"] },
+        },
+        "export default { name: 'planner', apply() {} };",
+      );
+      createStack();
+      await loader.init();
+
+      await recall("帮我用ast分析下这个项目");
+
+      expect(status("planner").status).toBe("unloaded");
     });
   });
 
@@ -370,6 +415,44 @@ describe("router plugin", () => {
       expect(fp).not.toContain("子");
       expect(fp).toContain("agent");
       expect(fp).toContain("探索");
+    });
+
+    it("drops structural bigrams from fingerprints", () => {
+      const fp = fingerprint(tokenize("帮我用ast分析下这个项目"));
+      expect(fp).toContain("ast");
+      expect(fp).toContain("分析");
+      expect(fp).toContain("项目");
+      expect(fp).not.toContain("帮我");
+      expect(fp).not.toContain("我用");
+      expect(fp).not.toContain("这个");
+      expect(fp).not.toContain("个项");
+      expect(fp).not.toContain("析下");
+    });
+
+    it("never records negative feedback for L0 keyword recalls", async () => {
+      await writePlugin("dyn-echo", echoManifest, echoEntry);
+      createStack();
+      await loader.init();
+      const memoryPath = join(tmp, ".flavorlite", "router-memory.json");
+
+      // Recalled via the author-declared keyword "echo" but never used: the
+      // model not calling the tool is no evidence against an L0 recall.
+      await recall("please echo this back");
+      expect(status("dyn-echo").status).toBe("loaded");
+      await endRun();
+      const memory = JSON.parse(await readFile(memoryPath, "utf-8")) as Array<{ plugin: string; used: boolean }>;
+      expect(memory.filter((entry) => entry.plugin === "dyn-echo")).toHaveLength(0);
+
+      // Used recalls still record a positive entry (boosts keep working).
+      await recall("please echo this back");
+      await hooks().waterfall<AfterToolCall>("tools/after-call", {
+        toolCall: { id: "t1", name: "echo_tool", args: {} },
+        args: {},
+        result: { content: "echo!" },
+      });
+      await endRun();
+      const updated = JSON.parse(await readFile(memoryPath, "utf-8")) as Array<{ plugin: string; used: boolean }>;
+      expect(updated).toContainEqual(expect.objectContaining({ plugin: "dyn-echo", used: true }));
     });
   });
 });

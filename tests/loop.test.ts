@@ -304,6 +304,49 @@ describe("agent loop plugin", () => {
     expect(requests[0]?.tools?.map((tool) => tool.name)).toEqual(["late_tool"]);
   });
 
+  it("keeps tools registered mid-run visible in later iterations", async () => {
+    const requests: ModelRequest[] = [];
+    const rt = mount(
+      [
+        [
+          { type: "tool_call", toolCall: { id: "t1", name: "Echo", args: { text: "a" } } },
+          { type: "done", stopReason: "tool_calls" },
+        ],
+        [{ type: "text_delta", text: "done" }, { type: "done", stopReason: "end" }],
+      ],
+      requests,
+    );
+    // Simulates the router's L2 fallback: a tool provider registers during
+    // tool execution; the next iteration must re-snapshot schemas or the
+    // model loses the recalled tools again.
+    const tools = rt.ctx.get("tools") as ToolRegistry;
+    let registered = false;
+    (rt.ctx.get("hooks") as HookBusService).hook("tools/after-call", async (event, next) => {
+      if (!registered) {
+        registered = true;
+        tools.register({
+          name: "late_tool",
+          description: "mounted mid-run",
+          category: "read",
+          inputSchema: { type: "object" },
+          async execute() {
+            return { content: "late" };
+          },
+        });
+      }
+      return next(event);
+    });
+
+    const agent = rt.ctx.get("agent") as AgentService;
+    for await (const _ of agent.run({ input: "work" })) {
+      /* drain */
+    }
+
+    expect(requests[0]?.tools?.map((tool) => tool.name)).toContain("Echo");
+    expect(requests[0]?.tools?.map((tool) => tool.name)).not.toContain("late_tool");
+    expect(requests[1]?.tools?.map((tool) => tool.name)).toContain("late_tool");
+  });
+
   it("resolves model refs through the llm service", () => {
     const requests: ModelRequest[] = [];
     const rt = mount([], requests);
