@@ -51,9 +51,17 @@ export class Runtime {
     if (this.disposed) throw new Error("runtime is disposed");
     this.pending.push({ plugin: plugin as Plugin<never>, config });
     if (this.started) {
-      const ordered = this.resolveOrder(this.pending);
-      this.pending = [];
-      this.activate(ordered);
+      try {
+        const ordered = this.resolveOrder(this.pending);
+        this.pending = [];
+        this.activate(ordered);
+      } catch (error) {
+        // A plugin that fails resolution must not stay queued: it would be
+        // re-resolved (and re-thrown) by every later use() call, poisoning
+        // all subsequent activations.
+        this.pending = [];
+        throw error;
+      }
     }
     return this;
   }
@@ -62,9 +70,14 @@ export class Runtime {
   start(): this {
     if (this.started || this.disposed) return this;
     this.started = true;
-    const ordered = this.resolveOrder(this.pending);
-    this.pending = [];
-    this.activate(ordered);
+    try {
+      const ordered = this.resolveOrder(this.pending);
+      this.pending = [];
+      this.activate(ordered);
+    } catch (error) {
+      this.pending = [];
+      throw error;
+    }
     return this;
   }
 
