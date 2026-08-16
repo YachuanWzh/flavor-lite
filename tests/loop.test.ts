@@ -284,6 +284,26 @@ describe("agent loop plugin", () => {
     });
   });
 
+  it("sends the tool schemas rewritten by loop/before-request hooks", async () => {
+    const requests: ModelRequest[] = [];
+    const rt = mount(
+      [[{ type: "text_delta", text: "done" }, { type: "done", stopReason: "end" }]],
+      requests,
+    );
+    // The router rewrites event.tools after recalling a plugin mid-waterfall;
+    // the model request must carry the rewritten list, not the run-start
+    // snapshot.
+    (rt.ctx.get("hooks") as HookBusService).hook("loop/before-request", async (event, next) => {
+      event.tools = [{ name: "late_tool", description: "added mid-flight", inputSchema: { type: "object" } }];
+      return next(event);
+    });
+    const agent = rt.ctx.get("agent") as AgentService;
+    for await (const _ of agent.run({ input: "hi" })) {
+      /* drain */
+    }
+    expect(requests[0]?.tools?.map((tool) => tool.name)).toEqual(["late_tool"]);
+  });
+
   it("resolves model refs through the llm service", () => {
     const requests: ModelRequest[] = [];
     const rt = mount([], requests);

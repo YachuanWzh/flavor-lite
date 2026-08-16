@@ -8,7 +8,7 @@ import { toolsPlugin, type ToolRegistry, type AfterToolCall } from "../src/plugi
 import { commandsPlugin } from "../src/plugins/commands";
 import { promptPlugin } from "../src/plugins/prompt";
 import { pluginsLoaderPlugin, type PluginsLoaderService, type PluginStatus } from "../src/plugins/plugins";
-import { routerPlugin, type RouterPluginConfig } from "../src/plugins/router";
+import { routerPlugin, fingerprint, tokenize, type RouterPluginConfig } from "../src/plugins/router";
 import type { AgentService, BeforeLoopRequest, LoopAfterRun } from "../src/plugins/loop";
 
 /** The router injects "agent" for ordering; tests stub it. */
@@ -345,6 +345,31 @@ describe("router plugin", () => {
 
       const memory = JSON.parse(await readFile(memoryPath, "utf-8")) as unknown[];
       expect(memory).toHaveLength(200);
+    });
+    it("ignores poisoned entries whose fingerprint barely overlaps", async () => {
+      await writePlugin("weather", weatherManifest, weatherEntry);
+      const memoryPath = join(tmp, ".flavorlite", "router-memory.json");
+      await mkdir(join(tmp, ".flavorlite"), { recursive: true });
+      // Legacy poisoned entry: mostly ubiquitous tokens (single CJK chars,
+      // plus one unrelated ascii token).
+      await writeFile(
+        memoryPath,
+        JSON.stringify([{ fp: ["city", "一", "个", "帮"], plugin: "weather", used: false }]),
+      );
+      createStack();
+      await loader.init();
+
+      await recall("what is the weather forecast today");
+
+      expect(status("weather").status).toBe("loaded");
+    });
+
+    it("drops single CJK chars from fingerprints", () => {
+      const fp = fingerprint(tokenize("派生一个子agent探索一下这个项目"));
+      expect(fp).not.toContain("一");
+      expect(fp).not.toContain("子");
+      expect(fp).toContain("agent");
+      expect(fp).toContain("探索");
     });
   });
 });

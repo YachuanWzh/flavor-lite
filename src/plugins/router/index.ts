@@ -42,6 +42,8 @@ export interface RouterPluginConfig {
   feedbackBoost?: number;
   /** Score subtracted per matching unused memory entry. Default 2. */
   feedbackPenalty?: number;
+  /** Most negative total adjustment per plugin per routing pass. Default 3. */
+  feedbackMaxPenalty?: number;
 }
 
 export interface RouterService {
@@ -98,9 +100,14 @@ export function tokenize(text: string): string[] {
   return tokens;
 }
 
-/** Stable input fingerprint: deduped sorted tokens, capped. */
+/** Stable input fingerprint: deduped sorted tokens, capped. Single CJK
+ * chars are excluded — they are too common to be identity ("一", "个"
+ * appear in almost every Chinese request and would match everything). */
 export function fingerprint(tokens: string[]): string[] {
-  return [...new Set(tokens)].sort().slice(0, FINGERPRINT_TOKENS);
+  return [...new Set(tokens)]
+    .filter((token) => !/^[\u4e00-\u9fff]$/.test(token))
+    .sort()
+    .slice(0, FINGERPRINT_TOKENS);
 }
 
 function isMetaMessage(message: Message): boolean {
@@ -133,6 +140,7 @@ class Router implements RouterService {
   private readonly pinned: string[];
   private readonly boost: number;
   private readonly penalty: number;
+  private readonly maxPenalty: number;
 
   constructor(
     private readonly ctx: PluginContext,
@@ -148,6 +156,7 @@ class Router implements RouterService {
     this.pinned = config.pinned ?? [];
     this.boost = config.feedbackBoost ?? 2;
     this.penalty = config.feedbackPenalty ?? 2;
+    this.maxPenalty = config.feedbackMaxPenalty ?? 3;
   }
 
   async route(input: string): Promise<string[]> {
@@ -343,12 +352,18 @@ class Router implements RouterService {
       if (entry.plugin !== name) continue;
       let overlap = 0;
       for (const token of entry.fp) {
+        // Single CJK chars carry no identity; legacy entries may hold them.
+        if (/^[\u4e00-\u9fff]$/.test(token)) continue;
         if (querySet.has(token)) overlap += 1;
       }
-      if (overlap < MEMORY_OVERLAP_MIN) continue;
+      // "Similar request" means sharing most of the fingerprint, not a couple
+      // of ubiquitous tokens — otherwise every demotion is a false positive.
+      if (overlap < MEMORY_OVERLAP_MIN || overlap * 2 < entry.fp.length) continue;
       adjustment += entry.used ? this.boost : -this.penalty;
     }
-    return adjustment;
+    // One bad turn (or a model that never calls the tool) must not bury a
+    // plugin forever: clamp the negative tail, leave boosts uncapped.
+    return Math.max(adjustment, -this.maxPenalty);
   }
 
   private ensureMemory(): Promise<void> {
