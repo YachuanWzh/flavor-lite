@@ -13,3 +13,4 @@ FLAVOR.md
 *.bak
 *.tsbuildinfo
 coverage/
+.flavorlite

@@ -63,7 +63,7 @@ export interface LoopCompact {
   messages: Message[];
 }
 
-const DEFAULT_MAX_ITERATIONS = 30;
+const DEFAULT_MAX_ITERATIONS = 50;
 const WARN_RATIO = 0.8;
 const MAX_RETRIES = 3;
 
