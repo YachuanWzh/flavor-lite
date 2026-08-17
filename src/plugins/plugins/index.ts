@@ -446,6 +446,8 @@ class PluginsLoader implements PluginsLoaderService {
         this.runtime.use(plugin, target.manifest.config as never);
         mounted.push(plugin.name);
       }
+      // Plugins with async apply() fail via ready, not via use().
+      await this.runtime.ready;
     } catch (error) {
       for (const mountedName of mounted.reverse()) await this.runtime.unmount(mountedName);
       this.failImport(target, `activation failed: ${errorMessage(error)}`);
@@ -518,12 +520,23 @@ class PluginsLoader implements PluginsLoaderService {
   private async unload(name: string): Promise<void> {
     const record = this.records.get(name);
     if (!record) return;
+    const remaining: string[] = [];
     for (const pluginName of [...record.pluginNames].reverse()) {
       try {
         await this.runtime.unmount(pluginName);
       } catch (error) {
+        // Still mounted (e.g. the kernel refuses while a dependent injects
+        // its service): keep tracking it so eject/reload can retry later.
+        remaining.push(pluginName);
         this.ctx.logger.warn(`plugin "${pluginName}" failed during unmount: ${errorMessage(error)}`);
       }
+    }
+    if (remaining.length > 0) {
+      this.records.set(name, {
+        status: { ...record.status, status: "loaded" },
+        pluginNames: remaining.reverse(),
+      });
+      return;
     }
     // Back to the catalog as unloaded: eject/reload can pick it up again.
     this.records.set(name, {

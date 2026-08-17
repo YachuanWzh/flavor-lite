@@ -9,6 +9,9 @@ export {
   type Logger,
   type Plugin,
   type PluginContext,
+  type ProvideOptions,
   type ServiceMap,
+  type StandardSchemaV1,
+  type StandardSchemaV1Issue,
   type WaterfallListener,
 } from "./types";

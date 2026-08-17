@@ -9,6 +9,39 @@
 
 export type Disposer = () => void | Promise<void>;
 
+/** Options for ctx.provide(). */
+export interface ProvideOptions {
+  /** Deliberately shadow a service owned by another plugin. */
+  override?: boolean;
+}
+
+/**
+ * Standard Schema v1 (standard-schema.dev): the vendor-neutral schema
+ * interface implemented by zod, valibot, arktype, ... A plugin declaring
+ * `config` with any compliant schema gets it validated before apply(),
+ * with issues reported along their paths. Kept structural so the kernel
+ * itself stays dependency-free.
+ */
+export interface StandardSchemaV1Issue {
+  readonly message: string;
+  readonly path?: ReadonlyArray<PropertyKey | { readonly key: PropertyKey }> | undefined;
+}
+
+export type StandardSchemaV1Result<Output> =
+  | { readonly value: Output; readonly issues?: undefined }
+  | { readonly issues: ReadonlyArray<StandardSchemaV1Issue> };
+
+export interface StandardSchemaV1<Input = unknown, Output = Input> {
+  readonly "~standard": {
+    readonly version: 1;
+    readonly vendor: string;
+    readonly validate: (
+      value: unknown,
+    ) => StandardSchemaV1Result<Output> | Promise<StandardSchemaV1Result<Output>>;
+    readonly types?: { readonly input: Input; readonly output: Output } | undefined;
+  };
+}
+
 /**
  * Service map extended by plugins through declaration merging:
  *
@@ -50,8 +83,13 @@ export interface Plugin<C = unknown> {
   inject?: string[];
   /** Service keys this plugin claims via ctx.provide(). Explicit > implicit. */
   provides?: string[];
-  /** Registration is an effect: return a disposer to unwind. */
-  apply: (ctx: PluginContext, config: C) => void | Disposer;
+  /** Optional Standard Schema v1 validated before apply(); the validated (possibly transformed) value is passed to apply(). */
+  config?: StandardSchemaV1<unknown, C>;
+  /**
+   * Registration is an effect: return a disposer to unwind. May be async;
+   * effects registered after an await stay scoped to this plugin.
+   */
+  apply: (ctx: PluginContext, config: C) => void | Disposer | Promise<void | Disposer>;
 }
 
 /** Identity helper so plugins read declaratively. */
@@ -74,9 +112,13 @@ export interface PluginContext {
   readonly cwd: string;
   readonly logger: Logger;
 
-  /** Claim a service key. Last provider wins; disposing restores the previous one. */
-  provide<K extends keyof ServiceMap>(key: K, service: ServiceMap[K]): Disposer;
-  provide(key: string, service: unknown): Disposer;
+  /**
+   * Claim a service key. Last provider wins; disposing restores the previous
+   * one. Cross-plugin overrides fail loud unless `override` is set; scoped
+   * (non-plugin) callers may always shadow, restored on dispose.
+   */
+  provide<K extends keyof ServiceMap>(key: K, service: ServiceMap[K], options?: ProvideOptions): Disposer;
+  provide(key: string, service: unknown, options?: ProvideOptions): Disposer;
 
   /** Resolve a service. Fails loud when absent — misconfiguration never hides. */
   get<K extends keyof ServiceMap>(key: K): ServiceMap[K];

@@ -1,6 +1,21 @@
 import { describe, expect, it } from "vitest";
-import { Runtime, definePlugin, type PluginContext } from "../src/kernel";
+import { z } from "zod";
+import { Runtime, definePlugin, type Logger, type PluginContext } from "../src/kernel";
 import { hooksPlugin, type HookBusService } from "../src/plugins/hooks";
+
+/** Logger spy: async activation failures surface via logger.error. */
+function spyLogger(): Logger & { errors: string[] } {
+  const errors: string[] = [];
+  return {
+    errors,
+    debug: () => {},
+    info: () => {},
+    warn: () => {},
+    error: (message: string) => errors.push(message),
+  };
+}
+
+const tick = () => new Promise<void>((resolve) => setTimeout(resolve, 0));
 
 describe("kernel runtime", () => {
   it("activates plugins in dependency order regardless of mount order", () => {
@@ -158,5 +173,217 @@ describe("kernel runtime", () => {
     await runtime.unmount("a"); // first-mounted plugin: must not touch b's effects
     expect(runtime.ctx.tryGet("a-svc")).toBeUndefined();
     expect(runtime.ctx.get("b-svc")).toBe("B");
+  });
+
+  it("rolls back already-activated plugins when a batch member fails, and allows retry", async () => {
+    const events: string[] = [];
+    const good = definePlugin({
+      name: "good",
+      provides: ["good-svc"],
+      apply(ctx) {
+        events.push("good-apply");
+        ctx.effect(() => {
+          const disposeProvide = ctx.provide("good-svc", "G");
+          return () => {
+            events.push("good-dispose");
+            return disposeProvide();
+          };
+        }, "good.provide");
+      },
+    });
+    const bad = definePlugin({
+      name: "bad",
+      apply() {
+        throw new Error("boom");
+      },
+    });
+
+    const runtime = Runtime.create();
+    runtime.use(good).use(bad);
+    expect(() => runtime.start()).toThrow(/boom/);
+    await tick(); // rollback teardown is tracked asynchronously
+    expect(runtime.ctx.tryGet("good-svc")).toBeUndefined();
+    expect(runtime.activePlugins()).toEqual([]);
+    expect(events).toEqual(["good-apply", "good-dispose"]);
+
+    // Nothing activated: start() is retryable once the broken plugin is gone.
+    runtime.use(good);
+    runtime.start();
+    expect(runtime.ctx.get("good-svc")).toBe("G");
+    expect(runtime.activePlugins()).toEqual(["good"]);
+  });
+
+  it("a broken dynamic mount is dropped without poisoning later use() calls", () => {
+    const runtime = Runtime.create();
+    runtime.start();
+    const broken = definePlugin({ name: "broken", inject: ["missing"], apply() {} });
+    expect(() => runtime.use(broken)).toThrow(/requires service "missing"/);
+    const ok = definePlugin({ name: "ok", provides: ["ok-svc"], apply(ctx) { ctx.provide("ok-svc", 1); } });
+    runtime.use(ok); // must not re-resolve (and re-throw) the broken plugin
+    expect(runtime.ctx.get("ok-svc")).toBe(1);
+  });
+
+  it("disposer inertia: teardown never runs a disposer twice", async () => {
+    let disposerRuns = 0;
+    let effectRuns = 0;
+    const plugin = definePlugin({
+      name: "guarded",
+      provides: ["guarded-svc"],
+      apply(ctx) {
+        ctx.effect(() => {
+          ctx.provide("guarded-svc", "G");
+          return () => {
+            effectRuns += 1;
+          };
+        }, "guarded.provide");
+        return () => {
+          disposerRuns += 1;
+        };
+      },
+    });
+    const runtime = Runtime.create().use(plugin);
+    runtime.start();
+    expect(await runtime.unmount("guarded")).toBe(true);
+    expect(await runtime.unmount("guarded")).toBe(false); // gone: no second run
+    await runtime.dispose();
+    expect(disposerRuns).toBe(1);
+    expect(effectRuns).toBe(1);
+  });
+
+  it("unmount refuses to leave dangling consumers unless forced", async () => {
+    const provider = definePlugin({
+      name: "provider",
+      provides: ["dep-svc"],
+      apply(ctx) {
+        return ctx.effect(() => ctx.provide("dep-svc", "D"), "dep.provide");
+      },
+    });
+    const consumer = definePlugin({
+      name: "consumer",
+      inject: ["dep-svc"],
+      apply() {},
+    });
+    const runtime = Runtime.create();
+    runtime.use(provider).use(consumer).start();
+
+    await expect(runtime.unmount("provider")).rejects.toThrow(/still injected by "consumer"/);
+    expect(runtime.ctx.get("dep-svc")).toBe("D"); // nothing was torn down
+
+    await runtime.unmount("provider", { force: true }); // explicit override
+    expect(runtime.ctx.tryGet("dep-svc")).toBeUndefined();
+
+    // Once the dependent is gone, unmount is allowed again.
+    const runtime2 = Runtime.create();
+    runtime2.use(provider).use(consumer).start();
+    await runtime2.unmount("consumer");
+    expect(await runtime2.unmount("provider")).toBe(true);
+  });
+
+  it("scopes effects registered after awaits in an async apply, and tracks them via ready", async () => {
+    const events: string[] = [];
+    const asyncPlugin = definePlugin({
+      name: "async",
+      provides: ["async-svc"],
+      async apply(ctx) {
+        await Promise.resolve();
+        ctx.effect(() => {
+          const disposeProvide = ctx.provide("async-svc", "A");
+          return () => {
+            events.push("async-dispose");
+            return disposeProvide();
+          };
+        }, "async.provide");
+        return () => {
+          events.push("async-return-dispose");
+        };
+      },
+    });
+    const runtime = Runtime.create();
+    runtime.use(asyncPlugin).start();
+    await runtime.ready;
+    expect(runtime.ctx.get("async-svc")).toBe("A");
+    expect(runtime.activePlugins()).toEqual(["async"]);
+
+    await runtime.unmount("async");
+    expect(runtime.ctx.tryGet("async-svc")).toBeUndefined();
+    expect(events).toEqual(["async-return-dispose", "async-dispose"]);
+  });
+
+  it("releases partial effects and rejects ready when an async apply fails", async () => {
+    const logger = spyLogger();
+    const flaky = definePlugin({
+      name: "flaky",
+      provides: ["flaky-svc"],
+      async apply(ctx) {
+        ctx.effect(() => ctx.provide("flaky-svc", "F"), "flaky.provide");
+        await Promise.resolve();
+        throw new Error("async boom");
+      },
+    });
+    const runtime = Runtime.create({ logger });
+    runtime.use(flaky).start();
+    await expect(runtime.ready).rejects.toThrow(/async boom/);
+    await tick();
+    expect(runtime.ctx.tryGet("flaky-svc")).toBeUndefined(); // partial effect released
+    expect(runtime.activePlugins()).toEqual([]);
+    expect(logger.errors.some((line) => line.includes("flaky"))).toBe(true);
+
+    // The failure must not wedge the runtime: later mounts still work.
+    const ok = definePlugin({ name: "ok", provides: ["ok-svc"], apply(ctx) { ctx.provide("ok-svc", 1); } });
+    runtime.use(ok);
+    expect(runtime.ctx.get("ok-svc")).toBe(1);
+  });
+
+  it("validates plugin config against a Standard Schema before apply", () => {
+    const seen: unknown[] = [];
+    const schemaPlugin = definePlugin({
+      name: "schema",
+      config: z.object({ level: z.coerce.number().min(1) }),
+      apply(_ctx, config) {
+        seen.push(config);
+      },
+    });
+
+    const runtime = Runtime.create();
+    runtime.use(schemaPlugin, { level: "3" } as never).start();
+    expect(seen).toEqual([{ level: 3 }]); // validated + transformed value
+
+    const broken = Runtime.create();
+    expect(() => broken.use(schemaPlugin, { level: 0 } as never).start()).toThrow(
+      /plugin "schema" has an invalid config.*at level/s,
+    );
+    expect(broken.activePlugins()).toEqual([]);
+  });
+
+  it("enforces service ownership: cross-plugin overrides fail loud unless explicit", async () => {
+    const owner = definePlugin({
+      name: "owner",
+      provides: ["owned"],
+      apply(ctx) {
+        return ctx.effect(() => ctx.provide("owned", "v1"), "owner.provide");
+      },
+    });
+    const intruder = definePlugin({
+      name: "intruder",
+      apply(ctx) {
+        ctx.provide("owned", "v2");
+      },
+    });
+    const runtime = Runtime.create();
+    runtime.use(owner).start();
+    expect(() => runtime.use(intruder)).toThrow(/owned by plugin "owner"/);
+    expect(runtime.ctx.get("owned")).toBe("v1");
+
+    // Deliberate shadowing is opt-in and unwinds back to the owner.
+    const scoped = definePlugin({
+      name: "scoped",
+      apply(ctx) {
+        return ctx.effect(() => ctx.provide("owned", "v2", { override: true }), "scoped.override");
+      },
+    });
+    runtime.use(scoped);
+    expect(runtime.ctx.get("owned")).toBe("v2");
+    await runtime.unmount("scoped");
+    expect(runtime.ctx.get("owned")).toBe("v1");
   });
 });

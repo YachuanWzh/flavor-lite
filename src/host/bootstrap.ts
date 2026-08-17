@@ -28,11 +28,16 @@ export interface BootstrapOptions {
   config?: FlavorConfig;
   logger?: Logger;
   /** Extra plugins mounted after the defaults (custom providers, policies, hosts). */
-  plugins?: Array<{ plugin: Plugin<never>; config?: never }>;
+  plugins?: Array<{ plugin: Plugin<unknown>; config?: unknown }>;
 }
 
 export interface AgentHandle {
   readonly runtime: Runtime;
+  /**
+   * Settles once every plugin (including ones with async apply()) has
+   * activated. Rejects when an activation failed.
+   */
+  readonly ready: Promise<void>;
   /** Run one user turn through the loop. */
   run(options: AgentRunOptions): AsyncIterable<AgentEvent>;
   /** Inject a steering message for the next model request. */
@@ -95,6 +100,7 @@ export function createAgent(options: BootstrapOptions = {}): AgentHandle {
   const agent = runtime.ctx.get("agent") as AgentService;
   return {
     runtime,
+    ready: runtime.ready,
     run: (runOptions) => agent.run(runOptions),
     steer: (text) => agent.steer(text),
     dispose: () => runtime.dispose(),

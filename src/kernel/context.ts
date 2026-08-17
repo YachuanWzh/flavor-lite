@@ -4,7 +4,7 @@
  * waterfall hooks included — is a plugin built on these two primitives.
  */
 
-import type { Disposer, Logger, PluginContext } from "./types";
+import type { Disposer, Logger, PluginContext, ProvideOptions } from "./types";
 
 interface EffectRecord {
   id: number;
@@ -12,11 +12,37 @@ interface EffectRecord {
   dispose: Disposer | void;
 }
 
+/**
+ * Disposer inertia: the first call runs the cleanup (synchronously when the
+ * disposer is sync); concurrent or repeat calls join the same run instead of
+ * re-running it. Protects registrations racing unmount() and dispose(), so
+ * teardown can never double-free.
+ */
+export function onceDisposer(dispose: Disposer): Disposer {
+  let run: Promise<void> | undefined;
+  let started = false;
+  return () => {
+    if (started) return run;
+    started = true;
+    const result = dispose();
+    if (result instanceof Promise) {
+      run = result;
+      // Duplicate callers may not await; keep a stray rejection handled.
+      run.catch(() => {});
+    }
+    return run;
+  };
+}
+
 export class Context implements PluginContext {
   readonly cwd: string;
   readonly logger: Logger;
 
   private services = new Map<string, unknown>();
+  /** Owning plugin per key; undefined when claimed outside an apply(). */
+  private owners = new Map<string, string | undefined>();
+  /** Plugin whose apply() is running right now (set by the runtime). */
+  private ownerScope: string | undefined;
   private effects: EffectRecord[] = [];
   private nextEffectId = 0;
   private disposed = false;
@@ -30,16 +56,36 @@ export class Context implements PluginContext {
     return !this.disposed;
   }
 
-  provide(key: string, service: unknown): Disposer {
+  provide(key: string, service: unknown, options?: ProvideOptions): Disposer {
     this.assertActive("provide");
-    const previous = this.services.has(key) ? this.services.get(key) : undefined;
+    const currentOwner = this.owners.get(key);
+    const newOwner = this.ownerScope;
+    if (currentOwner && newOwner && currentOwner !== newOwner && !options?.override) {
+      throw new Error(
+        `service "${key}" is owned by plugin "${currentOwner}"; plugin "${newOwner}" cannot provide it (pass { override: true } to shadow deliberately)`,
+      );
+    }
+    const previous = this.services.has(key)
+      ? { value: this.services.get(key), owner: this.owners.get(key) }
+      : undefined;
     this.services.set(key, service);
-    return () => {
+    this.owners.set(key, newOwner);
+    return onceDisposer(() => {
       // Restore the previous provider when this registration unwinds, so a
       // scoped override never leaves a dangling key behind.
-      if (previous === undefined) this.services.delete(key);
-      else this.services.set(key, previous);
-    };
+      if (previous === undefined) {
+        this.services.delete(key);
+        this.owners.delete(key);
+      } else {
+        this.services.set(key, previous.value);
+        this.owners.set(key, previous.owner);
+      }
+    });
+  }
+
+  /** @internal The runtime sets the ambient owner around plugin.apply(). */
+  setOwnerScope(owner: string | undefined): void {
+    this.ownerScope = owner;
   }
 
   get(key: string): unknown {
@@ -63,7 +109,7 @@ export class Context implements PluginContext {
   effect<S>(setup: () => S, label?: string): S {
     this.assertActive("effect");
     const result = setup();
-    const dispose = typeof result === "function" ? (result as unknown as Disposer) : undefined;
+    const dispose = typeof result === "function" ? onceDisposer(result as unknown as Disposer) : undefined;
     this.effects.push({ id: this.nextEffectId++, label: label ?? setup.name ?? "effect", dispose });
     return result;
   }
@@ -114,6 +160,7 @@ export class Context implements PluginContext {
     }
     this.effects = [];
     this.services.clear();
+    this.owners.clear();
     if (errors.length > 0) {
       throw new AggregateError(errors, "one or more effects failed to dispose");
     }

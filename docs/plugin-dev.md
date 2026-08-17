@@ -87,10 +87,14 @@ export default {
   plugin names** — the loop plugin provides `"agent"`, not `"loop"`.
 - `provides` (string[], optional) — service keys this plugin claims. Two
   plugins providing the same key fail loud at mount time.
-- `apply(ctx, config)` (required) — runs once on mount. Returns a disposer
-  that must fully undo everything `apply` registered (tools, commands,
-  hooks, services, timers). Wrap registrations in `ctx.effect()` to get
-  reverse-order teardown.
+- `config` (Standard Schema v1, optional) — e.g. a zod schema. The kernel
+  validates the manifest `config` against it before `apply` and passes the
+  validated (possibly transformed) value. Failures report the issue path.
+- `apply(ctx, config)` (required) — runs once on mount. May be `async`;
+  effects registered after an `await` stay scoped to the plugin. Returns a
+  disposer that must fully undo everything `apply` registered (tools,
+  commands, hooks, services, timers). Wrap registrations in `ctx.effect()`
+  to get reverse-order teardown.
 
 ### The PluginContext API
 
@@ -98,7 +102,7 @@ export default {
 |---|---|
 | `ctx.cwd` | The agent's working directory |
 | `ctx.logger` | `debug/info/warn/error` — the host logger |
-| `ctx.provide(key, service)` | Claim a service key; returns a disposer that restores the previous provider |
+| `ctx.provide(key, service, options?)` | Claim a service key; returns a disposer that restores the previous provider. Keys owned by another plugin are protected — pass `{ override: true }` to shadow deliberately |
 | `ctx.get(key)` | Resolve a service; throws when absent (fail loud) |
 | `ctx.tryGet(key)` | Resolve an optional service; `undefined` when absent |
 | `ctx.effect(setup, label)` | Track a reversible registration; teardown in reverse order |
@@ -193,6 +197,9 @@ short-circuit.
 |---|---|
 | `requires service "X", but no mounted plugin provides it` | `inject` names a service key that doesn't exist — check the table above (it's `agent`, not `loop`) |
 | `service "X" is provided by both ...` | Two plugins claim the same `provides` key |
+| `service "X" is owned by plugin "Y"` | Your plugin provides a key another plugin already owns — use a different key, or `{ override: true }` if shadowing is intentional |
+| `cannot unmount "X": service "Y" is still injected by ...` | The kernel refuses to leave dangling consumers — unmount the dependents first (or reload the whole group) |
+| `plugin "X" has an invalid config` | Manifest `config` failed the plugin's Standard Schema — the message lists each issue with its path |
 | `plugin name "X" is already active` | Two entry modules export the same plugin `name` |
 | `entry module must have a default export` | Add `export default { name, apply }` |
 | `/plugin list` shows `error: import failed` | Syntax error or missing dependency in the entry — the message has details |
