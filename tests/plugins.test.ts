@@ -198,11 +198,12 @@ export default {
     await expect(loader.scaffold("9bad")).rejects.toThrow(/invalid plugin name/);
   });
 
-  it("exposes the /plugin command for list and reload", async () => {
+  it("exposes the /plugin command for list and reload and eject", async () => {
     await writePlugin("demo", { name: "demo" }, demoEntry("v1"));
     createStack();
     await loader.init();
     const commands = runtime.ctx.get("commands") as CommandsService;
+    const tools = runtime.ctx.get("tools") as ToolRegistry;
 
     const list = await commands.execute("/plugin list");
     expect(list).toContain("demo");
@@ -213,6 +214,20 @@ export default {
 
     const unknown = await commands.execute("/plugin reload ghost");
     expect(unknown).toMatch(/error|not found/);
+
+    // Eject unmounts the plugin and cleans up its registrations.
+    expect(await commands.execute("/demo")).toBe("demo says v1");
+    const ejected = await commands.execute("/plugin eject demo");
+    expect(ejected).toContain("ejected: demo");
+    expect(ejected).toContain("unloaded");
+    expect(loader.list().find((entry) => entry.name === "demo")?.status).toBe("unloaded");
+    expect(await commands.execute("/demo")).toMatch(/Unknown command/);
+    expect(tools.get("demo_tool")).toBeUndefined();
+
+    // Ejecting is reversible via reload, and unknown names are reported.
+    expect(await commands.execute("/plugin reload demo")).toContain("reloaded: demo");
+    expect(await commands.execute("/demo")).toBe("demo says v1");
+    expect(await commands.execute("/plugin eject ghost")).toContain("not found");
   });
 
   it("topologically sorts eager plugins so providers mount before consumers", async () => {

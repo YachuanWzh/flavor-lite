@@ -249,8 +249,13 @@ describe("websearch plugin: disk-plugin integration", () => {
       const loader = runtime.ctx.get("pluginsLoader") as PluginsLoaderService;
       await loader.init();
       try {
+        // The manifest declares activation "dynamic": init() catalogues it
+        // unloaded; the router (or an explicit ensure) mounts it on demand.
         const status = loader.list().find((entry) => entry.name === "websearch");
-        expect(status?.status).toBe("loaded");
+        expect(status?.activation).toBe("dynamic");
+        expect(status?.status).toBe("unloaded");
+        await loader.ensure("websearch");
+        expect(loader.list().find((entry) => entry.name === "websearch")?.status).toBe("loaded");
 
         const tools = runtime.ctx.get("tools") as ToolRegistry;
         expect(tools.get("websearch")?.category).toBe("read");

@@ -1,7 +1,7 @@
 # flavor-lite 项目探索报告
 
-> 探索日期：2026-08-15
-> 测试验证：`npm test` 全部通过（7 个测试文件 / 39 个测试用例）
+> 探索日期：2026-08-17
+> 测试验证：`npm test` 实测 **19 个测试文件 / 238 个用例**（234 通过 / 4 失败，失败集中在两个磁盘插件集成测试，详见第八节）
 
 ---
 
@@ -28,6 +28,16 @@
 - **实时流式输出**：文本逐字到达，逐字渲染
 - **只在值得重试的地方重试**：网络/限流错误在未输出任何内容前做指数退避重试
 
+### 与 8-15 版报告相比新增了什么？
+
+| 类别 | 新增内容 |
+|---|---|
+| 内核 | 瀑布钩子独立成 `hooks` 插件；模型提供商发现也插件化（`providers.ts`） |
+| 宿主 | REPL 斜杠命令补全（`host/completions.ts`）、渲染可委托给 `ui` 服务 |
+| 内核级插件 | **磁盘插件加载器**（`.flavorlite/plugins/` 热重载）、**路由插件**（dynamic 插件按需召回） |
+| 文档/模板 | `docs/plugin-dev.md` 插件开发规范、`/plugin new` 脚手架模板 |
+| 磁盘插件生态 | 10 个功能插件：memory、error-monitor、websearch、subagent、astgraph、flavor-ui、filediff、clear-context、command-hints、task-planner |
+
 ---
 
 ## 二、技术栈与工程配置
@@ -36,7 +46,8 @@
 |---|---|
 | 语言 | TypeScript（strict 模式 + `noUncheckedIndexedAccess`） |
 | 包管理器 | npm |
-| Node 要求 | >= 20 |
+| 版本 | 0.1.1 |
+| Node 要求 | >= 20（astgraph 插件额外要求 >= 22.5，用 `node:sqlite`） |
 | 运行时依赖 | 仅 `zod`（^4.4.3） |
 | 开发依赖 | `tsup`（打包）、`typescript@7`、`vitest`（测试） |
 | 输出格式 | ESM，`tsup` 打包成 `dist/cli.js` 和 `dist/index.js` |
@@ -57,6 +68,8 @@ npm start         # node dist/cli.js 启动
 - `tsup.config.ts`：入口 `cli` 和 `index`，只输出 ESM；`dts` 关闭（TypeScript 7 兼容问题），需要类型声明时跑 `npm run types`
 - `vitest.config.ts`：只收集 `tests/**/*.test.ts`，Node 环境，超时 20 秒
 - `.env.example`：模板，只需设置一个 API Key（OpenAI 系或 Anthropic 系）即可运行
+- `docs/plugin-dev.md`：**插件开发规范**，磁盘插件契约的唯一权威文档
+- `templates/plugin-template/`：`/plugin new` 用的脚手架模板（源码里也内嵌了一份，保证 dist 自包含）
 
 ---
 
@@ -68,14 +81,16 @@ flavor-lite/
 │   ├── index.ts                  # 公共 SDK 出口：把内核和所有插件统一导出
 │   ├── cli.ts                    # CLI 入口：解析参数 → createAgent → REPL 或一次性运行
 │   ├── kernel/                   # 微型内核（mini-Cordis）
-│   │   ├── types.ts              #   类型：Plugin、PluginContext、Logger、Waterfall 等
+│   │   ├── types.ts              #   类型：Plugin、PluginContext、Logger、ServiceMap 等
 │   │   ├── context.ts            #   上下文：服务仓库 + 事件总线 + 可逆效果栈
 │   │   ├── runtime.ts            #   运行时：挂载插件、拓扑排序、逆序卸载
 │   │   └── index.ts              #   内核公共出口
 │   ├── shared/
 │   │   └── messages.ts           # 与厂商无关的消息模型 + 历史清洗
-│   ├── plugins/                  # 所有能力都是插件
-│   │   ├── llm/                  #   大模型能力缝：适配器注册表、OpenAI/Anthropic 适配器、SSE 解析
+│   ├── plugins/                  # 内核级能力插件
+│   │   ├── hooks/                #   【新】瀑布钩子总线插件（hooks 服务）
+│   │   ├── llm/                  #   大模型能力缝：适配器注册表、SSE 解析
+│   │   │   ├── providers.ts      #   【新】提供商发现插件化：openai/anthropic 各自独立成插件
 │   │   ├── tools/                #   工具能力缝：工具注册表 + before/after 钩子 + 7 个内置工具
 │   │   ├── permission/           #   权限插件：4 种模式 + 危险命令硬拦截
 │   │   ├── session/              #   会话插件：.flavorlite/sessions 下的 JSONL 持久化
@@ -85,14 +100,33 @@ flavor-lite/
 │   │   ├── compaction/           #   历史压缩插件：主动+被动裁剪上下文
 │   │   ├── skills/               #   技能插件：SKILL.md 发现 → 提示词节
 │   │   ├── commands/             #   斜杠命令注册表
-│   │   └── init/                 #   项目指南插件：FLAVOR.md 注入 + /init 生成器
+│   │   ├── init/                 #   项目指南插件：FLAVOR.md 注入 + /init 生成器
+│   │   ├── plugins/              #   【新】磁盘插件加载器：发现/热重载/目录监听/脚手架
+│   │   │   └── template.ts       #       /plugin new 的内嵌脚手架模板
+│   │   └── router/               #   【新】路由插件：dynamic 插件按需召回 + 空闲弹出
 │   └── host/                     # 宿主层：装配、配置合并、终端交互、渲染、REPL
 │       ├── bootstrap.ts          #   createAgent：唯一的组合根，挂载全部默认插件
 │       ├── config.ts             #   多源配置合并（用户/项目/环境/CLI），zod 校验
 │       ├── interaction.ts        #   终端交互实现（权限确认）
-│       ├── render.ts             #   事件渲染：零依赖 ANSI 颜色
+│       ├── render.ts             #   事件渲染：零依赖 ANSI 颜色；可委托给 ui 服务
+│       ├── completions.ts        #   【新】REPL 补全控制器：repl 服务 + 建议渲染 + Tab 补全
 │       └── repl.ts               #   交互式 REPL
-├── tests/                        # 7 个测试文件，39 个用例
+├── docs/
+│   └── plugin-dev.md             # 【新】插件开发规范
+├── templates/
+│   └── plugin-template/          # 【新】/plugin new 脚手架模板
+├── .flavorlite/plugins/          # 【新】磁盘插件根（本项目自带的 10 个插件）
+│   ├── memory/                   #   长期记忆：BM25 + 向量 + RRF 混合检索
+│   ├── error-monitor/            #   工具错误监控 + LLM 分析蒸馏到记忆
+│   ├── websearch/                #   网络搜索：DuckDuckGo / Brave / SearXNG
+│   ├── subagent/                 #   子代理：最多 3 层嵌套，独立会话
+│   ├── astgraph/                 #   代码图谱：ast_search/callers/callees/impact/context
+│   ├── flavor-ui/                #   时间线 UI：banner、spinner、工具卡片
+│   ├── filediff/                 #   文件修改后终端打印 +/- diff
+│   ├── clear-context/            #   /clear：清屏 + 重置上下文
+│   ├── command-hints/            #   REPL 斜杠补全候选提供者
+│   └── task-planner/             #   任务规划：彩色任务面板
+├── tests/                        # 19 个测试文件，238 个用例
 └── dist/                         # 构建产物（已 gitignore）
 ```
 
@@ -122,7 +156,7 @@ dispose()                          // 随时可退订，一切可逆
 
 ### 2. 瀑布钩子（Waterfall，环绕中间件）
 
-这是 flavor-lite 最优雅的扩展点。一个钩子可以有多层监听器，像"洋葱"一样套在一起：每个监听器收到值，可以做点事，再调用 `next(value)` 传给下一层；**不调用 next 就是短路**。
+8-15 版里瀑布钩子内嵌在 Context 中；**现在它独立成了 `hooks` 插件**（`src/plugins/hooks/index.ts`）。内核只保留服务仓库和效果栈，环绕中间件全部住在 hooks 插件里——**卸掉这个插件，就不存在任何钩子点了**，"插件，而不是改循环"的纯度更高。
 
 ```ts
 ctx.hook("tools/before-call", async (event, next) => {
@@ -133,7 +167,7 @@ ctx.hook("tools/before-call", async (event, next) => {
 });
 ```
 
-权限插件、压缩插件就是通过这种钩子"挂"到循环上，**完全不需要改动循环本身**——这就是"插件，而不是改循环"（plugins, not loop changes）。
+新特性：`hook(name, listener, { prepend: true })` 可以把监听器插到链头（最外层）——路由、策略类插件靠它保证在任何其他监听器之前看到载荷。
 
 ### 3. 插件的声明式元数据
 
@@ -162,6 +196,10 @@ export const myPlugin = definePlugin({
 
 这种"错在启动时爆、不在运行中藏"的设计，是整个项目"fail loud"哲学的体现。卸载时则按激活的**逆序**逐个执行卸载函数，保证世界干净地回到原点。
 
+### 5. 【新】提供商发现也插件化了
+
+`src/plugins/llm/providers.ts`：OpenAI / Anthropic 各自是独立插件（`openaiProviderPlugin` / `anthropicProviderPlugin`），有 API Key 就自我注册适配器，没有就静默跳过。组合根（bootstrap）**完全不碰适配器实现和环境变量**，只做一个通用检查：无论内置还是第三方，只要最终 `llm.providers().length === 0` 就启动即抛错。第三方提供商现在可以走和内置一模一样的路径。
+
 ---
 
 ## 五、消息模型（Model-visible ⇔ Logged）
@@ -188,6 +226,7 @@ export const myPlugin = definePlugin({
 - **OpenAIAdapter**：兼容 OpenAI、DeepSeek、Moonshot、vLLM、Ollama 等任何 OpenAI 兼容网关，纯 `fetch` + SSE 流式解析，自动累加 tool_calls 分片
 - **AnthropicAdapter**：走 Anthropic Messages API，同样纯 fetch 流式
 - 错误统一归一化为 `ProviderError`，带语义化错误码：`authentication`（401/403）、`rate_limit`（429）、`context_overflow`、`model_not_found`、`network`、`cancelled`
+- **提供商注册改为独立插件**（见第四节第 5 点），第三方可完全复刻
 
 ### 2. 工具插件（`plugins/tools/`）——智能体的"手脚"
 
@@ -240,6 +279,7 @@ export const myPlugin = definePlugin({
 - `shell` 工具插件：Shell（平台提示）
 - `skills` 插件：Skills（可用技能）
 - `init` 插件：Project guide（FLAVOR.md 内容）
+- **磁盘插件**：memory（用户偏好）、error-monitor（过往错误教训）、subagent（委派指引）、flavor-ui 等各插自己的节
 
 **卸掉某个插件，它的节就消失**——系统提示词完全由插件决定，这是"一切皆插件"最直观的体现。
 
@@ -252,7 +292,7 @@ export const myPlugin = definePlugin({
   ↓
 进入 while 循环（最多 maxIterations=30 次）
   ↓
-插入 steering 消息（运行中用户插话）→ loop/before-request 瀑布（压缩钩子）
+插入 steering 消息（运行中用户插话）→ loop/before-request 瀑布（压缩钩子、路由钩子）
   ↓
 sanitizeHistory 修复历史
   ↓
@@ -277,26 +317,121 @@ sanitizeHistory 修复历史
 - **主动压缩**：挂在 `loop/before-request` 上，历史足迹超过预算（默认 160k 字符 ≈ 40k token）时裁剪中间部分，换成一条 `[system] Earlier conversation ...` 标记，尾部保留（默认 20 条）且裁切边界会回退，**绝不让工具结果成为第一条**
 - **被动压缩**：挂在 `loop/compact` 上，处理提供商仍报 context overflow 的情况
 
-### 8. 其他插件
+### 8. 其他内核级插件
 
 - **skills**：扫描 `.flavorlite/skills/<name>/SKILL.md`（项目）和 `~/.flavorlite/skills/`（用户全局），只把技能的名字和描述注入提示词，模型用到时再用 Read 工具读全文——保持提示词精简
-- **commands**：斜杠命令注册表，`/model`、`/permissions`、`/sessions`、`/resume`、`/new`、`/help` 由宿主注册，`/init` 由 init 插件注册
+- **commands**：斜杠命令注册表，宿主与插件都能注册
 - **init**：FLAVOR.md 项目指南作为提示词节注入；`/init` 让 agent 自己探索项目并生成 `.flavorlite/FLAVOR.md`
 
 ---
 
-## 七、宿主层与配置
+## 七、【新】磁盘插件系统（`.flavorlite/plugins/`）
+
+这是 8-15 之后最大的一块新能力：**不用改 flavor-lite 源码，往项目里放一个目录就是新插件，改完 `/plugin reload` 即刻生效**。磁盘插件与内置插件使用完全相同的契约。
+
+### 1. 加载器插件（`src/plugins/plugins/`）——发现、热重载、监听
+
+- **发现根**：`<项目>/.flavorlite/plugins/`（项目）→ `~/.flavorlite/plugins/`（用户全局），同名按 manifest 里的 `name` 项目遮蔽用户
+- **目录结构**：每个插件 = `flavor-plugin.json`（manifest）+ ESM entry（默认 `index.js`），默认导出 `Plugin` 或 `Plugin[]`
+- **manifest 字段**：`name`（必填）、`version`、`entry`、`description`、`config`（透传给 `apply(ctx, config)`）、`activation`（`eager` 启动即挂载 / `dynamic` 进目录但先不挂载，等路由插件召回）、`triggers`（路由提示：keywords / patterns / tools / commands）、`provides`（声明的服务键，用于跨插件依赖解析）
+- **热重载**：`/plugin reload <name>` 卸载（按逆序跑 disposer）→ 用 cache-busting query 重新 import → 重挂载；`/plugin reload` 全量重发现，新目录自动出现、删除的自动卸载
+- **目录监听**（默认开）：新插件自动进目录、移除的自动卸载；**已加载的插件永不被自动 sync 触碰**——正在跑的 turn 绝不被干扰，要换只能手动 `/plugin reload`
+- **坏插件绝不炸宿主**：manifest 非法、import 失败、激活失败，全部标记为 `error` 记在目录里，其余继续跑
+- **依赖解析**：eager 插件可以 inject 另一个磁盘插件提供的服务，加载器按 `provides` 声明递归装载 + 拓扑排序；eager 依赖 dynamic 提供的服务会启动即报错
+- **/plugin 命令**：`list`（状态 + 错误 + provides）、`reload [name]`、`new <name>`（脚手架，从内嵌模板生成目录）
+- **脚手架模板**（`templates/plugin-template/` + `src/plugins/plugins/template.ts`）：内嵌一份在源码里保证 dist 自包含；`/plugin new` 生成的工具/命令/提示词节三合一样板
+
+### 2. 路由插件（`src/plugins/router/`）——dynamic 插件按需召回
+
+dynamic 插件平时不占内存不占提示词；每个模型请求过一个**三级召回漏斗**，每次 `agent_end` 把没用上的弹出去：
+
+- **L0 确定性**：manifest 声明的 `keywords`（大小写不敏感子串）/ `patterns`（正则）命中即召回——作者控制的精确匹配，微秒级
+- **L1 倒排索引**：对 name / description / triggers 做 tokenize（英文单词 + CJK 单字/二元组，带停用词表），构建 IDF 加权倒排索引；目录变化才重建，查询路径是纯查找
+- **L2 工具名回退**：挂在 `tools/before-call` 上——模型调了一个"当前不存在"的工具，如果某 dynamic 插件声明了它，当场挂载再执行——**零漏召回**
+- **自适应反馈**：召回但没用上的配对降权、用了的加权，写入 `.flavorlite/router-memory.json`（滚动 200 条）；用指纹（去重排序的 token）判断"相似请求"，L0 命中永不绝不降权（作者声明是精确信号）
+- **空闲弹出**：turn 结束时把加载了但没用到工具、也没有反向依赖的 dynamic 插件 eject 回目录（`pinned` 名单可豁免）
+- 召回时往请求里插一条 `[system] Plugins activated for this task: ...` 消息并刷新工具 schema，让模型知道新工具可用
+
+### 3. 自带磁盘插件（本项目 `.flavorlite/plugins/` 下的 10 个）
+
+#### memory —— 长期记忆
+- 存储：`.flavorlite/memory/MEMORY.md` 路由索引 + `tasks/<id>.md` 全文，文件锁 + 原子改名 + `.bak` 兜底，崩溃不丢
+- 去重：归一化 + `similarity >= 0.92` 拒绝近似重复
+- **混合检索**：BM25（稀疏）+ 外部 embedding 向量（稠密，OpenAI 兼容端点，Ollama 也可）→ **RRF 融合**；热度调制（hot +15% / cold −25%）
+- 热度老化：7 天内召回 >10 次 = hot；3 天没动 = cold（`/forget-cold` 清理）
+- 自动召回：`loop/before-request` 每轮把 top hits 追加进系统提示词（按 query 缓存）
+- 自动提取：`loop/after-run` 用 agent 自己的 LLM 从对话里提取持久事实，置信度 ≥ 11/12 才自动入库；敏感内容（密钥、注入文本）拒绝
+- 命令：`/memory`、`/remember`、`/forget`、`/forget-cold`、`/embedding`
+
+#### error-monitor —— 错误监控 + LLM 蒸馏
+- `tools/after-call` 钩子捕获 `isError: true` 的工具结果，按签名去重记录到 `.flavorlite/error-monitor/records.json`（`/errors` 查看）
+- 对**每个新失败**，后台调用 LLM 分析（带平台/shell/cwd 环境、脱敏后的错误文本），要求返回严格 JSON `{"analysis": "...", "confidence": 0.0-1.0}`
+- 只有 `confidence >= 0.7` 的分析才蒸馏成 `feedback` 记忆写进 memory 插件（`memoryStatus` 记录在每条 record 上，`/errors` 可直接看到 skipped 原因）
+- 防呆：20s 超时中止、指数退避重试、串行化防爆、推理模型关 CoT（`thinking: "disabled"`）；LLM 失败默认**不写记忆**（除非显式 `fallbackToRules: true`）
+- 教训注入：`prompt/assemble` 把最近的教训注入系统提示词，让模型在下一次规划工具前看到历史失败
+- 命令：`/errors`、`/errors clear`、`/errors analyze`（对空回复的旧记录重新蒸馏）
+
+#### websearch —— 网络搜索（dynamic）
+- 工具 `websearch`（`query` / `maxResults` / `region`），category `read` 全权限放行
+- 三提供商：DuckDuckGo lite（免费默认）、Brave API（需要 key）、自定义 SearXNG JSON 端点
+- 零依赖纯 ESM，只用 Node 内置 fetch；超时/HTTP 错误作为错误结果返回给模型、绝不 throw
+- 触发词包括中文（搜索/查一下/查资料/网页/新闻…）与英文（web/search）；`/websearch` REPL 命令是工具薄封装
+
+#### subagent —— 子代理
+- 工具 `subagent_spawn`（`task` / `role` / `maxIterations`）：让 agent 委派子任务给全新子代理
+- 子代理：**独立会话**（历史不污染父级，父级只看最终报告）、专属系统提示词节（角色/任务/深度）、与父级相同的工具与权限策略、继承父级 abort 信号
+- **最多 3 层嵌套**（root → child → grandchild → great-grandchild），深度用 `AsyncLocalStorage` 跟踪，不需要改 loop
+- 报告保障三层：提示词预留迭代 → 静默时驱动 2 次收尾轮 → 仍静默就从会话日志重建工具调用摘要；报告头总带子会话 id 便于父级查全程
+- 被拒绝的 spawn 不落盘（没有孤儿会话文件）
+
+#### astgraph —— 代码图谱（dynamic，Node >= 22.5）
+- 从 flavor-code 移植：用 tree-sitter（WASM）构建函数/类/接口/类型的调用、import、继承边，存进 `.flavorlite/astgraph/index.db`（`node:sqlite`，WAL）
+- 工具：`ast_search` / `ast_callers` / `ast_callees` / `ast_impact` / `ast_context`
+- 命令 `/ast`：init / sync / status / search / impact / callers / callees / context
+- 懒加载：激活只注册处理器，WASM 语法与数据库首次使用才载入；`tools/after-call` 对文件修改做增量同步
+- 低版本 Node 上加载正常、查询时给友好错误
+
+#### flavor-ui —— 时间线 UI
+- 宿主只拥有终端，但把渲染委托给可选的 `ui` 服务（`provides: ["ui"]`）——这个插件接管整个观感
+- 每轮 turn 变成时间线：输入回显、模型文本实时流、工具调用 live 状态行（TTY 下 spinner 原地重写）、结尾 dim 统计行（turn 数 / token / 耗时）
+- 启动 banner 变成状态卡片：版本、模型、权限模式（语义着色）、会话 id、插件健康、失败插件告警
+- `/ui` 查看/切换样式（full 动画 / plain 静态）；非 TTY / `NO_COLOR` 自动退化为纯文本
+- 卸载即恢复宿主默认渲染，无残留状态
+
+#### filediff —— 文件变更 diff
+- 文件修改工具（Write/Edit/ApplyPatch 及带 path 的 write 类工具）跑完后，终端立刻打印彩色 `+/-` diff
+- 识别 shell 删除（rm/unlink/del/erase/rmdir/rd）与移动（mv/move/ren/rename）；目录递归扫描（有上限）
+- diff 直接写 stdout、**绝不污染模型可见的工具结果**（ANSI 不进上下文）
+- 可配置 color / maxDiffLines / maxFileBytes / maxTreeFiles
+
+#### clear-context —— `/clear`
+- 清屏（ANSI 转义）+ 重置上下文：会话文件重写为只剩 header，`loop/before-request` 把 clear 之前的消息从每次请求里裁掉
+- 重写失败时请求时裁剪兜底，旧上下文仍然到不了模型
+
+#### command-hints —— REPL 补全候选
+- 输入以 `/` 开头时，把命令、插件、技能名渲染在输入行下方，前缀高亮，Tab 循环补全（命令 → `/name`；插件 → `/plugin reload <name>`；技能仅展示信息）
+- 一次性 `-p` 模式下无 REPL，优雅 no-op
+
+#### task-planner —— 任务规划面板
+- 工具 `plan_start` / `plan_update` / `plan_view`：把复杂工作拆成原子任务，彩色面板（running 绿 / pending 橙 / error 红 / done 暗）直接画到终端
+- 面板只在终端显示，模型只拿纯文本摘要——颜色不污染上下文
+- `control` 类工具在 default/plan 模式下免询问，agent 可以自主规划
+
+---
+
+## 八、宿主层与配置
 
 ### createAgent() —— 组合根（`host/bootstrap.ts`）
 
 这是唯一知道完整插件清单的地方：
 
 ```
-llm → tools → guidance(4个) → 内置7工具 → permission → session
-    → prompt → loop → compaction → skills → commands → init
+hooks → llm → providers(openai/anthropic) → tools → guidance(4个) → 内置7工具
+    → permission → session → prompt → loop → compaction → skills → commands
+    → init → pluginsLoader → router → (extra plugins)
 ```
 
-按依赖关系加载配置的 LLM 提供商（有 OPENAI_API_KEY 就挂 OpenAI 适配器，有 ANTHROPIC_API_KEY 就挂 Anthropic 适配器），**一个 key 都没有启动即抛错**。
+按依赖关系加载配置的 LLM 提供商（有 OPENAI_API_KEY 就挂 OpenAI 适配器，有 ANTHROPIC_API_KEY 就挂 Anthropic 适配器），**一个 key 都没有启动即抛错**（通用检查：`llm.providers().length === 0`）。
 
 ### 配置合并（`host/config.ts`）
 
@@ -314,15 +449,29 @@ llm → tools → guidance(4个) → 内置7工具 → permission → session
 - **交互式 REPL**：`flavor-lite`。`›` 提示符；运行中输入文字 = steering；`Ctrl+C` 中止当前 turn；斜杠命令；退出时保存会话
 - **一次性运行**：`flavor-lite -p "任务"`。跑完就退出
 
-### 终端渲染（`host/render.ts`）
+### 【新】REPL 命令补全（`host/completions.ts`）
 
-零依赖 ANSI 颜色，非 TTY 或设置 `NO_COLOR` 时自动退化为纯文本。文本增量直接写 stdout（实时流式），工具调用显示 `⚙ 工具名 参数摘要`。
+宿主拥有终端，插件拥有候选来源：插件通过 `repl` 服务注册 `CompletionProvider`。输入时宿主在输入行下方渲染匹配候选（前缀高亮），Tab 补全选中的候选，再按 Tab 循环。
+
+实现细节很讲究：
+- 渲染用原生 ANSI 且保持 readline 的光标模型完好——每次绘制后把终端光标恢复到输入行尾
+- 行首 `prependListener` 在 readline 处理 Enter/Ctrl+C **之前**先撤掉建议块，命令输出永远不会和残留的建议块碰撞
+- 输入行即将换行时退化为不渲染（防止 readline 多行重绘与建议块互相踩踏）
+- 支持中英文宽度计算（`stringWidth`）、ANSI 安全截断、合并组合字符
+
+### 【新】渲染可委托（`host/render.ts` + flavor-ui）
+
+`render.ts` 检查可选的 `ui` 服务：存在就用它渲染（事件流、回显、错误、banner 全部委托），否则回退默认渲染。这就是 flavor-ui 能整体接管终端观感的机制。
+
+### 终端交互与权限（`host/interaction.ts`）
+
+终端交互实现（权限确认），在无 TTY / 一次性模式下优雅降级。
 
 ---
 
-## 八、测试情况
+## 九、测试情况
 
-`npm test` 实测 **7 个测试文件、39 个用例全部通过**（722ms）：
+`npm test` 实测 **19 个测试文件、238 个用例**（约 9.4s）：
 
 | 文件 | 覆盖内容 |
 |---|---|
@@ -333,12 +482,26 @@ llm → tools → guidance(4个) → 内置7工具 → permission → session
 | `compaction.test.ts` | 阈值内不动、尾部保留+标记、绝不以工具结果开头 |
 | `history.test.ts` | sanitizeHistory 各种边界（完整组、悬空组、部分回答、孤儿结果） |
 | `prompt.test.ts` | 空装配、节顺序、缺插件丢节、同名去重、权限/环境节 |
+| `providers.test.ts` | 【新】提供商插件：无凭证跳过、有凭证自注册、dispose 注销、无提供商 fail loud、第三方 provider 计入 |
+| `plugins.test.ts` | 【新】磁盘加载器：有效插件加载、manifest 校验、动态插件、依赖递归装载、热重载、坏插件不炸宿主 |
+| `router.test.ts` | 【新】路由：L0 关键词召回、L1 倒排索引、L2 工具名回退、反馈记忆、空闲弹出、CJK 分词/指纹 |
+| `completions.test.ts` | 【新】stringWidth/truncateToWidth/findHighlight、command-hints 候选收集、ReplCompletions 渲染/Tab 循环/Enter 撤块 |
+| `memory-plugin.test.ts` | 【新】存储去重、热度老化、BM25/向量/RRF 检索、embedding 客户端、向量库、自动提取、崩溃安全 |
+| `error-monitor-plugin.test.ts` | 【新】错误记录去重、分类、教训注入、ignorePatterns、脱敏、memory 集成、无 llm 时不写记忆 |
+| `error-monitor-llm.test.ts` | 【新】LLM 分析：提示词构建、严格 JSON 解析、超时中止、重试、空回复重试、集成链路 |
+| `websearch-plugin.test.ts` | 【新】HTML 解析、三提供商解析、searchWeb mock fetch、集成 |
+| `subagent.test.ts` | 【新】子代理加载、spawn 独立会话、深度限制 |
+| `filediff.test.ts` | 【新】新增/修改/覆盖/删除的 diff 输出、只读工具不输出、写失败不输出 |
+| `flavor-ui.test.ts` | 【新】时间线渲染、spinner 动画、样式切换、banner、非 TTY 退化 |
+| `clear-context-plugin.test.ts` | 【新】/clear 加载、会话文件重写、请求时裁剪、短历史不裁 |
 
-测试风格很有特点：**用一个脚本化假模型适配器**（`scriptedAdapter`）回放预写的事件序列，捕获每个请求，从而无网络地测整个 agent 循环。
+> 当前有 4 个用例失败（`completions.test.ts` 3 个 + `websearch-plugin.test.ts` 1 个，均与磁盘插件集成测试相关），其余 234 个全部通过。本次仅更新报告，未对失败用例做修复。
+
+测试风格很有特点：**用一个脚本化假模型适配器**（`scriptedAdapter`）回放预写的事件序列，捕获每个请求，从而无网络地测整个 agent 循环；磁盘插件测试则把插件目录复制进临时工作区，用真加载器装载。
 
 ---
 
-## 九、快速上手
+## 十、快速上手
 
 ```bash
 # 1. 安装依赖
@@ -366,22 +529,30 @@ OPENAI_BASE_URL=https://api.deepseek.com
 FLAVOR_OPENAI_MODEL=deepseek-chat
 ```
 
+**装第三方插件**：往 `.flavorlite/plugins/<name>/` 放 `flavor-plugin.json` + `index.js`，然后 `/plugin reload`（或直接 `flavor-lite` 里 `/plugin new <name>` 生成脚手架）。本项目自带的 10 个插件就是现成的参考实现。
+
 ---
 
-## 十、给想扩展它的人
+## 十一、给想扩展它的人
 
-**想加一个新工具？** 写一个工具对象，在插件 `apply` 里 `ctx.get("tools").register(...)` 即可。
+**想写一个磁盘插件？** 读 `docs/plugin-dev.md`（插件开发规范，唯一权威文档）。在 REPL 里 `/plugin new my-plugin` 生成脚手架，编辑 `index.js`，`/plugin reload my-plugin` 热重载——不需要重新构建、不需要重启。
 
-**想加一个新模型提供商？** 实现 `ModelAdapter`（一个 `stream(request)` 方法），注册进 `llm` 适配器注册表。
+**想加一个新工具？** `ctx.get("tools").register(...)` 即可；工具跑完后想立刻给终端打印点东西（比如 diff），挂 `tools/after-call`。
+
+**想加一个新模型提供商？** 实现 `ModelAdapter`（一个 `stream(request)` 方法），仿照 `providers.ts` 写一个自我注册的 provider 插件。
 
 **想加一条全局策略？** 挂一个 `tools/before-call` 或 `loop/before-request` 瀑布钩子，完全不碰循环代码。
 
 **想自定义系统提示词？** 挂 `prompt/assemble` 钩子，往 `event.sections` 推一节即可。
 
+**想让插件"用时才加载"？** manifest 里 `"activation": "dynamic"` + `triggers`，路由插件会按需召回、用后弹出。
+
 **想定制整套插件栈？** 不用 `createAgent()`，直接用 `Runtime.create().use(...).start()` 自己搭。
 
 ---
 
-## 十一、总结
+## 十二、总结
 
 flavor-lite 的价值不在于功能多，而在于**架构的纯粹性**：一个 150 行的内核 + 一堆各管一摊的小插件，通过"服务注册、瀑布钩子、可逆效果、拓扑排序"四个机制组合成完整智能体。系统提示词是拼出来的、权限是挂出来的、压缩是钩上去的、连主循环本身都是插件。想要什么能力，挂一个插件；不想要，卸掉即可。这种设计让代码小而清晰，也让扩展变得极其便宜。
+
+8-15 到 8-17 这一轮演进把"万物皆插件"推到了最后一步：**内核本身更薄了**（瀑布总线、提供商发现都插件化），**扩展成本降到了"放一个目录"**（磁盘插件 + 热重载 + 脚手架 + 开发规范文档），**复杂功能全搬到了插件层**（记忆、错误监控、网络搜索、子代理、代码图谱、UI、diff、规划……），甚至还有了**按需加载**（dynamic 插件 + 路由召回 + 空闲弹出），让"插件多"不再等于"内存多、提示词大"。如果你愿意，这个内核已经可以当作一个通用 agent 平台来用了。

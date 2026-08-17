@@ -9,7 +9,7 @@ import type { AgentHandle } from "./bootstrap";
 import { bold, dim, renderEvent, yellow, type UiBannerInfo, type UiService } from "./render";
 import { version } from "../../package.json";
 import { terminalInteractionPlugin } from "./interaction";
-import { ReplCompletions } from "./completions";
+import { ReplCompletions, stringWidth } from "./completions";
 import type { LlmService } from "../plugins/llm";
 import type { CommandsService } from "../plugins/commands";
 import type { PluginsLoaderService } from "../plugins/plugins";
@@ -85,6 +85,22 @@ export async function runRepl(handle: AgentHandle, options: ReplOptions = {}): P
     rl.prompt();
   };
 
+  /**
+   * After Enter, readline leaves the typed `› ...` line on screen. When a
+   * UI plugin echoes the input in its own style, that remnant becomes a
+   * duplicate row — erase it so the turn starts with a single echo line.
+   * Wrapped input occupies one physical row per wrap; clear them all.
+   */
+  const clearInputLine = (typed: string): void => {
+    if (process.stdout.isTTY !== true) return;
+    const columns = process.stdout.columns ?? 80;
+    const width = stringWidth(rl.getPrompt()) + stringWidth(typed);
+    const rows = Math.max(1, Math.ceil(width / columns));
+    // Enter left the cursor one row below the input: step up onto the
+    // first input row, erase every wrapped row, end where Enter left off.
+    process.stdout.write(`\x1b[${rows}A\r${"\x1b[2K\x1b[1B".repeat(rows)}\r`);
+  };
+
   rl.on("SIGINT", () => {
     if (busy && aborter) {
       aborter.abort(); // ends the current turn; second Ctrl+C while idle exits
@@ -139,10 +155,11 @@ export async function runRepl(handle: AgentHandle, options: ReplOptions = {}): P
       busy = true;
       aborter = new AbortController();
       const uiService = resolveUi();
-      if (uiService) {
-        // The echoed input is the visual start of a turn; without a UI
-        // plugin the readline prompt already showed what was typed.
-        uiService.renderUserInput?.(line);
+      if (uiService?.renderUserInput) {
+        // The echoed input is the visual start of a turn; drop readline's
+        // own remnant so the UI plugin's echo is the only copy on screen.
+        clearInputLine(line);
+        uiService.renderUserInput(line);
       }
       try {
         for await (const event of handle.run({ input: line, session: sessionRef.getSession(), signal: aborter.signal })) {

@@ -675,7 +675,7 @@ function registerPluginCommand(ctx: PluginContext, loader: PluginsLoader): () =>
   if (!commands) return () => {};
   return commands.register({
     name: "plugin",
-    description: "Manage plugins (/plugin list | reload [name] | new <name>)",
+    description: "Manage plugins (/plugin list | reload [name] | eject <name> | new <name>)",
     async run(args) {
       const [sub, ...rest] = args.trim() === "" ? [] : args.trim().split(/\s+/);
       switch (sub ?? "list") {
@@ -712,6 +712,18 @@ function registerPluginCommand(ctx: PluginContext, loader: PluginsLoader): () =>
           ];
           return lines.join("\n");
         }
+        case "eject": {
+          const name = rest[0];
+          if (!name) return "usage: /plugin eject <name>";
+          try {
+            await loader.eject(name);
+            const status = loader.list().find((entry) => entry.name === name);
+            if (!status) return `plugin "${name}" not found`;
+            return `ejected: ${name} (status: ${status.status})`;
+          } catch (error) {
+            return `error: ${errorMessage(error)}`;
+          }
+        }
         case "new": {
           const name = rest[0];
           if (!name) return "usage: /plugin new <name>";
@@ -723,7 +735,7 @@ function registerPluginCommand(ctx: PluginContext, loader: PluginsLoader): () =>
           }
         }
         default:
-          return `unknown subcommand "${sub}" (use: list | reload [name] | new <name>)`;
+          return `unknown subcommand "${sub}" (use: list | reload [name] | eject <name> | new <name>)`;
       }
     },
   });

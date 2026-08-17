@@ -332,8 +332,9 @@ describe("error-monitor LLM integration (through the plugins loader)", () => {
     expect(prompt).toContain("- node:");
     expect(prompt).toContain("- cwd:");
 
-    // Distillation is async; wait until the memory write completed.
-    await waitFor(async () => (await memory().store.list()).some((entry) => entry.type === "feedback"));
+    // Distillation is fire-and-forget; memoryStatus is persisted LAST, so
+    // waiting for it covers both the memory write and the record update.
+    await waitFor(async () => (await recordsFile()).records[0]?.memoryStatus === "stored");
 
     // High confidence → distilled into long-term memory as feedback.
     const entries = await memory().store.list();
@@ -371,8 +372,9 @@ describe("error-monitor LLM integration (through the plugins loader)", () => {
 
     await fireError();
 
-    // Wait for the async analysis to be attached to the record.
-    await waitFor(async () => (await recordsFile()).records[0]?.analysis != null);
+    // Wait for the async analysis to be attached to the record AND for the
+    // skip outcome to be persisted (memoryStatus lands after the analysis).
+    await waitFor(async () => (await recordsFile()).records[0]?.memoryStatus?.includes("confidence") === true);
 
     expect((await memory().store.list()).filter((entry) => entry.type === "feedback")).toHaveLength(0);
 
@@ -390,9 +392,9 @@ describe("error-monitor LLM integration (through the plugins loader)", () => {
 
     await fireError();
 
-    // The LLM call throws synchronously; give the fire-and-forget task a
-    // moment, then confirm nothing reached memory.
-    await new Promise((resolve) => setTimeout(resolve, 100));
+    // The LLM call throws; memoryStatus is persisted last, so waiting for it
+    // also covers the (absent) memory write.
+    await waitFor(async () => (await recordsFile()).records[0]?.memoryStatus?.startsWith("skipped") === true);
     expect((await memory().store.list()).filter((entry) => entry.type === "feedback")).toHaveLength(0);
     // The failure is still recorded locally for inspection, with the reason
     // surfaced so /errors explains why nothing was distilled.
@@ -414,7 +416,9 @@ describe("error-monitor LLM integration (through the plugins loader)", () => {
 
     await fireError();
 
-    await waitFor(async () => (await memory().store.list()).some((entry) => entry.type === "feedback"));
+    await waitFor(
+      async () => (await recordsFile()).records[0]?.memoryStatus === "stored (rule-based fallback)",
+    );
 
     const entries = await memory().store.list();
     const lesson = entries.find((entry) => entry.type === "feedback");

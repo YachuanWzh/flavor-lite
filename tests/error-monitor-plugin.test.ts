@@ -307,7 +307,12 @@ describe("error-monitor + memory integration", () => {
   it("persists the memory outcome on the record (silent-logger diagnostics)", async () => {
     await fireError(shellCall("frobnicate"), { content: WIN_SHELL_ERROR, isError: true });
 
-    await waitFor(async () => (await memory().store.list()).some((entry) => entry.type === "feedback"));
+    // memoryStatus is persisted LAST by the distillation, so polling for it
+    // also covers the memory write (avoids reading a stale records.json).
+    await waitFor(async () => {
+      const raw = JSON.parse(await readFile(join(dir, ".flavorlite", "error-monitor", "records.json"), "utf-8"));
+      return raw.records[0]?.memoryStatus === "stored (rule-based fallback)";
+    });
 
     const raw = JSON.parse(await readFile(join(dir, ".flavorlite", "error-monitor", "records.json"), "utf-8"));
     expect(raw.records[0].memoryStatus).toBe("stored (rule-based fallback)");
@@ -372,11 +377,18 @@ describe("error-monitor without an llm service (default fallbackToRules=false)",
     expect(await memory.store.list()).toHaveLength(0);
 
     // ...but the record explains why, so /errors can diagnose it even with
-    // a silent host logger.
-    await new Promise((resolve) => setTimeout(resolve, 150));
-    const reread = JSON.parse(await readFile(join(dir, ".flavorlite", "error-monitor", "records.json"), "utf-8"));
-    expect((reread.records[0] as { memoryStatus?: string }).memoryStatus)
-      .toContain("no llm service available");
+    // a silent host logger. memoryStatus is persisted asynchronously after
+    // the record itself — poll for it instead of sleeping a fixed delay.
+    const recordsPath = join(dir, ".flavorlite", "error-monitor", "records.json");
+    const deadline = Date.now() + 3000;
+    let status: string | undefined;
+    while (Date.now() < deadline) {
+      const reread = JSON.parse(await readFile(recordsPath, "utf-8"));
+      status = (reread.records[0] as { memoryStatus?: string }).memoryStatus;
+      if (status) break;
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+    expect(status).toContain("no llm service available");
   });
 });
 

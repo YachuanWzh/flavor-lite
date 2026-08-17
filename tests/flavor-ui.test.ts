@@ -177,6 +177,31 @@ describe("flavor-ui renderer", () => {
     expect(plain(output)).toContain("✓ Shell  npm test");
   });
 
+  it("clips cards to the terminal width so rewrites never wrap (no ghost copies)", () => {
+    const output = makeOutput(40);
+    const renderer = createRenderer({ output, color: false, tty: true });
+
+    // A summary longer than the terminal: a wrapped card leaves the pending
+    // line behind because \r only reaches the last physical line.
+    const longPath = "C:\\Users\\wangzh\\Desktop\\idea\\flavor-lite\\tests\\completions.test.ts";
+    renderer.render(event.agentStart);
+    renderer.render(event.toolStart("Read", { path: longPath }));
+    renderer.render(event.toolEnd("Read", "ok", false));
+
+    const frames = output.chunks.filter((chunk) => chunk.startsWith("\r\x1b[2K") && chunk.length > "\r\x1b[2K".length);
+    expect(frames.length).toBeGreaterThanOrEqual(1); // at least one spinner frame
+    // Every written row (spinner frames and the final card alike) must fit
+    // one physical row, otherwise the \r rewrite leaves the wrapped part
+    // behind as a ghost copy.
+    for (const chunk of output.chunks) {
+      const body = chunk.replace(/\r\x1b\[2K/g, "").replace(/\n$/, "");
+      if (body) expect(body.length, `row wraps the terminal: ${JSON.stringify(body)}`).toBeLessThanOrEqual(39);
+    }
+    expect(plain(output)).toContain("✓ Read");
+    expect(plain(output)).toContain("…"); // long path clipped with an ellipsis
+    expect(plain(output)).not.toContain(longPath);
+  });
+
   it("pauseAnimation freezes the spinner into a static pending card", () => {
     const output = makeOutput();
     const renderer = createRenderer({ output, color: false, tty: true });

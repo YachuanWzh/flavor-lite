@@ -75,7 +75,8 @@ describe("command-hints plugin: collectSuggestions", () => {
     expect(suggestions.map((s) => s.display)).toEqual(["/remember", "/resume", "release-tools", "review"]);
     expect(suggestions[0]).toMatchObject({ completion: "/remember", description: "Store a fact" });
     expect(suggestions[2]).toMatchObject({ completion: "/plugin reload release-tools" });
-    expect(suggestions[3]).toMatchObject({ completion: undefined });
+    expect(suggestions[3]).toMatchObject({ display: "review" });
+    expect(suggestions[3]?.completion).toBeUndefined(); // skills are informational
   });
 
   it("lists everything when only a slash is typed", async () => {
@@ -189,7 +190,7 @@ describe("ReplCompletions", () => {
 
     input.emit("keypress", "\t", { name: "tab", ctrl: false, meta: false, shift: false, sequence: "\t" });
     expect(rl.line).toBe("/resume");
-    expect(rl.cursor).toBe(8);
+    expect(rl.cursor).toBe("/resume".length);
 
     input.emit("keypress", "\t", { name: "tab", ctrl: false, meta: false, shift: false, sequence: "\t" });
     expect(rl.line).toBe("/remember"); // wraps around
