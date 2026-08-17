@@ -1,12 +1,32 @@
-export { Context, errorMessage } from "./context";
+export { Context, errorMessage, withOwnerScope } from "./context";
+export type { EffectDiagnostic, ServiceChange } from "./context";
 export { Runtime } from "./runtime";
+export type {
+  KernelEventMap,
+  PluginInspectInfo,
+  PluginInstanceRef,
+  RuntimeSnapshot,
+  ServiceInfo,
+} from "./runtime";
+export {
+  ActivationError,
+  ConfigValidationError,
+  DisposedError,
+  KernelError,
+  OwnershipError,
+  ResolutionError,
+  UnmountError,
+} from "./errors";
+export type { KernelErrorCode, ResolutionErrorCode } from "./errors";
 export {
   definePlugin,
   silentLogger,
   type Disposer,
   type HookMap,
   type KernelOptions,
+  type LogFields,
   type Logger,
+  type LogLevel,
   type Plugin,
   type PluginContext,
   type ProvideOptions,

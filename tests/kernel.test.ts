@@ -1,16 +1,27 @@
 import { describe, expect, it } from "vitest";
 import { z } from "zod";
-import { Runtime, definePlugin, type Logger, type PluginContext } from "../src/kernel";
+import {
+  ActivationError,
+  OwnershipError,
+  ResolutionError,
+  Runtime,
+  definePlugin,
+  type LogFields,
+  type Logger,
+  type PluginContext,
+} from "../src/kernel";
 import { hooksPlugin, type HookBusService } from "../src/plugins/hooks";
 
 /** Logger spy: async activation failures surface via logger.error. */
-function spyLogger(): Logger & { errors: string[] } {
+function spyLogger(): Logger & { errors: string[]; warns: string[] } {
   const errors: string[] = [];
+  const warns: string[] = [];
   return {
     errors,
+    warns,
     debug: () => {},
     info: () => {},
-    warn: () => {},
+    warn: (message: string) => warns.push(message),
     error: (message: string) => errors.push(message),
   };
 }
@@ -385,5 +396,239 @@ describe("kernel runtime", () => {
     expect(runtime.ctx.get("owned")).toBe("v2");
     await runtime.unmount("scoped");
     expect(runtime.ctx.get("owned")).toBe("v1");
+  });
+
+  it("enforces service ownership across awaits in async apply", async () => {
+    const owner = definePlugin({
+      name: "owner",
+      provides: ["als-owned"],
+      apply(ctx) {
+        ctx.provide("als-owned", "v1");
+      },
+    });
+    const intruder = definePlugin({
+      name: "intruder",
+      async apply(ctx) {
+        await Promise.resolve();
+        // After an await the ambient owner still travels with this apply:
+        // this must fail loud instead of silently overriding "owner".
+        ctx.provide("als-owned", "v2");
+      },
+    });
+    const runtime = Runtime.create();
+    runtime.use(owner).start();
+    runtime.use(intruder);
+    await expect(runtime.ready).rejects.toThrow(/owned by plugin "owner"/);
+    expect(runtime.ctx.get("als-owned")).toBe("v1");
+  });
+
+  it("distinguishes same-named plugin instances by instance id", async () => {
+    const makePlugin = (key: string) =>
+      definePlugin({
+        name: "dup-name",
+        provides: [key],
+        apply(ctx) {
+          return ctx.effect(() => ctx.provide(key, key), `${key}.provide`);
+        },
+      });
+    const runtime = Runtime.create();
+    runtime.use(makePlugin("svc-one")).use(makePlugin("svc-two")).start();
+    const instances = runtime.inspect().plugins.filter((info) => info.name === "dup-name");
+    expect(instances).toHaveLength(2);
+    expect(instances[0]!.instanceId).not.toBe(instances[1]!.instanceId);
+
+    // unmount targets the first instance only; the second keeps its service.
+    expect(await runtime.unmount("dup-name")).toBe(true);
+    expect(runtime.ctx.tryGet("svc-one")).toBeUndefined();
+    expect(runtime.ctx.get("svc-two")).toBe("svc-two");
+  });
+
+  it("inspect() exposes services, owners, consumers and activation timing", () => {
+    const provider = definePlugin({
+      name: "provider",
+      provides: ["ins-svc"],
+      apply(ctx) {
+        ctx.provide("ins-svc", 1);
+      },
+    });
+    const consumer = definePlugin({ name: "consumer", inject: ["ins-svc"], apply() {} });
+    const runtime = Runtime.create();
+    runtime.use(provider).use(consumer).start();
+    const snapshot = runtime.inspect();
+    expect(snapshot.started).toBe(true);
+    expect(snapshot.disposed).toBe(false);
+    expect(snapshot.plugins.map((info) => `${info.name}:${info.status}`)).toEqual([
+      "provider:active",
+      "consumer:active",
+    ]);
+    expect(snapshot.services).toContainEqual({ key: "ins-svc", owner: "provider" });
+    expect(snapshot.consumers["ins-svc"]).toEqual(["consumer"]);
+    expect(typeof snapshot.plugins.find((info) => info.name === "provider")?.activationMs).toBe("number");
+  });
+
+  it("plan() dry-runs resolution without activating or consuming pending", () => {
+    const runtime = Runtime.create();
+    const a = definePlugin({ name: "a", inject: ["plan-b"], apply() {} });
+    const b = definePlugin({ name: "b", provides: ["plan-b"], apply() {} });
+    const broken = definePlugin({ name: "broken", inject: ["plan-nope"], apply() {} });
+    runtime.use(a).use(b).use(broken);
+    const outcome = runtime.plan();
+    expect(outcome.ordered).toEqual(["b", "a"]);
+    expect(outcome.errors).toHaveLength(1);
+    expect(outcome.errors[0]).toBeInstanceOf(ResolutionError);
+    expect(runtime.activePlugins()).toEqual([]); // nothing ran
+
+    // plan() does not consume the pending list: start() sees the same mounts.
+    expect(() => runtime.start()).toThrow(/requires service "plan-nope"/);
+    expect(runtime.activePlugins()).toEqual(["b", "a"]);
+  });
+
+  it("fails async activations that exceed activationTimeoutMs", async () => {
+    const slow = definePlugin({ name: "slow", apply: () => new Promise<void>(() => {}) });
+    const runtime = Runtime.create({ activationTimeoutMs: 25 });
+    runtime.use(slow).start();
+    let caught: unknown;
+    try {
+      await runtime.ready;
+    } catch (error) {
+      caught = error;
+    }
+    expect(caught).toBeInstanceOf(ActivationError);
+    expect((caught as ActivationError).code).toBe("activation/timeout");
+
+    // The runtime stays usable after a timeout failure.
+    const ok = definePlugin({
+      name: "ok",
+      provides: ["ok-after-timeout"],
+      apply(ctx) {
+        ctx.provide("ok-after-timeout", 1);
+      },
+    });
+    runtime.use(ok);
+    expect(runtime.ctx.get("ok-after-timeout")).toBe(1);
+  });
+
+  it("warns and moves on when a disposer exceeds teardownTimeoutMs", async () => {
+    const logger = spyLogger();
+    const sticky = definePlugin({
+      name: "sticky",
+      apply: () => () => new Promise<void>(() => {}), // disposer never settles
+    });
+    const runtime = Runtime.create({ logger, teardownTimeoutMs: 25 });
+    runtime.use(sticky).start();
+    const startedAt = Date.now();
+    await runtime.dispose();
+    expect(Date.now() - startedAt).toBeLessThan(2000); // shutdown did not wedge
+    expect(logger.warns.some((line) => line.includes("timed out"))).toBe(true);
+  });
+
+  it("aborts ctx.signal when dispose starts", async () => {
+    const runtime = Runtime.create();
+    let seen: AbortSignal | undefined;
+    const observer = definePlugin({
+      name: "observer",
+      apply(ctx) {
+        seen = ctx.signal;
+      },
+    });
+    runtime.use(observer).start();
+    expect(seen!.aborted).toBe(false);
+    await runtime.dispose();
+    expect(seen!.aborted).toBe(true);
+  });
+
+  it("emits lifecycle events for activation, services, unmount and dispose", async () => {
+    const runtime = Runtime.create();
+    const seen: string[] = [];
+    const offs = [
+      runtime.on("plugin:activated", (event) => seen.push(`activated:${event.name}`)),
+      runtime.on("service:provided", (event) => seen.push(`provided:${event.key}`)),
+      runtime.on("service:removed", (event) => seen.push(`removed:${event.key}`)),
+      runtime.on("plugin:unmounted", (event) => seen.push(`unmounted:${event.name}`)),
+      runtime.on("runtime:disposed", () => seen.push("disposed")),
+    ];
+    const plugin = definePlugin({
+      name: "svc",
+      provides: ["evt-svc"],
+      apply(ctx) {
+        return ctx.effect(() => ctx.provide("evt-svc", 1), "evt.provide");
+      },
+    });
+    runtime.use(plugin).start();
+    await runtime.unmount("svc");
+    await runtime.dispose();
+    for (const off of offs) off();
+    expect(seen).toEqual([
+      "provided:evt-svc",
+      "activated:svc",
+      "removed:evt-svc",
+      "unmounted:svc",
+      "disposed",
+    ]);
+  });
+
+  it("logs activation failures with structured fields", async () => {
+    const fields: Array<LogFields | undefined> = [];
+    const logger: Logger = {
+      debug: () => {},
+      info: () => {},
+      warn: () => {},
+      error: (_message: string, errorFields?: LogFields) => {
+        fields.push(errorFields);
+      },
+    };
+    const flaky = definePlugin({
+      name: "flaky-fields",
+      async apply() {
+        throw new Error("field boom");
+      },
+    });
+    const runtime = Runtime.create({ logger });
+    runtime.use(flaky).start();
+    await expect(runtime.ready).rejects.toThrow(/field boom/);
+    expect(fields.some((entry) => entry?.plugin === "flaky-fields" && entry?.phase === "activation")).toBe(true);
+  });
+
+  it("typed kernel errors carry stable codes and structured detail", () => {
+    const broken = definePlugin({ name: "broken-codes", inject: ["code-nope"], apply() {} });
+    let caught: unknown;
+    try {
+      Runtime.create().use(broken).start();
+    } catch (error) {
+      caught = error;
+    }
+    expect(caught).toBeInstanceOf(ResolutionError);
+    expect((caught as ResolutionError).code).toBe("resolution/missing-provider");
+    expect((caught as ResolutionError).detail.plugins).toEqual(["broken-codes"]);
+
+    // Ownership violations surface as ActivationError with the original cause.
+    const runtime = Runtime.create();
+    runtime
+      .use(
+        definePlugin({
+          name: "o",
+          provides: ["code-owned"],
+          apply(ctx) {
+            ctx.provide("code-owned", 1);
+          },
+        }),
+      )
+      .start();
+    let ownership: unknown;
+    try {
+      runtime.use(
+        definePlugin({
+          name: "i",
+          apply(ctx) {
+            ctx.provide("code-owned", 2);
+          },
+        }),
+      );
+    } catch (error) {
+      ownership = error;
+    }
+    expect(ownership).toBeInstanceOf(ActivationError);
+    expect((ownership as ActivationError).code).toBe("activation/failed");
+    expect(((ownership as ActivationError).cause as OwnershipError).code).toBe("service/ownership");
   });
 });

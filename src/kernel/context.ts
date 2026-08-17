@@ -4,12 +4,54 @@
  * waterfall hooks included — is a plugin built on these two primitives.
  */
 
+import { AsyncLocalStorage } from "node:async_hooks";
+
+import { DisposedError, OwnershipError } from "./errors";
 import type { Disposer, Logger, PluginContext, ProvideOptions } from "./types";
+
+/**
+ * Ambient plugin ownership, propagated across awaits. The runtime wraps
+ * every plugin.apply() in withOwnerScope(plugin.name, ...); AsyncLocalStorage
+ * carries the owner through the whole async body, so registrations made
+ * after an await are attributed exactly like sync ones.
+ */
+const ownerStorage = new AsyncLocalStorage<string | undefined>();
+
+/** Run fn with an ambient owner scope; async continuations inherit it. */
+export function withOwnerScope<T>(owner: string | undefined, fn: () => T): T {
+  return ownerStorage.run(owner, fn);
+}
+
+/** Service registration change, surfaced by the runtime as kernel events. */
+export interface ServiceChange {
+  type: "provided" | "removed";
+  key: string;
+  owner: string | undefined;
+}
 
 interface EffectRecord {
   id: number;
   label: string;
   dispose: Disposer | void;
+  stack?: string;
+}
+
+/** Effect registration diagnostics (stacks only when captured). */
+export interface EffectDiagnostic {
+  id: number;
+  label: string;
+  stack?: string;
+}
+
+export interface ContextOptions {
+  cwd: string;
+  logger: Logger;
+  /** Aborted when the owning runtime starts disposing. */
+  signal?: AbortSignal;
+  /** Capture registration stacks for effects (diagnostics only). */
+  captureEffectStacks?: boolean;
+  /** Invoked whenever a service registration appears or unwinds. */
+  onServiceChange?: (change: ServiceChange) => void;
 }
 
 /**
@@ -37,19 +79,23 @@ export function onceDisposer(dispose: Disposer): Disposer {
 export class Context implements PluginContext {
   readonly cwd: string;
   readonly logger: Logger;
+  readonly signal: AbortSignal;
 
   private services = new Map<string, unknown>();
   /** Owning plugin per key; undefined when claimed outside an apply(). */
   private owners = new Map<string, string | undefined>();
-  /** Plugin whose apply() is running right now (set by the runtime). */
-  private ownerScope: string | undefined;
   private effects: EffectRecord[] = [];
   private nextEffectId = 0;
   private disposed = false;
+  private readonly captureEffectStacks: boolean;
+  private readonly onServiceChange?: (change: ServiceChange) => void;
 
-  constructor(options: { cwd: string; logger: Logger }) {
+  constructor(options: ContextOptions) {
     this.cwd = options.cwd;
     this.logger = options.logger;
+    this.signal = options.signal ?? new AbortController().signal;
+    this.captureEffectStacks = options.captureEffectStacks ?? false;
+    this.onServiceChange = options.onServiceChange;
   }
 
   get active(): boolean {
@@ -59,33 +105,29 @@ export class Context implements PluginContext {
   provide(key: string, service: unknown, options?: ProvideOptions): Disposer {
     this.assertActive("provide");
     const currentOwner = this.owners.get(key);
-    const newOwner = this.ownerScope;
+    const newOwner = ownerStorage.getStore();
     if (currentOwner && newOwner && currentOwner !== newOwner && !options?.override) {
-      throw new Error(
-        `service "${key}" is owned by plugin "${currentOwner}"; plugin "${newOwner}" cannot provide it (pass { override: true } to shadow deliberately)`,
-      );
+      throw new OwnershipError(key, currentOwner, newOwner);
     }
     const previous = this.services.has(key)
       ? { value: this.services.get(key), owner: this.owners.get(key) }
       : undefined;
     this.services.set(key, service);
     this.owners.set(key, newOwner);
+    this.notifyServiceChange({ type: "provided", key, owner: newOwner });
     return onceDisposer(() => {
       // Restore the previous provider when this registration unwinds, so a
       // scoped override never leaves a dangling key behind.
       if (previous === undefined) {
         this.services.delete(key);
         this.owners.delete(key);
+        this.notifyServiceChange({ type: "removed", key, owner: newOwner });
       } else {
         this.services.set(key, previous.value);
         this.owners.set(key, previous.owner);
+        this.notifyServiceChange({ type: "provided", key, owner: previous.owner });
       }
     });
-  }
-
-  /** @internal The runtime sets the ambient owner around plugin.apply(). */
-  setOwnerScope(owner: string | undefined): void {
-    this.ownerScope = owner;
   }
 
   get(key: string): unknown {
@@ -106,17 +148,32 @@ export class Context implements PluginContext {
     return [...this.services.keys()];
   }
 
+  /** Snapshot of currently provided services with their owning plugin. */
+  serviceOwners(): Array<{ key: string; owner: string | undefined }> {
+    return [...this.services.keys()].map((key) => ({ key, owner: this.owners.get(key) }));
+  }
+
   effect<S>(setup: () => S, label?: string): S {
     this.assertActive("effect");
     const result = setup();
     const dispose = typeof result === "function" ? onceDisposer(result as unknown as Disposer) : undefined;
-    this.effects.push({ id: this.nextEffectId++, label: label ?? setup.name ?? "effect", dispose });
+    this.effects.push({
+      id: this.nextEffectId++,
+      label: label ?? setup.name ?? "effect",
+      dispose,
+      stack: this.captureEffectStacks ? new Error().stack : undefined,
+    });
     return result;
   }
 
   /** Ids of the currently tracked effects (the runtime scopes plugins with this). */
   effectIds(): number[] {
     return this.effects.map((record) => record.id);
+  }
+
+  /** Registration diagnostics for every live effect (stacks when captured). */
+  effectDiagnostics(): EffectDiagnostic[] {
+    return this.effects.map((record) => ({ id: record.id, label: record.label, stack: record.stack }));
   }
 
   /**
@@ -139,7 +196,10 @@ export class Context implements PluginContext {
       try {
         await record.dispose();
       } catch (error) {
-        this.logger.warn(`effect "${record.label}" failed during release: ${errorMessage(error)}`);
+        this.logger.warn(`effect "${record.label}" failed during release: ${errorMessage(error)}`, {
+          effect: record.label,
+          error: errorMessage(error),
+        });
       }
     }
   }
@@ -155,7 +215,10 @@ export class Context implements PluginContext {
         await record.dispose();
       } catch (error) {
         errors.push(error);
-        this.logger.warn(`effect "${record.label}" failed during dispose: ${errorMessage(error)}`);
+        this.logger.warn(`effect "${record.label}" failed during dispose: ${errorMessage(error)}`, {
+          effect: record.label,
+          error: errorMessage(error),
+        });
       }
     }
     this.effects = [];
@@ -166,8 +229,21 @@ export class Context implements PluginContext {
     }
   }
 
+  private notifyServiceChange(change: ServiceChange): void {
+    if (!this.onServiceChange) return;
+    try {
+      this.onServiceChange(change);
+    } catch (error) {
+      // Event listeners must never break service registration.
+      this.logger.warn(`service change listener failed for "${change.key}": ${errorMessage(error)}`, {
+        serviceKey: change.key,
+        error: errorMessage(error),
+      });
+    }
+  }
+
   private assertActive(operation: string): void {
-    if (this.disposed) throw new Error(`context is disposed; cannot ${operation}`);
+    if (this.disposed) throw new DisposedError("context", operation);
   }
 }
 

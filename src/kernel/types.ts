@@ -58,11 +58,20 @@ export interface ServiceMap {}
 // eslint-disable-next-line @typescript-eslint/no-empty-interface
 export interface HookMap {}
 
+export type LogLevel = "debug" | "info" | "warn" | "error";
+
+/**
+ * Structured fields carried alongside a log line (plugin, serviceKey,
+ * code, ...). Implementations may ignore them; the kernel always supplies
+ * them so machine consumers (audit logs, metrics) never have to parse text.
+ */
+export type LogFields = Record<string, unknown>;
+
 export interface Logger {
-  debug(message: string): void;
-  info(message: string): void;
-  warn(message: string): void;
-  error(message: string): void;
+  debug(message: string, fields?: LogFields): void;
+  info(message: string, fields?: LogFields): void;
+  warn(message: string, fields?: LogFields): void;
+  error(message: string, fields?: LogFields): void;
 }
 
 export const silentLogger: Logger = {
@@ -100,6 +109,20 @@ export function definePlugin<C = unknown>(plugin: Plugin<C>): Plugin<C> {
 export interface KernelOptions {
   cwd?: string;
   logger?: Logger;
+  /**
+   * Fail an async plugin activation (code "activation/timeout") when its
+   * apply() has not settled within this many milliseconds. Sync apply()
+   * cannot be timed out; long sync work should be moved to async. Plugins
+   * should observe ctx.signal to unwind promptly once abandoned.
+   */
+  activationTimeoutMs?: number;
+  /**
+   * Warn and move on when a disposer or effect release hangs during
+   * teardown, so shutdown can never wedge. Unset = wait forever.
+   */
+  teardownTimeoutMs?: number;
+  /** Capture registration stacks for effects (diagnostics only). */
+  effectStackTraces?: boolean;
 }
 
 /**
@@ -111,6 +134,11 @@ export type WaterfallListener<T> = (value: T, next: (value: T) => Promise<T>) =>
 export interface PluginContext {
   readonly cwd: string;
   readonly logger: Logger;
+  /**
+   * Aborted when the owning runtime starts disposing. Plugins should
+   * propagate it to their own async work so shutdown stays prompt.
+   */
+  readonly signal: AbortSignal;
 
   /**
    * Claim a service key. Last provider wins; disposing restores the previous

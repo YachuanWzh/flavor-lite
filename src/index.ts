@@ -7,11 +7,30 @@
 
 // kernel
 export { Context, Runtime, definePlugin, silentLogger, errorMessage } from "./kernel";
+export {
+  ActivationError,
+  ConfigValidationError,
+  DisposedError,
+  KernelError,
+  OwnershipError,
+  ResolutionError,
+  UnmountError,
+} from "./kernel/errors";
+export type { KernelErrorCode, ResolutionErrorCode } from "./kernel/errors";
+export type {
+  KernelEventMap,
+  PluginInspectInfo,
+  PluginInstanceRef,
+  RuntimeSnapshot,
+  ServiceInfo,
+} from "./kernel/runtime";
 export type {
   Disposer,
   HookMap,
   KernelOptions,
+  LogFields,
   Logger,
+  LogLevel,
   Plugin,
   PluginContext,
   ServiceMap,

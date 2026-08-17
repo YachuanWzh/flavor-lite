@@ -11,16 +11,32 @@
  * - resolution failures drop only the offending plugins (and, cascading,
  *   their dependents), so a broken mount never poisons later use() calls
  * - unmount refuses to leave dangling consumers (reverse dependency graph
- *   built from declared inject/provides)
+ *   built per instance from declared inject/provides)
  * - apply() may be async; effects registered after an await stay scoped
- *   because the effect snapshot diff is taken at settle time
+ *   because the effect snapshot diff is taken at settle time, and service
+ *   ownership stays enforced because the owner travels via AsyncLocalStorage
+ * - async activations can be bounded by activationTimeoutMs; teardown is
+ *   bounded by teardownTimeoutMs (warn and move on, shutdown never wedges)
  * - plugin disposers are inertia-guarded (see onceDisposer)
+ *
+ * Operability: typed errors with stable codes (see ./errors), structured
+ * log fields, a kernel event bus (on()), and introspection (inspect(),
+ * plan()).
  */
 
-import { Context, errorMessage, onceDisposer } from "./context";
+import { Context, errorMessage, onceDisposer, withOwnerScope, type ServiceChange } from "./context";
+import {
+  ActivationError,
+  ConfigValidationError,
+  DisposedError,
+  ResolutionError,
+  UnmountError,
+  activationFailure,
+} from "./errors";
 import type {
   Disposer,
   KernelOptions,
+  LogFields,
   Logger,
   Plugin,
   StandardSchemaV1Issue,
@@ -31,6 +47,8 @@ import { silentLogger } from "./types";
 interface MountedPlugin {
   plugin: Plugin<never>;
   config: unknown;
+  /** Per-mount identity: same-named plugins stay distinguishable. */
+  instanceId: number;
 }
 
 interface QueuedPlugin extends MountedPlugin {
@@ -41,6 +59,8 @@ interface ActivePlugin extends MountedPlugin {
   dispose: Disposer | void;
   /** Ids of effects registered during apply(): scoped for unmount. */
   effectIds: number[];
+  activatedAt: number;
+  activationMs: number;
 }
 
 /** One use()/start() activation group: rolls back together on failure. */
@@ -49,14 +69,45 @@ interface ActivationBatch {
   activated: ActivePlugin[];
 }
 
-/** Resolution failure carrying the offending entries so they can be dropped. */
-class ResolutionError extends Error {
-  constructor(
-    message: string,
-    readonly entries: MountedPlugin[],
-  ) {
-    super(message);
-  }
+/** Identity carried by lifecycle events. */
+export interface PluginInstanceRef {
+  instanceId: number;
+  name: string;
+}
+
+/** Kernel lifecycle events, subscribable via runtime.on(). */
+export interface KernelEventMap {
+  "plugin:activating": PluginInstanceRef;
+  "plugin:activated": PluginInstanceRef;
+  "plugin:failed": PluginInstanceRef & { error: unknown };
+  "plugin:unmounted": PluginInstanceRef;
+  "batch:rolled-back": { plugins: string[]; error: unknown };
+  "service:provided": { key: string; owner: string | undefined };
+  "service:removed": { key: string; owner: string | undefined };
+  "runtime:disposed": Record<string, never>;
+}
+
+export interface ServiceInfo {
+  key: string;
+  owner: string | undefined;
+}
+
+export interface PluginInspectInfo extends PluginInstanceRef {
+  status: "queued" | "activating" | "active";
+  inject: string[];
+  provides: string[];
+  effectCount?: number;
+  activatedAt?: number;
+  activationMs?: number;
+}
+
+export interface RuntimeSnapshot {
+  started: boolean;
+  disposed: boolean;
+  plugins: PluginInspectInfo[];
+  services: ServiceInfo[];
+  /** Service key -> names of active plugins injecting it. */
+  consumers: Record<string, string[]>;
 }
 
 export class Runtime {
@@ -68,19 +119,32 @@ export class Runtime {
   private queue: QueuedPlugin[] = [];
   private batches = new Map<number, ActivationBatch>();
   private nextBatchId = 0;
+  private nextInstanceId = 0;
   private pumping = false;
-  /** Reverse dependency graph: service key -> active plugin names injecting it. */
-  private consumers = new Map<string, Set<string>>();
+  /** Reverse dependency graph: service key -> instance ids injecting it. */
+  private consumers = new Map<string, Set<number>>();
   private activationTail: Promise<void> = Promise.resolve();
+  private controller = new AbortController();
+  private listeners = new Map<string, Set<(event: never) => void>>();
+  /** Instance ids whose apply() is currently running. */
+  private activating = new Set<number>();
+  private readonly activationTimeoutMs?: number;
+  private readonly teardownTimeoutMs?: number;
 
-  private constructor(ctx: Context) {
-    this.ctx = ctx;
+  private constructor(options: KernelOptions) {
+    this.activationTimeoutMs = options.activationTimeoutMs;
+    this.teardownTimeoutMs = options.teardownTimeoutMs;
+    this.ctx = new Context({
+      cwd: options.cwd ?? process.cwd(),
+      logger: options.logger ?? silentLogger,
+      signal: this.controller.signal,
+      captureEffectStacks: options.effectStackTraces,
+      onServiceChange: (change) => this.emitServiceChange(change),
+    });
   }
 
   static create(options: KernelOptions = {}): Runtime {
-    const logger = options.logger ?? silentLogger;
-    const cwd = options.cwd ?? process.cwd();
-    return new Runtime(new Context({ cwd, logger }));
+    return new Runtime(options);
   }
 
   get logger(): Logger {
@@ -104,8 +168,8 @@ export class Runtime {
    * reported, so they can never poison a later use() call.
    */
   use<C>(plugin: Plugin<C>, config?: C): this {
-    if (this.disposed) throw new Error("runtime is disposed");
-    this.pending.push({ plugin: plugin as unknown as Plugin<never>, config });
+    if (this.disposed) throw new DisposedError("runtime", "use()");
+    this.pending.push({ plugin: plugin as unknown as Plugin<never>, config, instanceId: this.nextInstanceId++ });
     if (this.started) {
       const { ordered, errors } = this.resolvePending();
       let activationError: unknown;
@@ -157,18 +221,15 @@ export class Runtime {
    * `{ force: true }` to override (consumers will then fail on resolution).
    */
   async unmount(name: string, options: { force?: boolean } = {}): Promise<boolean> {
-    if (this.disposed) throw new Error("runtime is disposed");
+    if (this.disposed) throw new DisposedError("runtime", "unmount()");
     const entry = this.active.find((candidate) => candidate.plugin.name === name);
     if (!entry) return false;
     if (!options.force) {
       const problems = this.danglingConsumers(entry);
-      if (problems.length > 0) {
-        throw new Error(
-          `cannot unmount "${name}": ${problems.join("; ")}; unmount the dependents first or pass { force: true }`,
-        );
-      }
+      if (problems.length > 0) throw new UnmountError(name, problems);
     }
     await this.teardown(entry);
+    this.emit("plugin:unmounted", { instanceId: entry.instanceId, name });
     return true;
   }
 
@@ -177,10 +238,79 @@ export class Runtime {
     return this.active.map((entry) => entry.plugin.name);
   }
 
+  /**
+   * Subscribe to kernel lifecycle events. Listener errors are warned and
+   * swallowed — a broken observer can never break the kernel. The returned
+   * disposer unsubscribes.
+   */
+  on<K extends keyof KernelEventMap>(type: K, listener: (event: KernelEventMap[K]) => void): Disposer {
+    if (this.disposed) throw new DisposedError("runtime", "on()");
+    let set = this.listeners.get(type);
+    if (!set) this.listeners.set(type, (set = new Set()));
+    set.add(listener as (event: never) => void);
+    return () => {
+      set.delete(listener as (event: never) => void);
+    };
+  }
+
+  /**
+   * Full kernel snapshot for monitoring and debugging: plugin instances
+   * with status/timing, provided services with owners, and the consumer
+   * graph. Cheap to call; built from live in-memory state.
+   */
+  inspect(): RuntimeSnapshot {
+    const plugins: PluginInspectInfo[] = [];
+    for (const entry of this.queue) {
+      plugins.push({
+        instanceId: entry.instanceId,
+        name: entry.plugin.name,
+        status: this.activating.has(entry.instanceId) ? "activating" : "queued",
+        inject: entry.plugin.inject ?? [],
+        provides: entry.plugin.provides ?? [],
+      });
+    }
+    for (const entry of this.active) {
+      plugins.push({
+        instanceId: entry.instanceId,
+        name: entry.plugin.name,
+        status: "active",
+        inject: entry.plugin.inject ?? [],
+        provides: entry.plugin.provides ?? [],
+        effectCount: entry.effectIds.length,
+        activatedAt: entry.activatedAt,
+        activationMs: entry.activationMs,
+      });
+    }
+    const nameOf = this.instanceNames();
+    const consumers: Record<string, string[]> = {};
+    for (const [key, ids] of this.consumers) {
+      consumers[key] = [...ids].map((id) => nameOf.get(id) ?? `#${id}`);
+    }
+    return {
+      started: this.started,
+      disposed: this.disposed,
+      plugins,
+      services: this.ctx.serviceOwners(),
+      consumers,
+    };
+  }
+
+  /**
+   * Dry-run dependency resolution over what is pending: returns the
+   * activation order and any resolution errors without activating anything
+   * or consuming the pending list. Useful for CI validation of mount lists.
+   */
+  plan(): { ordered: string[]; errors: Error[] } {
+    const { ordered, errors } = this.resolveQueue([...this.pending]);
+    return { ordered: ordered.map((entry) => entry.plugin.name), errors };
+  }
+
   /** Tear down plugin disposers in reverse activation order, then the context. */
   async dispose(): Promise<void> {
     if (this.disposed) return;
     this.disposed = true;
+    // Cooperatively cancel in-flight plugin work before unwinding.
+    this.controller.abort();
     this.pending = [];
     this.queue = [];
     this.batches.clear();
@@ -193,11 +323,13 @@ export class Runtime {
       } catch (error) {
         this.ctx.logger.warn(
           `plugin "${entry.plugin.name}" failed during dispose: ${errorMessage(error)}`,
+          { plugin: entry.plugin.name, instanceId: entry.instanceId, error: errorMessage(error) },
         );
       }
     }
     this.active = [];
     await this.ctx.dispose();
+    this.emit("runtime:disposed", {});
   }
 
   // ---------------------------------------------------------------------
@@ -215,11 +347,10 @@ export class Runtime {
   }
 
   /**
-   * Activate queued plugins strictly one at a time (so the ambient owner
-   * scope and effect snapshots never interleave). Runs fully synchronously
-   * while every apply() is sync; the first async apply hands the remainder
-   * to the returned promise. Sync failures throw with their batch already
-   * scheduled for rollback.
+   * Activate queued plugins strictly one at a time (so effect snapshots
+   * never interleave). Runs fully synchronously while every apply() is sync;
+   * the first async apply hands the remainder to the returned promise. Sync
+   * failures throw with their batch already scheduled for rollback.
    */
   private drain(): void | Promise<void> {
     if (this.pumping) return; // nested use() during apply(): outer loop picks it up
@@ -240,7 +371,8 @@ export class Runtime {
         result = this.activateOne(entry);
       } catch (error) {
         // Roll back this batch, drop its queued remainder, fail loud.
-        this.track(this.failBatch(entry.batch));
+        this.emit("plugin:failed", { instanceId: entry.instanceId, name: entry.plugin.name, error });
+        this.track(this.failBatch(entry.batch, error));
         throw error;
       }
       if (result instanceof Promise) {
@@ -259,8 +391,14 @@ export class Runtime {
       this.commitActivated(entry, activeEntry);
     } catch (error) {
       failure = error;
-      this.ctx.logger.error(`plugin "${entry.plugin.name}" failed to activate: ${errorMessage(error)}`);
-      await this.failBatch(entry.batch);
+      this.emit("plugin:failed", { instanceId: entry.instanceId, name: entry.plugin.name, error });
+      this.ctx.logger.error(errorMessage(error), {
+        plugin: entry.plugin.name,
+        instanceId: entry.instanceId,
+        phase: "activation",
+        code: error instanceof Error ? (error as { code?: string }).code : undefined,
+      });
+      await this.failBatch(entry.batch, error);
     }
     try {
       await this.drainRest();
@@ -281,44 +419,62 @@ export class Runtime {
   }
 
   /**
-   * Validate config and run apply() for one plugin. Sync plugins complete
-   * synchronously; an async apply() returns a promise that commits the
-   * entry at settle time. On async failure every effect registered so far
-   * is released, so a half-started plugin cannot leak registrations.
+   * Validate config and run apply() for one plugin, inside an ownership
+   * scope that survives awaits. Sync plugins complete synchronously; an
+   * async apply() returns a promise that commits the entry at settle time.
+   * On async failure (or timeout) every effect registered so far is
+   * released, so a half-started plugin cannot leak registrations.
    */
   private activateOne(entry: QueuedPlugin): ActivePlugin | Promise<ActivePlugin> {
     const { plugin } = entry;
     const existing = new Set(this.ctx.effectIds());
+    const startedAt = Date.now();
+    this.activating.add(entry.instanceId);
+    this.emit("plugin:activating", { instanceId: entry.instanceId, name: plugin.name });
 
     const commit = (config: unknown, result: void | Disposer): ActivePlugin => {
+      this.activating.delete(entry.instanceId);
       const effectIds = this.ctx.effectIds().filter((id) => !existing.has(id));
       return {
         plugin,
         config,
+        instanceId: entry.instanceId,
         dispose: typeof result === "function" ? onceDisposer(result) : undefined,
         effectIds,
+        activatedAt: startedAt,
+        activationMs: Date.now() - startedAt,
       };
+    };
+
+    const releaseLeaked = async (): Promise<void> => {
+      this.activating.delete(entry.instanceId);
+      const leaked = this.ctx.effectIds().filter((id) => !existing.has(id));
+      await this.ctx.releaseEffects(leaked);
     };
 
     const finish = (config: unknown): ActivePlugin | Promise<ActivePlugin> => {
       let result: void | Disposer | Promise<void | Disposer>;
-      this.ctx.setOwnerScope(plugin.name);
       try {
-        result = plugin.apply(this.ctx, config as never);
-      } finally {
-        // Registrations after an await are unscoped: the ambient owner must
-        // never leak into unrelated runtime code while apply() is pending.
-        this.ctx.setOwnerScope(undefined);
+        result = withOwnerScope(plugin.name, () => plugin.apply(this.ctx, config as never));
+      } catch (error) {
+        // Sync failure: unwind partial effects (tracked for ready), fail loud.
+        this.activating.delete(entry.instanceId);
+        const leaked = this.ctx.effectIds().filter((id) => !existing.has(id));
+        if (leaked.length > 0) this.track(this.ctx.releaseEffects(leaked));
+        throw activationFailure(plugin.name, error);
       }
       if (result instanceof Promise) {
-        return result.then(
+        let outcome = result.then(
           (dispose) => commit(config, dispose),
           async (error) => {
-            const leaked = this.ctx.effectIds().filter((id) => !existing.has(id));
-            await this.ctx.releaseEffects(leaked);
-            throw error;
+            await releaseLeaked();
+            throw activationFailure(plugin.name, error);
           },
         );
+        if (this.activationTimeoutMs !== undefined) {
+          outcome = this.withActivationTimeout(outcome, entry, releaseLeaked);
+        }
+        return outcome;
       }
       return commit(config, result);
     };
@@ -328,7 +484,10 @@ export class Runtime {
     const checked = (result: StandardSchemaV1Result<unknown>): unknown => {
       if (result.issues) {
         const lines = result.issues.map((issue) => ` - ${formatIssue(issue)}`);
-        throw new Error(`plugin "${plugin.name}" has an invalid config:\n${lines.join("\n")}`);
+        throw new ConfigValidationError(
+          plugin.name,
+          `plugin "${plugin.name}" has an invalid config:\n${lines.join("\n")}`,
+        );
       }
       return result.value;
     };
@@ -339,13 +498,63 @@ export class Runtime {
     return finish(checked(validation));
   }
 
+  /**
+   * Bound an async activation: reject with code "activation/timeout" when
+   * apply() does not settle in time. The abandoned apply keeps a cleanup
+   * handler — whatever it registers after the timeout is still unwound once
+   * it finally settles (plugins should watch ctx.signal to settle promptly).
+   */
+  private withActivationTimeout(
+    outcome: Promise<ActivePlugin>,
+    entry: QueuedPlugin,
+    releaseLeaked: () => Promise<void>,
+  ): Promise<ActivePlugin> {
+    const ms = this.activationTimeoutMs!;
+    return new Promise<ActivePlugin>((resolve, reject) => {
+      let settled = false;
+      const timer = setTimeout(() => {
+        if (settled) return;
+        settled = true;
+        reject(
+          new ActivationError(
+            `plugin "${entry.plugin.name}" timed out while activating after ${ms}ms`,
+            entry.plugin.name,
+            "activation/timeout",
+            { timeoutMs: ms },
+          ),
+        );
+        void releaseLeaked();
+        // Late settle of the abandoned apply: unwind its leftovers quietly.
+        outcome.then(
+          () => this.track(releaseLeaked()),
+          () => this.track(releaseLeaked()),
+        );
+      }, ms);
+      outcome.then(
+        (value) => {
+          if (settled) return;
+          settled = true;
+          clearTimeout(timer);
+          resolve(value);
+        },
+        (error) => {
+          if (settled) return;
+          settled = true;
+          clearTimeout(timer);
+          reject(error);
+        },
+      );
+    });
+  }
+
   /** Record a successfully activated entry: active list, batch, consumers. */
   private commitActivated(entry: QueuedPlugin, activeEntry: ActivePlugin): void {
     this.active.push(activeEntry);
+    this.emit("plugin:activated", { instanceId: entry.instanceId, name: entry.plugin.name });
     for (const key of entry.plugin.inject ?? []) {
       let set = this.consumers.get(key);
       if (!set) this.consumers.set(key, (set = new Set()));
-      set.add(entry.plugin.name);
+      set.add(entry.instanceId);
     }
     const batch = this.batches.get(entry.batch);
     if (batch) {
@@ -359,18 +568,22 @@ export class Runtime {
    * Roll back a failed batch: teardown the activated members in reverse
    * order and drop whatever of the batch is still queued.
    */
-  private failBatch(batchId: number): Promise<void> {
+  private failBatch(batchId: number, error?: unknown): Promise<void> {
     const batch = this.batches.get(batchId);
     this.batches.delete(batchId);
     this.queue = this.queue.filter((queued) => queued.batch !== batchId);
     const activated = batch ? [...batch.activated].reverse() : [];
+    if (activated.length > 0) {
+      this.emit("batch:rolled-back", { plugins: activated.map((entry) => entry.plugin.name), error });
+    }
     return (async () => {
       for (const entry of activated) {
         try {
           await this.teardown(entry);
-        } catch (error) {
+        } catch (teardownError) {
           this.ctx.logger.warn(
-            `plugin "${entry.plugin.name}" failed during rollback: ${errorMessage(error)}`,
+            `plugin "${entry.plugin.name}" failed during rollback: ${errorMessage(teardownError)}`,
+            { plugin: entry.plugin.name, instanceId: entry.instanceId, error: errorMessage(teardownError) },
           );
         }
       }
@@ -395,24 +608,70 @@ export class Runtime {
     for (const key of entry.plugin.inject ?? []) {
       const set = this.consumers.get(key);
       if (set) {
-        set.delete(entry.plugin.name);
+        set.delete(entry.instanceId);
         if (set.size === 0) this.consumers.delete(key);
       }
     }
+    const fields: LogFields = { plugin: entry.plugin.name, instanceId: entry.instanceId };
     try {
-      if (entry.dispose) await entry.dispose();
+      if (entry.dispose) {
+        await this.settle(
+          Promise.resolve(entry.dispose()),
+          `plugin "${entry.plugin.name}" disposer timed out during teardown`,
+          fields,
+        );
+      }
     } finally {
-      await this.ctx.releaseEffects(entry.effectIds);
+      await this.settle(
+        this.ctx.releaseEffects(entry.effectIds),
+        `plugin "${entry.plugin.name}" effect release timed out during teardown`,
+        fields,
+      );
     }
+  }
+
+  /**
+   * Await cleanup, but (when teardownTimeoutMs is set) warn and move on
+   * instead of hanging forever: shutdown must always make progress. The
+   * abandoned cleanup keeps a stray-rejection guard.
+   */
+  private async settle(cleanup: Promise<void>, timeoutWarning: string, fields: LogFields): Promise<void> {
+    const ms = this.teardownTimeoutMs;
+    if (ms === undefined) return cleanup;
+    return new Promise<void>((resolve, reject) => {
+      let settled = false;
+      const timer = setTimeout(() => {
+        if (settled) return;
+        settled = true;
+        this.ctx.logger.warn(timeoutWarning, { ...fields, timeoutMs: ms });
+        cleanup.catch(() => {});
+        resolve();
+      }, ms);
+      cleanup.then(
+        () => {
+          if (settled) return;
+          settled = true;
+          clearTimeout(timer);
+          resolve();
+        },
+        (error) => {
+          if (settled) return;
+          settled = true;
+          clearTimeout(timer);
+          reject(error);
+        },
+      );
+    });
   }
 
   /** Active consumers (other than the plugin itself) of its provided keys. */
   private danglingConsumers(entry: ActivePlugin): string[] {
+    const nameOf = this.instanceNames();
     const problems: string[] = [];
     for (const key of entry.plugin.provides ?? []) {
-      const consumers = [...(this.consumers.get(key) ?? [])].filter(
-        (name) => name !== entry.plugin.name,
-      );
+      const consumers = [...(this.consumers.get(key) ?? [])]
+        .filter((id) => id !== entry.instanceId)
+        .map((id) => nameOf.get(id) ?? `#${id}`);
       if (consumers.length > 0) {
         problems.push(
           `service "${key}" is still injected by ${consumers.map((name) => `"${name}"`).join(", ")}`,
@@ -420,6 +679,37 @@ export class Runtime {
       }
     }
     return problems;
+  }
+
+  private instanceNames(): Map<number, string> {
+    return new Map(this.active.map((candidate) => [candidate.instanceId, candidate.plugin.name]));
+  }
+
+  // ---------------------------------------------------------------------
+  // Kernel events
+  // ---------------------------------------------------------------------
+
+  private emit<K extends keyof KernelEventMap>(type: K, event: KernelEventMap[K]): void {
+    const set = this.listeners.get(type);
+    if (!set) return;
+    for (const listener of [...set]) {
+      try {
+        (listener as (event: KernelEventMap[K]) => void)(event);
+      } catch (error) {
+        this.ctx.logger.warn(`kernel event listener for "${type}" failed: ${errorMessage(error)}`, {
+          event: type,
+          error: errorMessage(error),
+        });
+      }
+    }
+  }
+
+  private emitServiceChange(change: ServiceChange): void {
+    if (change.type === "provided") {
+      this.emit("service:provided", { key: change.key, owner: change.owner });
+    } else {
+      this.emit("service:removed", { key: change.key, owner: change.owner });
+    }
   }
 
   // ---------------------------------------------------------------------
@@ -433,19 +723,25 @@ export class Runtime {
    * plugins still activate.
    */
   private resolvePending(): { ordered: MountedPlugin[]; errors: Error[] } {
-    let queue = this.pending;
+    const queue = this.pending;
     this.pending = [];
+    return this.resolveQueue(queue);
+  }
+
+  /** Pure resolution over a queue snapshot (plan() relies on it not mutating). */
+  private resolveQueue(queue: MountedPlugin[]): { ordered: MountedPlugin[]; errors: Error[] } {
+    let remaining = queue;
     const ordered: MountedPlugin[] = [];
     const errors: Error[] = [];
-    while (queue.length > 0) {
+    while (remaining.length > 0) {
       try {
-        ordered.push(...this.resolveOrder(queue));
+        ordered.push(...this.resolveOrder(remaining));
         break;
       } catch (error) {
         if (!(error instanceof ResolutionError)) throw error;
         errors.push(error);
         const bad = new Set(error.entries);
-        queue = queue.filter((entry) => !bad.has(entry));
+        remaining = remaining.filter((entry) => !bad.has(entry));
       }
     }
     return { ordered, errors };
@@ -466,6 +762,7 @@ export class Runtime {
         const existing = provider.get(key);
         if (existing) {
           throw new ResolutionError(
+            "resolution/duplicate-provider",
             `service "${key}" is provided by both "${existing.plugin.name}" and "${entry.plugin.name}"`,
             [existing, entry],
           );
@@ -482,6 +779,7 @@ export class Runtime {
       if (status === "done") return;
       if (status === "visiting") {
         throw new ResolutionError(
+          "resolution/cycle",
           `plugin dependency cycle: ${[...chain, entry].map((link) => link.plugin.name).join(" -> ")}`,
           [...chain, entry],
         );
@@ -492,6 +790,7 @@ export class Runtime {
         const upstream = provider.get(key);
         if (!upstream) {
           throw new ResolutionError(
+            "resolution/missing-provider",
             `plugin "${entry.plugin.name}" requires service "${key}", but no mounted plugin provides it`,
             [entry],
           );
