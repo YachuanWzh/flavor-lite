@@ -45,7 +45,8 @@ FLAVOR_OPENAI_MODEL=deepseek-chat
 
 ```
 src/
-  kernel/      mini-Cordis: Context (services/effects only) + Runtime (topo-sort)
+  kernel/      mini-Cordis: Context (services/effects only) + Runtime (topo-sort,
+               typed errors, service ownership, atomic reload, event bus)
   shared/      provider-neutral Message model
   plugins/
     hooks/       the waterfall bus as a plugin: provides the `hooks` service
@@ -78,6 +79,44 @@ src/
 | System prompt is runtime-derived | every section is a plugin contribution (`prompt/assemble`); unmount the plugin, lose the section |
 | Model-visible ⇔ logged | session JSONL fully reconstructs any conversation |
 | Fail loud | missing providers, duplicate services, cycles, bad config throw at startup |
+| Services are owned | `ctx.provide()` claims a key for the activating plugin (owner travels via `AsyncLocalStorage`); cross-plugin overrides need `{ override: true }` |
+| Declared provides is a contract | a plugin with `provides` cannot register a service outside that list — `service/undeclared` at activation |
+| Reloads are atomic | `runtime.reload()` activates the replacement first, then it takes over the old registrations: consumers never see a gap |
+| Late services are waitable | `ctx.whenAvailable(key)` resolves now or as soon as a dynamic plugin mounts it |
+
+### Kernel hardening (0.1.2)
+
+Since 0.1.1 the kernel grew a stability and operability layer without changing
+its shape — still a tiny context plus a topo-sorting runtime, still zero
+runtime dispatch:
+
+- **Typed kernel errors** — every failure carries a stable `code` plus
+  structured `detail` (`KernelError` base): `resolution/*`, `activation/*`,
+  `service/ownership`, `service/undeclared`, `reload/*`,
+  `unmount/dangling-consumers`, `kernel/limit-exceeded`, `runtime/disposed`.
+  Hosts and monitoring branch on codes, never on message text.
+- **Service ownership** — who provides a key is tracked (owner propagates
+  through `AsyncLocalStorage`, so async `apply()` stays scoped). Silently
+  shadowing another plugin's service is a startup error unless you pass
+  `{ override: true }` on purpose.
+- **Declared `provides` contract** — a plugin listing `provides` may only
+  register those keys; anything else fails activation (`service/undeclared`).
+- **Atomic reload** — `runtime.reload(name, replacement)` activates the new
+  plugin first, then hands over the old registrations. Consumers never see a
+  service gap; if the replacement fails, the old instance is left untouched.
+- **Async activation, bounded** — `apply()` may be async; effects registered
+  after an `await` still belong to the plugin. `activationTimeoutMs` fails a
+  stalled activation (`activation/timeout`); `teardownTimeoutMs` warns and
+  moves on so shutdown never wedges.
+- **Kernel event bus** — `runtime.on()` subscribes to lifecycle events:
+  `plugin:activating|activated|failed|unmounted`, `batch:rolled-back`,
+  `service:provided|removed`, `runtime:disposed`.
+- **Resource caps** — optional `maxEffects` / `maxServices` /
+  `maxListenersPerEvent` make a runaway plugin fail loud at registration
+  instead of growing kernel state without bound.
+- **Introspection** — `runtime.inspect()` snapshots services/plugins/effects;
+  `runtime.plan()` previews the topological order; logs carry structured
+  fields (`plugin`, `serviceKey`, `code`, ...) for audit and metrics.
 
 ### Extension points
 
@@ -148,7 +187,8 @@ Configuration merges from (low → high): `~/.flavorlite/config.json`,
 ## Development
 
 ```bash
-npm test          # 55 tests: kernel, loop, permission, session, compaction, plugins loader
+npm test          # 271 tests: kernel (42), loop, permission, session, compaction,
+                  # plus disk plugins, router, memory, error-monitor, subagent, ...
 npm run typecheck # strict + noUncheckedIndexedAccess
 npm run build     # tsup → dist/ (index + cli)
 ```

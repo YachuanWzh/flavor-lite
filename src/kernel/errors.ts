@@ -7,6 +7,7 @@
 
 export type KernelErrorCode =
   | "runtime/disposed"
+  | "kernel/limit-exceeded"
   | "resolution/missing-provider"
   | "resolution/cycle"
   | "resolution/duplicate-provider"
@@ -43,6 +44,16 @@ export class DisposedError extends KernelError {
     super("runtime/disposed", `${subject} is disposed; cannot ${operation}`, {
       subject,
       operation,
+    });
+  }
+}
+
+/** A kernel resource cap (effects / services / listeners) was exceeded. */
+export class LimitExceededError extends KernelError {
+  constructor(subject: string, limit: number) {
+    super("kernel/limit-exceeded", `${subject} exceeded the configured limit of ${limit}`, {
+      subject,
+      limit,
     });
   }
 }

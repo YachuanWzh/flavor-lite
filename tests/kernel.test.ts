@@ -2,6 +2,8 @@ import { describe, expect, it } from "vitest";
 import { z } from "zod";
 import {
   ActivationError,
+  DisposedError,
+  LimitExceededError,
   OwnershipError,
   ReloadError,
   ResolutionError,
@@ -811,5 +813,100 @@ describe("kernel contract & atomic reload", () => {
     expect(caught).toBeInstanceOf(AggregateError);
     expect((caught as AggregateError).errors).toHaveLength(2);
     expect(disposedSeen).toBe(true); // guaranteed even when teardown failed
+  });
+});
+
+describe("kernel resource limits & late services", () => {
+  it("caps live effects at registration time", () => {
+    const runtime = Runtime.create({ maxEffects: 2 });
+    runtime.ctx.effect(() => undefined, "e1");
+    runtime.ctx.effect(() => undefined, "e2");
+    let caught: unknown;
+    try {
+      runtime.ctx.effect(() => undefined, "e3");
+    } catch (error) {
+      caught = error;
+    }
+    expect(caught).toBeInstanceOf(LimitExceededError);
+    expect((caught as LimitExceededError).code).toBe("kernel/limit-exceeded");
+    expect((caught as LimitExceededError).detail.limit).toBe(2);
+  });
+
+  it("fails activation when a plugin exceeds maxServices and rolls back cleanly", async () => {
+    const greedy = definePlugin({
+      name: "greedy",
+      provides: ["s1", "s2"],
+      apply(ctx) {
+        ctx.effect(() => ctx.provide("s1", 1), "s1.provide");
+        ctx.effect(() => ctx.provide("s2", 2), "s2.provide"); // beyond maxServices: 1
+      },
+    });
+    const runtime = Runtime.create({ maxServices: 1 });
+    let caught: unknown;
+    try {
+      runtime.use(greedy).start();
+    } catch (error) {
+      caught = error;
+    }
+    expect(caught).toBeInstanceOf(ActivationError);
+    expect(((caught as ActivationError).cause as LimitExceededError).code).toBe("kernel/limit-exceeded");
+    await tick();
+    expect(runtime.ctx.tryGet("s1")).toBeUndefined(); // batch rolled back
+    expect(runtime.activePlugins()).toEqual([]);
+  });
+
+  it("does not count service re-registration against maxServices", () => {
+    const runtime = Runtime.create({ maxServices: 1 });
+    const disposeFirst = runtime.ctx.provide("only", 1);
+    const disposeSecond = runtime.ctx.provide("only", 2); // shadowing never grows the map
+    expect(runtime.ctx.get("only")).toBe(2);
+    disposeSecond();
+    disposeFirst();
+  });
+
+  it("caps listeners per kernel event type and frees slots on unsubscribe", () => {
+    const runtime = Runtime.create({ maxListenersPerEvent: 1 });
+    const off = runtime.on("runtime:disposed", () => {});
+    expect(() => runtime.on("runtime:disposed", () => {})).toThrow(LimitExceededError);
+    off();
+    const offAgain = runtime.on("runtime:disposed", () => {}); // freed slot
+    offAgain();
+  });
+
+  it("whenAvailable resolves immediately when present, otherwise once the service appears", async () => {
+    const runtime = Runtime.create();
+    runtime.ctx.provide("early", 1);
+    await expect(runtime.ctx.whenAvailable("early")).resolves.toBe(1);
+
+    const late = runtime.ctx.whenAvailable("late-svc");
+    runtime.start();
+    runtime.use(
+      definePlugin({
+        name: "late",
+        provides: ["late-svc"],
+        apply(ctx) {
+          ctx.provide("late-svc", 2);
+        },
+      }),
+    );
+    await expect(late).resolves.toBe(2);
+  });
+
+  it("whenAvailable rejects when the runtime is disposed", async () => {
+    const runtime = Runtime.create();
+    runtime.start();
+    const pending = runtime.ctx.whenAvailable("never");
+    await runtime.dispose();
+    await expect(pending).rejects.toBeInstanceOf(DisposedError);
+    await expect(runtime.ctx.whenAvailable("never")).rejects.toBeInstanceOf(DisposedError);
+  });
+
+  it("whenAvailable rejects with the abort reason when the caller aborts", async () => {
+    const runtime = Runtime.create();
+    runtime.start();
+    const controller = new AbortController();
+    const pending = runtime.ctx.whenAvailable("never", controller.signal);
+    controller.abort(new Error("gave up"));
+    await expect(pending).rejects.toThrow("gave up");
   });
 });

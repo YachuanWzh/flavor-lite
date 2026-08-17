@@ -107,6 +107,7 @@ export default {
 | `ctx.provide(key, service, options?)` | Claim a service key; returns a disposer that restores the previous provider. Keys owned by another plugin are protected — pass `{ override: true }` to shadow deliberately |
 | `ctx.get(key)` | Resolve a service; throws when absent (fail loud) |
 | `ctx.tryGet(key)` | Resolve an optional service; `undefined` when absent |
+| `ctx.whenAvailable(key, signal?)` | Resolve now, or wait until the service appears (disk plugins mount after start, so services can show up late). Rejects on dispose/abort. For repeat reads of a service that may be ejected again, prefer `ctx.tryGet` |
 | `ctx.effect(setup, label)` | Track a reversible registration; teardown in reverse order |
 | `ctx.active` | False once the runtime starts disposing |
 

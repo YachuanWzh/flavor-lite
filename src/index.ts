@@ -12,6 +12,7 @@ export {
   ConfigValidationError,
   DisposedError,
   KernelError,
+  LimitExceededError,
   OwnershipError,
   ReloadError,
   ResolutionError,

@@ -17,6 +17,9 @@
  *   see a gap; a failed replacement leaves the old instance untouched
  * - a plugin declaring `provides` cannot register services outside that list
  *   (fail-loud contract, code "service/undeclared")
+ * - optional resource caps (maxEffects / maxServices / maxListenersPerEvent)
+ *   fail loud at registration (code "kernel/limit-exceeded"), so a runaway
+ *   plugin can never grow kernel state without bound
  * - apply() may be async; effects registered after an await stay scoped
  *   because the effect snapshot diff is taken at settle time, and service
  *   ownership stays enforced because the owner travels via AsyncLocalStorage
@@ -34,6 +37,7 @@ import {
   ActivationError,
   ConfigValidationError,
   DisposedError,
+  LimitExceededError,
   ReloadError,
   ResolutionError,
   UnmountError,
@@ -140,16 +144,20 @@ export class Runtime {
   private reloading = new Set<number>();
   private readonly activationTimeoutMs?: number;
   private readonly teardownTimeoutMs?: number;
+  private readonly maxListenersPerEvent?: number;
 
   private constructor(options: KernelOptions) {
     this.activationTimeoutMs = options.activationTimeoutMs;
     this.teardownTimeoutMs = options.teardownTimeoutMs;
+    this.maxListenersPerEvent = options.maxListenersPerEvent;
     this.ctx = new Context({
       cwd: options.cwd ?? process.cwd(),
       logger: options.logger ?? silentLogger,
       signal: this.controller.signal,
       captureEffectStacks: options.effectStackTraces,
       onServiceChange: (change) => this.emitServiceChange(change),
+      ...(options.maxEffects !== undefined ? { maxEffects: options.maxEffects } : {}),
+      ...(options.maxServices !== undefined ? { maxServices: options.maxServices } : {}),
     });
   }
 
@@ -345,6 +353,9 @@ export class Runtime {
     if (this.disposed) throw new DisposedError("runtime", "on()");
     let set = this.listeners.get(type);
     if (!set) this.listeners.set(type, (set = new Set()));
+    if (this.maxListenersPerEvent !== undefined && set.size >= this.maxListenersPerEvent) {
+      throw new LimitExceededError(`listeners for "${type}" (maxListenersPerEvent)`, this.maxListenersPerEvent);
+    }
     set.add(listener as (event: never) => void);
     return () => {
       set.delete(listener as (event: never) => void);

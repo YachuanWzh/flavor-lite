@@ -1,7 +1,7 @@
 # flavor-lite 项目探索报告
 
-> 探索日期：2026-08-17
-> 测试验证：`npm test` 实测 **19 个测试文件 / 238 个用例**（234 通过 / 4 失败，失败集中在两个磁盘插件集成测试，详见第八节）
+> 探索日期：2026-08-18
+> 测试验证：`npm test` 实测 **19 个测试文件 / 271 个用例，全部通过**（相比 8-17 版报告的 238 个用例、4 个失败：新增 33 个用例，且此前 4 个磁盘插件集成测试失败已修复）
 
 ---
 
@@ -38,6 +38,26 @@
 | 文档/模板 | `docs/plugin-dev.md` 插件开发规范、`/plugin new` 脚手架模板 |
 | 磁盘插件生态 | 10 个功能插件：memory、error-monitor、websearch、subagent、astgraph、flavor-ui、filediff、clear-context、command-hints、task-planner |
 
+### 8-17 → 8-18 内核强化（0.1.2）
+
+这一轮不新增功能插件，而是把**内核本身的稳定性与可运维性**补完整（三次提交 + 工作区未提交改动）：
+
+| 类别 | 内容 |
+|---|---|
+| 类型化错误 | `errors.ts`：所有内核失败带稳定错误码 + 结构化 `detail`（`resolution/*`、`activation/*`、`service/ownership`、`service/undeclared`、`reload/*`、`unmount/dangling-consumers`、`kernel/limit-exceeded`、`runtime/disposed`），宿主按码分支而非解析文案 |
+| 服务所有权 | `ctx.provide()` 的服务归激活它的插件所有（AsyncLocalStorage 传播）；跨插件覆盖须显式 `{ override: true }`，否则启动即报 `service/ownership` |
+| 声明契约 | 声明了 `provides` 的插件只能注册清单内的服务，越界即 `service/undeclared`（fail loud） |
+| 原子重载 | `runtime.reload()`：新实例先激活、接管旧注册，消费者看不到服务间隙；失败则旧实例原样保留；并发重载拒绝（`reload/in-progress`） |
+| 异步激活 | `apply()` 可 async，await 后注册的效果仍归属正确插件；`activationTimeoutMs` 超时失败（`activation/timeout`） |
+| 批量回滚 | 激活按 batch 组织，任一失败整个 batch 逆序回滚；惰性销毁器防并发双重释放 |
+| 卸载安全 | 卸载检查悬空消费者（`unmount/dangling-consumers`），须先卸载依赖者或 `{ force: true }` |
+| 内核事件总线 | `runtime.on()` 订阅 `plugin:activating/activated/failed/unmounted`、`batch:rolled-back`、`service:provided/removed`、`runtime:disposed` |
+| 资源上限 | `maxEffects` / `maxServices` / `maxListenersPerEvent` 硬上限，超限注册即抛 `kernel/limit-exceeded`（工作区新改动） |
+| 迟到服务 | `ctx.whenAvailable(key, signal?)`：现在解析或等服务出现（动态插件后挂载的场景），dispose/abort 时拒绝（工作区新改动） |
+| 可观测性 | `runtime.inspect()` 快照、`runtime.plan()` 预览拓扑顺序、结构化日志字段、效果堆栈捕获（`effectStackTraces`） |
+| 配置校验 | 插件 `config` 支持 Standard Schema v1（zod/valibot/arktype…），apply 前校验，失败抛 `activation/invalid-config` |
+| 文档 | `docs/evolve.md`：插件模式自进化路线图（缺口分析 + 分优先级计划） |
+
 ---
 
 ## 二、技术栈与工程配置
@@ -46,7 +66,7 @@
 |---|---|
 | 语言 | TypeScript（strict 模式 + `noUncheckedIndexedAccess`） |
 | 包管理器 | npm |
-| 版本 | 0.1.1 |
+| 版本 | 0.1.2 |
 | Node 要求 | >= 20（astgraph 插件额外要求 >= 22.5，用 `node:sqlite`） |
 | 运行时依赖 | 仅 `zod`（^4.4.3） |
 | 开发依赖 | `tsup`（打包）、`typescript@7`、`vitest`（测试） |
@@ -69,6 +89,7 @@ npm start         # node dist/cli.js 启动
 - `vitest.config.ts`：只收集 `tests/**/*.test.ts`，Node 环境，超时 20 秒
 - `.env.example`：模板，只需设置一个 API Key（OpenAI 系或 Anthropic 系）即可运行
 - `docs/plugin-dev.md`：**插件开发规范**，磁盘插件契约的唯一权威文档
+- `docs/evolve.md`：**【新】插件模式自进化路线图**（现状盘点 → 缺口分析 → 分优先级路线图 → 反模式清单）
 - `templates/plugin-template/`：`/plugin new` 用的脚手架模板（源码里也内嵌了一份，保证 dist 自包含）
 
 ---
@@ -81,9 +102,10 @@ flavor-lite/
 │   ├── index.ts                  # 公共 SDK 出口：把内核和所有插件统一导出
 │   ├── cli.ts                    # CLI 入口：解析参数 → createAgent → REPL 或一次性运行
 │   ├── kernel/                   # 微型内核（mini-Cordis）
-│   │   ├── types.ts              #   类型：Plugin、PluginContext、Logger、ServiceMap 等
-│   │   ├── context.ts            #   上下文：服务仓库 + 事件总线 + 可逆效果栈
-│   │   ├── runtime.ts            #   运行时：挂载插件、拓扑排序、逆序卸载
+│   │   ├── types.ts              #   类型：Plugin、PluginContext、KernelOptions、ServiceMap 等
+│   │   ├── context.ts            #   上下文：服务仓库 + 可逆效果栈 + 服务所有权 + whenAvailable
+│   │   ├── runtime.ts            #   运行时：挂载/拓扑排序/逆序卸载 + 原子重载 + 事件总线
+│   │   ├── errors.ts             #   【新】类型化内核错误：稳定错误码 + 结构化 detail
 │   │   └── index.ts              #   内核公共出口
 │   ├── shared/
 │   │   └── messages.ts           # 与厂商无关的消息模型 + 历史清洗
@@ -199,6 +221,77 @@ export const myPlugin = definePlugin({
 ### 5. 【新】提供商发现也插件化了
 
 `src/plugins/llm/providers.ts`：OpenAI / Anthropic 各自是独立插件（`openaiProviderPlugin` / `anthropicProviderPlugin`），有 API Key 就自我注册适配器，没有就静默跳过。组合根（bootstrap）**完全不碰适配器实现和环境变量**，只做一个通用检查：无论内置还是第三方，只要最终 `llm.providers().length === 0` 就启动即抛错。第三方提供商现在可以走和内置一模一样的路径。
+
+### 6. 【新】内核稳定性与可运维性机制（0.1.2）
+
+0.1.2 没有改变内核的形状（仍然是"上下文 + 拓扑排序运行时"），而是在四个方向上把内核补硬了：
+
+#### 6.1 类型化内核错误（`kernel/errors.ts`）
+
+所有内核失败都带**稳定错误码** + **结构化 `detail`**，宿主和监控按码分支，而不是解析错误文案。完整错误码表：
+
+| 错误码 | 含义 |
+|---|---|
+| `runtime/disposed` | 运行时/上下文已销毁（`DisposedError`） |
+| `kernel/limit-exceeded` | 超过资源上限（`LimitExceededError`） |
+| `resolution/missing-provider` / `cycle` / `duplicate-provider` | 依赖解析失败（`ResolutionError`，带涉及条目） |
+| `activation/failed` / `timeout` / `invalid-config` | 激活失败 / 超时 / 配置校验失败（`ActivationError` / `ConfigValidationError`） |
+| `service/ownership` | 跨插件覆盖服务未声明 `override`（`OwnershipError`） |
+| `service/undeclared` | 注册了 `provides` 清单之外的服务（`UndeclaredServiceError`） |
+| `reload/provider-mismatch` / `in-progress` | 重载被拒（`ReloadError`） |
+| `unmount/dangling-consumers` | 卸载会留下悬空消费者（`UnmountError`） |
+
+所有错误类都继承 `KernelError`（code + detail + cause 链保留原始错误）。
+
+#### 6.2 服务所有权与声明契约
+
+- **所有权**：`ctx.provide()` 注册的服务归"激活它的插件"所有——所有者身份通过 `AsyncLocalStorage` 传播，所以**异步 `apply()` 在 await 之后注册的效果/服务依然归属正确插件**。跨插件覆盖另一个插件的服务是启动错误，除非显式 `{ override: true }`（有意的遮蔽）。
+- **声明契约**：插件声明了 `provides: [...]` 就只能在清单内注册服务，越界即 `service/undeclared` 激活失败。`provides` 从"元数据"变成了**运行时强制的契约**。
+
+#### 6.3 原子重载（`runtime.reload(name, replacement)`）
+
+磁盘插件热重载一直是"卸载 → 重装"两步，中间消费者会短暂拿不到服务。0.1.2 把它变成原子的：
+
+```
+旧实例运行中 → 新实例先激活（pre-activate）→ 新实例接管旧实例的服务注册
+              → 旧实例 teardown → 成功则提交、失败则回滚（旧实例原样保留）
+```
+
+- 消费者**永远看不到服务间隙**（takeover 记录 + 提交/回滚机制）
+- 重载失败时旧实例完整保留，错误抛 `ReloadError`
+- 同一插件的并发重载被拒绝（`reload/in-progress`）
+
+#### 6.4 异步激活、批量回滚与超时控制
+
+- `apply()` 可以是 async 的；激活按 **batch** 组织，任一插件失败，整个 batch 逆序回滚，已注册的服务/效果全部撤掉，`activePlugins()` 回到干净状态
+- 惰性销毁器（`onceDisposer`）：销毁器只执行一次，防并发销毁导致的双重释放
+- `activationTimeoutMs`：异步激活超时即 `activation/timeout` 失败（同步 apply 无法超时，长同步任务应改异步并观察 `ctx.signal`）
+- `teardownTimeoutMs`：teardown 挂起时警告并继续，**关机永不卡死**
+
+#### 6.5 内核事件总线（`runtime.on()`）
+
+`runtime.on(type, listener)` 订阅内核生命周期事件（返回退订函数）：
+
+- `plugin:activating` / `plugin:activated` / `plugin:failed` / `plugin:unmounted`（带 `instanceId` + `name`）
+- `batch:rolled-back`（带涉及插件列表与错误）
+- `service:provided` / `service:removed`（带 key + owner）
+- `runtime:disposed`（保证在 dispose 完成后发出，即使部分 teardown 失败）
+
+#### 6.6 资源上限与迟到服务（工作区最新改动）
+
+- **资源上限**：`KernelOptions` 新增 `maxEffects` / `maxServices` / `maxListenersPerEvent` 三个硬上限。注册时即校验，超限抛 `LimitExceededError`（`kernel/limit-exceeded`）——失控插件**不可能无界增长内核状态**。`maxServices` 只对"新 key"计数，遮蔽已有 key 不涨。
+- **迟到服务**：`ctx.whenAvailable(key, signal?)` —— 服务现在存在就立即解析，否则挂起等待（磁盘 dynamic 插件在 `start()` 之后挂载，服务可能"迟到"）。context 销毁时以 `DisposedError` 拒绝，调用方 abort 时以 abort reason 拒绝。适合一次性等待；需要反复读可能被弹出/重新挂载的服务仍建议 `tryGet()`。
+
+#### 6.7 可观测性
+
+- `runtime.inspect()` → `RuntimeSnapshot`：服务清单（含 owner）、激活插件、效果、注册表状态
+- `runtime.plan()`：预览拓扑排序结果（有序列表 + 解析错误），不动任何状态
+- 结构化日志：`Logger` 接口带 `LogFields`（plugin / serviceKey / code ...），机器消费者不用解析文本
+- `effectStackTraces`：为效果捕获注册时的调用栈（诊断用）
+
+#### 6.8 Standard Schema v1 配置校验
+
+插件 `config` 字段支持 **Standard Schema v1**（zod、valibot、arktype 等共通的厂商中立接口，内核保持零依赖只是结构性地引用）。apply() 之前先校验，失败抛 `activation/invalid-config`，校验通过（可含 transform）后的值传给 `apply(ctx, config)`。
 
 ---
 
@@ -471,11 +564,11 @@ hooks → llm → providers(openai/anthropic) → tools → guidance(4个) → �
 
 ## 九、测试情况
 
-`npm test` 实测 **19 个测试文件、238 个用例**（约 9.4s）：
+`npm test` 实测 **19 个测试文件、271 个用例，全部通过**（约 7.4s）：
 
 | 文件 | 覆盖内容 |
 |---|---|
-| `kernel.test.ts` | 依赖排序、缺失服务报错、重复提供报错、成环报错、provide 回滚、效果逆序卸载、瀑布短路 |
+| `kernel.test.ts`（42 个用例） | 依赖排序、缺失/重复/成环报错、provide 回滚、效果逆序卸载、瀑布短路；**【新】配置校验、异步激活、服务所有权、声明契约、原子重载、批量回滚、卸载悬空消费者、事件总线、资源上限、whenAvailable** |
 | `loop.test.ts` | 完整一轮工具循环、steering 注入、迭代上限、中止占位、模型引用解析 |
 | `permission.test.ts` | plan 模式拦截、危险命令硬拦截、bypass 放行、fail closed、一次性批准记忆、路径穿越拒绝 |
 | `session.test.ts` | JSONL 持久化、列表排序、损坏行隔离、latest、非法 id 拒绝 |
@@ -495,9 +588,9 @@ hooks → llm → providers(openai/anthropic) → tools → guidance(4个) → �
 | `flavor-ui.test.ts` | 【新】时间线渲染、spinner 动画、样式切换、banner、非 TTY 退化 |
 | `clear-context-plugin.test.ts` | 【新】/clear 加载、会话文件重写、请求时裁剪、短历史不裁 |
 
-> 当前有 4 个用例失败（`completions.test.ts` 3 个 + `websearch-plugin.test.ts` 1 个，均与磁盘插件集成测试相关），其余 234 个全部通过。本次仅更新报告，未对失败用例做修复。
+> 相比 8-17 版报告（238 个用例、4 个失败）：新增 33 个用例（主要是内核 0.1.2 机制：所有权/契约/重载/回滚/事件/上限/等待），且此前 `completions.test.ts` 3 个 + `websearch-plugin.test.ts` 1 个集成测试失败已全部修复。
 
-测试风格很有特点：**用一个脚本化假模型适配器**（`scriptedAdapter`）回放预写的事件序列，捕获每个请求，从而无网络地测整个 agent 循环；磁盘插件测试则把插件目录复制进临时工作区，用真加载器装载。
+测试风格很有特点：**用一个脚本化假模型适配器**（`scriptedAdapter`）回放预写的事件序列，捕获每个请求，从而无网络地测整个 agent 循环；磁盘插件测试则把插件目录复制进临时工作区，用真加载器装载；内核测试直接驱动 `Runtime.create()`，验证激活/回滚/重载/销毁的真实时序。
 
 ---
 
@@ -553,6 +646,8 @@ FLAVOR_OPENAI_MODEL=deepseek-chat
 
 ## 十二、总结
 
-flavor-lite 的价值不在于功能多，而在于**架构的纯粹性**：一个 150 行的内核 + 一堆各管一摊的小插件，通过"服务注册、瀑布钩子、可逆效果、拓扑排序"四个机制组合成完整智能体。系统提示词是拼出来的、权限是挂出来的、压缩是钩上去的、连主循环本身都是插件。想要什么能力，挂一个插件；不想要，卸掉即可。这种设计让代码小而清晰，也让扩展变得极其便宜。
+flavor-lite 的价值不在于功能多，而在于**架构的纯粹性**：一个千余行的内核（5 个文件：context / runtime / types / errors / index，仍只有服务注册、瀑布钩子、可逆效果、拓扑排序这几个概念）+ 一堆各管一摊的小插件，组合成完整智能体。系统提示词是拼出来的、权限是挂出来的、压缩是钩上去的、连主循环本身都是插件。想要什么能力，挂一个插件；不想要，卸掉即可。这种设计让代码小而清晰，也让扩展变得极其便宜。
 
 8-15 到 8-17 这一轮演进把"万物皆插件"推到了最后一步：**内核本身更薄了**（瀑布总线、提供商发现都插件化），**扩展成本降到了"放一个目录"**（磁盘插件 + 热重载 + 脚手架 + 开发规范文档），**复杂功能全搬到了插件层**（记忆、错误监控、网络搜索、子代理、代码图谱、UI、diff、规划……），甚至还有了**按需加载**（dynamic 插件 + 路由召回 + 空闲弹出），让"插件多"不再等于"内存多、提示词大"。如果你愿意，这个内核已经可以当作一个通用 agent 平台来用了。
+
+8-17 到 8-18（0.1.2）这一轮则反过来**加固内核本身**：类型化错误让失败可编程化（稳定错误码 + 结构化详情）、服务所有权和 `provides` 声明契约让插件之间的服务边界不再靠默契、原子重载让热更新从"两步有缝隙"变成"一步无感知"、批量激活 + 超时 + 惰性销毁让插件生命周期在任何异常下都能干净回滚、事件总线 + inspect/plan + 结构化日志让内核状态可观察、资源上限和 `whenAvailable` 补齐了"失控插件"与"迟到服务"两个边界。内核的形状没变——还是上下文 + 拓扑排序——但"薄"不再是"弱"：**架构的纯粹性和工程的严谨性在同一层上完成了合流**。

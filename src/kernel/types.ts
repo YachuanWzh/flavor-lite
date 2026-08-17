@@ -127,6 +127,21 @@ export interface KernelOptions {
   teardownTimeoutMs?: number;
   /** Capture registration stacks for effects (diagnostics only). */
   effectStackTraces?: boolean;
+  /**
+   * Hard cap on live effects; registering beyond it fails loud
+   * (code "kernel/limit-exceeded"). Unset = unlimited.
+   */
+  maxEffects?: number;
+  /**
+   * Hard cap on live service keys; providing a NEW key beyond it fails
+   * loud. Re-registering an existing key never counts. Unset = unlimited.
+   */
+  maxServices?: number;
+  /**
+   * Hard cap on listeners per kernel event type; runtime.on() beyond it
+   * fails loud. Kernel-internal subscriptions count too. Unset = unlimited.
+   */
+  maxListenersPerEvent?: number;
 }
 
 /**
@@ -159,6 +174,16 @@ export interface PluginContext {
   /** Resolve an optional service without failing. */
   tryGet<K extends keyof ServiceMap>(key: K): ServiceMap[K] | undefined;
   tryGet(key: string): unknown;
+
+  /**
+   * Resolve a service now, or wait until it appears (dynamic mounts after
+   * start() can make services show up later). Rejects with DisposedError
+   * when the context is disposed, or with the abort reason when the
+   * optional signal aborts first. For repeat reads of a service that may
+   * vanish again (ejected plugins), prefer tryGet().
+   */
+  whenAvailable<K extends keyof ServiceMap>(key: K, signal?: AbortSignal): Promise<ServiceMap[K]>;
+  whenAvailable(key: string, signal?: AbortSignal): Promise<unknown>;
 
   /**
    * Track a reversible registration owned by the current plugin scope.

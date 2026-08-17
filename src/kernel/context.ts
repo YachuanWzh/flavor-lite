@@ -6,7 +6,7 @@
 
 import { AsyncLocalStorage } from "node:async_hooks";
 
-import { DisposedError, OwnershipError, UndeclaredServiceError } from "./errors";
+import { DisposedError, LimitExceededError, OwnershipError, UndeclaredServiceError } from "./errors";
 import type { Disposer, Logger, PluginContext, ProvideOptions } from "./types";
 
 /**
@@ -70,6 +70,16 @@ export interface ContextOptions {
   captureEffectStacks?: boolean;
   /** Invoked whenever a service registration appears or unwinds. */
   onServiceChange?: (change: ServiceChange) => void;
+  /** Hard cap on live effects (unset = unlimited). */
+  maxEffects?: number;
+  /** Hard cap on live service keys (unset = unlimited). */
+  maxServices?: number;
+}
+
+/** A pending whenAvailable() waiter, woken when its key becomes present. */
+interface ServiceWaiter {
+  resolve: (value: unknown) => void;
+  reject: (error: unknown) => void;
 }
 
 /**
@@ -107,11 +117,15 @@ export class Context implements PluginContext {
   private nextRegistration = 0;
   /** Pending takeovers (atomic reload); reverted on failure, dropped on commit. */
   private takeovers: TakeoverRecord[] = [];
+  /** Service waiters per key; woken on any registration that makes it present. */
+  private waiters = new Map<string, Set<ServiceWaiter>>();
   private effects: EffectRecord[] = [];
   private nextEffectId = 0;
   private disposed = false;
   private readonly captureEffectStacks: boolean;
   private readonly onServiceChange?: (change: ServiceChange) => void;
+  private readonly maxEffects?: number;
+  private readonly maxServices?: number;
 
   constructor(options: ContextOptions) {
     this.cwd = options.cwd;
@@ -119,6 +133,8 @@ export class Context implements PluginContext {
     this.signal = options.signal ?? new AbortController().signal;
     this.captureEffectStacks = options.captureEffectStacks ?? false;
     this.onServiceChange = options.onServiceChange;
+    this.maxEffects = options.maxEffects;
+    this.maxServices = options.maxServices;
   }
 
   get active(): boolean {
@@ -127,6 +143,10 @@ export class Context implements PluginContext {
 
   provide(key: string, service: unknown, options?: ProvideOptions): Disposer {
     this.assertActive("provide");
+    // Resource cap: only NEW keys count; shadowing never grows the map.
+    if (this.maxServices !== undefined && !this.services.has(key) && this.services.size >= this.maxServices) {
+      throw new LimitExceededError(`service key "${key}" (maxServices)`, this.maxServices);
+    }
     const scope = ownerStorage.getStore();
     const newOwner = scope?.owner;
     const currentOwner = this.owners.get(key);
@@ -209,8 +229,45 @@ export class Context implements PluginContext {
     return [...this.services.keys()].map((key) => ({ key, owner: this.owners.get(key) }));
   }
 
+  /** Resolve now, or wait until the service appears. See PluginContext. */
+  whenAvailable(key: string, signal?: AbortSignal): Promise<unknown> {
+    if (this.disposed) return Promise.reject(new DisposedError("context", "whenAvailable()"));
+    if (signal?.aborted) return Promise.reject(signal.reason ?? new Error(`waiting for "${key}" aborted`));
+    if (this.services.has(key)) return Promise.resolve(this.services.get(key));
+    return new Promise<unknown>((resolve, reject) => {
+      let set = this.waiters.get(key);
+      if (!set) this.waiters.set(key, (set = new Set()));
+      const detach = () => {
+        set!.delete(waiter);
+        if (set!.size === 0) this.waiters.delete(key);
+        signal?.removeEventListener("abort", onAbort);
+      };
+      const waiter: ServiceWaiter = {
+        resolve: (value) => {
+          detach();
+          resolve(value);
+        },
+        reject: (error) => {
+          detach();
+          reject(error);
+        },
+      };
+      const onAbort = () => waiter.reject(signal!.reason ?? new Error(`waiting for "${key}" aborted`));
+      signal?.addEventListener("abort", onAbort, { once: true });
+      set.add(waiter);
+    });
+  }
+
+  /**
+   * Track a reversible registration owned by the current plugin scope.
+   * The setup runs immediately; its disposer (or returned function) is
+   * invoked on teardown in reverse registration order.
+   */
   effect<S>(setup: () => S, label?: string): S {
     this.assertActive("effect");
+    if (this.maxEffects !== undefined && this.effects.length >= this.maxEffects) {
+      throw new LimitExceededError(`effect "${label ?? setup.name ?? "effect"}" (maxEffects)`, this.maxEffects);
+    }
     const result = setup();
     const dispose = typeof result === "function" ? onceDisposer(result as unknown as Disposer) : undefined;
     this.effects.push({
@@ -307,12 +364,18 @@ export class Context implements PluginContext {
     this.owners.clear();
     this.registrations.clear();
     this.takeovers = [];
+    const stranded: ServiceWaiter[] = [];
+    for (const set of this.waiters.values()) stranded.push(...set);
+    this.waiters.clear();
+    for (const waiter of stranded) waiter.reject(new DisposedError("context", "whenAvailable()"));
     if (errors.length > 0) {
       throw new AggregateError(errors, "one or more effects failed to dispose");
     }
   }
 
   private notifyServiceChange(change: ServiceChange): void {
+    // A key becoming present (fresh, restored, or reverted) wakes waiters.
+    if (change.type === "provided") this.wakeWaiters(change.key);
     if (!this.onServiceChange) return;
     try {
       this.onServiceChange(change);
@@ -323,6 +386,14 @@ export class Context implements PluginContext {
         error: errorMessage(error),
       });
     }
+  }
+
+  /** Resolve every waiter on `key` with the current value. */
+  private wakeWaiters(key: string): void {
+    const set = this.waiters.get(key);
+    if (!set || set.size === 0) return;
+    const value = this.services.get(key);
+    for (const waiter of [...set]) waiter.resolve(value);
   }
 
   private assertActive(operation: string): void {
