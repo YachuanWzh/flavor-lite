@@ -86,7 +86,9 @@ export default {
   The kernel fails loud when one is missing. **These are service keys, not
   plugin names** — the loop plugin provides `"agent"`, not `"loop"`.
 - `provides` (string[], optional) — service keys this plugin claims. Two
-  plugins providing the same key fail loud at mount time.
+  plugins providing the same key fail loud at mount time. The list is a
+  **contract**: calling `ctx.provide()` with a key outside it fails loud
+  (`service/undeclared`). Omit the field for implicit (unchecked) providing.
 - `config` (Standard Schema v1, optional) — e.g. a zod schema. The kernel
   validates the manifest `config` against it before `apply` and passes the
   validated (possibly transformed) value. Failures report the issue path.
@@ -190,6 +192,10 @@ short-circuit.
   unmounted, the new failure shows up in `/plugin list` as `error`.
 - Don't reload while a turn is mid-flight (a tool call of the old version may
   still be running); prefer idle moments.
+- SDK hosts replacing a service provider that still has consumers should use
+  `runtime.reload(name, plugin, config)`: the replacement activates first and
+  takes over the old instance's registrations atomically — consumers never
+  see a gap, and a failed replacement leaves the old instance untouched.
 
 ## Common errors
 
@@ -198,6 +204,7 @@ short-circuit.
 | `requires service "X", but no mounted plugin provides it` | `inject` names a service key that doesn't exist — check the table above (it's `agent`, not `loop`) |
 | `service "X" is provided by both ...` | Two plugins claim the same `provides` key |
 | `service "X" is owned by plugin "Y"` | Your plugin provides a key another plugin already owns — use a different key, or `{ override: true }` if shadowing is intentional |
+| `plugin "X" provides service "Y", which is not in its declared provides` | `ctx.provide()` used a key outside the plugin's `provides` list — declare the key, or omit `provides` for implicit mode |
 | `cannot unmount "X": service "Y" is still injected by ...` | The kernel refuses to leave dangling consumers — unmount the dependents first (or reload the whole group) |
 | `plugin "X" has an invalid config` | Manifest `config` failed the plugin's Standard Schema — the message lists each issue with its path |
 | `plugin name "X" is already active` | Two entry modules export the same plugin `name` |

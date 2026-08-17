@@ -6,7 +6,7 @@
 
 import { AsyncLocalStorage } from "node:async_hooks";
 
-import { DisposedError, OwnershipError } from "./errors";
+import { DisposedError, OwnershipError, UndeclaredServiceError } from "./errors";
 import type { Disposer, Logger, PluginContext, ProvideOptions } from "./types";
 
 /**
@@ -15,11 +15,22 @@ import type { Disposer, Logger, PluginContext, ProvideOptions } from "./types";
  * carries the owner through the whole async body, so registrations made
  * after an await are attributed exactly like sync ones.
  */
-const ownerStorage = new AsyncLocalStorage<string | undefined>();
+export interface OwnerScopeExtras {
+  /** Declared service keys: provide() outside this list fails loud. */
+  declared?: readonly string[];
+  /** Atomic reload: replace registrations currently owned by this plugin name. */
+  replaceOwner?: string;
+}
+
+interface OwnerScope extends OwnerScopeExtras {
+  owner: string;
+}
+
+const ownerStorage = new AsyncLocalStorage<OwnerScope | undefined>();
 
 /** Run fn with an ambient owner scope; async continuations inherit it. */
-export function withOwnerScope<T>(owner: string | undefined, fn: () => T): T {
-  return ownerStorage.run(owner, fn);
+export function withOwnerScope<T>(owner: string | undefined, fn: () => T, extras?: OwnerScopeExtras): T {
+  return ownerStorage.run(owner ? { owner, ...extras } : undefined, fn);
 }
 
 /** Service registration change, surfaced by the runtime as kernel events. */
@@ -41,6 +52,13 @@ export interface EffectDiagnostic {
   id: number;
   label: string;
   stack?: string;
+}
+
+/** One taken-over registration, revertible until the reload commits. */
+interface TakeoverRecord {
+  replaceOwner: string;
+  key: string;
+  previous: { value: unknown; owner: string | undefined; registration: number };
 }
 
 export interface ContextOptions {
@@ -84,6 +102,11 @@ export class Context implements PluginContext {
   private services = new Map<string, unknown>();
   /** Owning plugin per key; undefined when claimed outside an apply(). */
   private owners = new Map<string, string | undefined>();
+  /** Current registration token per key; superseded disposers unwind nothing. */
+  private registrations = new Map<string, number>();
+  private nextRegistration = 0;
+  /** Pending takeovers (atomic reload); reverted on failure, dropped on commit. */
+  private takeovers: TakeoverRecord[] = [];
   private effects: EffectRecord[] = [];
   private nextEffectId = 0;
   private disposed = false;
@@ -104,27 +127,60 @@ export class Context implements PluginContext {
 
   provide(key: string, service: unknown, options?: ProvideOptions): Disposer {
     this.assertActive("provide");
+    const scope = ownerStorage.getStore();
+    const newOwner = scope?.owner;
     const currentOwner = this.owners.get(key);
-    const newOwner = ownerStorage.getStore();
-    if (currentOwner && newOwner && currentOwner !== newOwner && !options?.override) {
+    // Contract: a plugin declaring `provides` may not register outside it.
+    if (scope?.declared && !scope.declared.includes(key)) {
+      throw new UndeclaredServiceError(key, newOwner ?? "?", scope.declared);
+    }
+    // Takeover (atomic reload): replace a registration owned by the plugin
+    // being replaced — no ownership error, no restore-on-unwind. The
+    // displaced registration is bookkept so a failed reload can revert it.
+    const takeover = scope?.replaceOwner !== undefined && currentOwner === scope.replaceOwner;
+    if (!takeover && currentOwner && newOwner && currentOwner !== newOwner && !options?.override) {
       throw new OwnershipError(key, currentOwner, newOwner);
     }
-    const previous = this.services.has(key)
-      ? { value: this.services.get(key), owner: this.owners.get(key) }
-      : undefined;
+    const previous =
+      this.services.has(key) && !takeover
+        ? {
+            value: this.services.get(key),
+            owner: this.owners.get(key),
+            registration: this.registrations.get(key) ?? -1,
+          }
+        : undefined;
+    if (takeover) {
+      this.takeovers.push({
+        replaceOwner: scope!.replaceOwner!,
+        key,
+        previous: {
+          value: this.services.get(key),
+          owner: this.owners.get(key),
+          registration: this.registrations.get(key) ?? -1,
+        },
+      });
+    }
+    const registration = this.nextRegistration++;
     this.services.set(key, service);
     this.owners.set(key, newOwner);
+    this.registrations.set(key, registration);
     this.notifyServiceChange({ type: "provided", key, owner: newOwner });
     return onceDisposer(() => {
-      // Restore the previous provider when this registration unwinds, so a
-      // scoped override never leaves a dangling key behind.
+      // Superseded by a newer registration (e.g. an atomic reload took the
+      // key over): the current registration owns the unwinding now, so
+      // unwinding here would clobber it.
+      if (this.registrations.get(key) !== registration) return;
       if (previous === undefined) {
         this.services.delete(key);
         this.owners.delete(key);
+        this.registrations.delete(key);
         this.notifyServiceChange({ type: "removed", key, owner: newOwner });
       } else {
+        // Restore the previous provider when this registration unwinds, so a
+        // scoped override never leaves a dangling key behind.
         this.services.set(key, previous.value);
         this.owners.set(key, previous.owner);
+        this.registrations.set(key, previous.registration);
         this.notifyServiceChange({ type: "provided", key, owner: previous.owner });
       }
     });
@@ -204,6 +260,31 @@ export class Context implements PluginContext {
     }
   }
 
+  /**
+   * Restore every registration taken over from `replaceOwner` (reverse
+   * order). Runtime.reload calls this when the replacement failed, so the
+   * old instance's services survive a botched swap. Runtime-internal.
+   */
+  revertTakeovers(replaceOwner: string): void {
+    const pending = this.takeovers.filter((record) => record.replaceOwner === replaceOwner);
+    this.takeovers = this.takeovers.filter((record) => record.replaceOwner !== replaceOwner);
+    for (const record of pending.reverse()) {
+      this.services.set(record.key, record.previous.value);
+      this.owners.set(record.key, record.previous.owner);
+      this.registrations.set(record.key, record.previous.registration);
+      this.notifyServiceChange({ type: "provided", key: record.key, owner: record.previous.owner });
+    }
+  }
+
+  /**
+   * Drop the pending takeovers for `replaceOwner`: the replacement is now
+   * responsible for those keys. Runtime.reload calls this once the
+   * replacement has activated. Runtime-internal.
+   */
+  commitTakeovers(replaceOwner: string): void {
+    this.takeovers = this.takeovers.filter((record) => record.replaceOwner !== replaceOwner);
+  }
+
   /** Unwind every effect in reverse registration order. Idempotent. */
   async dispose(): Promise<void> {
     if (this.disposed) return;
@@ -224,6 +305,8 @@ export class Context implements PluginContext {
     this.effects = [];
     this.services.clear();
     this.owners.clear();
+    this.registrations.clear();
+    this.takeovers = [];
     if (errors.length > 0) {
       throw new AggregateError(errors, "one or more effects failed to dispose");
     }

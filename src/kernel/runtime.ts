@@ -12,6 +12,11 @@
  *   their dependents), so a broken mount never poisons later use() calls
  * - unmount refuses to leave dangling consumers (reverse dependency graph
  *   built per instance from declared inject/provides)
+ * - reload() swaps a plugin atomically: the replacement activates first and
+ *   takes over the old instance's service registrations, so consumers never
+ *   see a gap; a failed replacement leaves the old instance untouched
+ * - a plugin declaring `provides` cannot register services outside that list
+ *   (fail-loud contract, code "service/undeclared")
  * - apply() may be async; effects registered after an await stay scoped
  *   because the effect snapshot diff is taken at settle time, and service
  *   ownership stays enforced because the owner travels via AsyncLocalStorage
@@ -29,6 +34,7 @@ import {
   ActivationError,
   ConfigValidationError,
   DisposedError,
+  ReloadError,
   ResolutionError,
   UnmountError,
   activationFailure,
@@ -49,6 +55,8 @@ interface MountedPlugin {
   config: unknown;
   /** Per-mount identity: same-named plugins stay distinguishable. */
   instanceId: number;
+  /** Atomic reload: replace registrations owned by this plugin name. */
+  takeover?: string;
 }
 
 interface QueuedPlugin extends MountedPlugin {
@@ -128,6 +136,8 @@ export class Runtime {
   private listeners = new Map<string, Set<(event: never) => void>>();
   /** Instance ids whose apply() is currently running. */
   private activating = new Set<number>();
+  /** Instance ids with a reload() in flight (one replacement at a time). */
+  private reloading = new Set<number>();
   private readonly activationTimeoutMs?: number;
   private readonly teardownTimeoutMs?: number;
 
@@ -233,6 +243,94 @@ export class Runtime {
     return true;
   }
 
+  /**
+   * Atomically replace the first active plugin named `name` with a new
+   * implementation: the replacement activates first and its provide() calls
+   * take over the old instance's registrations; only then is the old
+   * instance torn down, so consumers of its services never see a gap. When
+   * the replacement fails to activate, the old instance stays mounted.
+   * Returns false when no active plugin carries that name (use `use()`).
+   *
+   * The replacement must declare every service key the old instance
+   * declared: keys it did not re-provide would vanish when the old instance
+   * is torn down, leaving consumers dangling.
+   */
+  async reload<C>(name: string, plugin: Plugin<C>, config?: C): Promise<boolean> {
+    if (this.disposed) throw new DisposedError("runtime", "reload()");
+    const oldEntry = this.active.find((candidate) => candidate.plugin.name === name);
+    if (!oldEntry) return false;
+    if (this.reloading.has(oldEntry.instanceId)) {
+      throw new ReloadError("reload/in-progress", `reload of "${name}" is already in progress`, { plugin: name });
+    }
+    const missing = (oldEntry.plugin.provides ?? []).filter((key) => !(plugin.provides ?? []).includes(key));
+    if (missing.length > 0) {
+      throw new ReloadError(
+        "reload/provider-mismatch",
+        `cannot reload "${name}": replacement "${plugin.name}" does not provide ${missing.map((key) => `"${key}"`).join(", ")}`,
+        { plugin: name, replacement: plugin.name, missing },
+      );
+    }
+
+    const entry: MountedPlugin = {
+      plugin: plugin as unknown as Plugin<never>,
+      config,
+      instanceId: this.nextInstanceId++,
+      takeover: name,
+    };
+    // Same fail-loud dependency check use() applies after start().
+    const { errors } = this.resolveQueue([entry]);
+    if (errors.length > 0) throw errors[0];
+
+    this.reloading.add(oldEntry.instanceId);
+    let failure: { error: unknown } | undefined;
+    const offFailed = this.on("plugin:failed", (event) => {
+      if (event.instanceId === entry.instanceId) failure = { error: event.error };
+    });
+    try {
+      try {
+        // Sync activation failures throw here (batch already rolled back);
+        // async ones surface via `ready` and the plugin:failed capture.
+        this.enqueue([entry]);
+        await this.ready.catch(() => {});
+      } catch (error) {
+        // Sync failure: let the tracked partial-effect release settle, then
+        // hand the taken-over services back to the old instance.
+        await this.ready.catch(() => {});
+        this.ctx.revertTakeovers(name);
+        throw error;
+      } finally {
+        offFailed();
+      }
+      if (this.disposed) throw new DisposedError("runtime", "reload()");
+      if (failure) {
+        // The replacement's registrations are already unwound; put the old
+        // instance's taken-over services back so it stays fully functional.
+        this.ctx.revertTakeovers(name);
+        throw failure.error;
+      }
+      const newEntry = this.active.find((candidate) => candidate.instanceId === entry.instanceId);
+      if (!newEntry) {
+        this.ctx.revertTakeovers(name);
+        throw new ActivationError(`reload of "${name}" failed to activate its replacement`, plugin.name);
+      }
+      // Success: the replacement now owns the taken-over registrations; the
+      // old instance's disposers skip whatever they no longer own.
+      this.ctx.commitTakeovers(name);
+      if (this.active.includes(oldEntry)) {
+        await this.teardown(oldEntry);
+        this.emit("plugin:unmounted", { instanceId: oldEntry.instanceId, name });
+      }
+      this.ctx.logger.debug(`reloaded "${name}" with "${plugin.name}"`, {
+        plugin: plugin.name,
+        instanceId: entry.instanceId,
+        replaced: oldEntry.instanceId,
+      });
+      return true;
+    } finally {
+      this.reloading.delete(oldEntry.instanceId);
+    }
+  }
+
   /** Names of currently active plugins, in activation order. */
   activePlugins(): string[] {
     return this.active.map((entry) => entry.plugin.name);
@@ -317,10 +415,12 @@ export class Runtime {
     // Let in-flight activations settle first so their effects are released
     // by the teardown below instead of leaking past dispose.
     await this.activationTail.catch(() => {});
+    const errors: unknown[] = [];
     for (const entry of [...this.active].reverse()) {
       try {
         await this.teardown(entry);
       } catch (error) {
+        errors.push(error);
         this.ctx.logger.warn(
           `plugin "${entry.plugin.name}" failed during dispose: ${errorMessage(error)}`,
           { plugin: entry.plugin.name, instanceId: entry.instanceId, error: errorMessage(error) },
@@ -328,8 +428,21 @@ export class Runtime {
       }
     }
     this.active = [];
-    await this.ctx.dispose();
+    try {
+      await this.ctx.dispose();
+    } catch (error) {
+      errors.push(error);
+      this.ctx.logger.warn(`context effects failed during dispose: ${errorMessage(error)}`, {
+        phase: "dispose",
+        error: errorMessage(error),
+      });
+    }
+    // Guaranteed: observers can rely on disposal having run even when some
+    // teardown steps failed (failures are aggregated and rethrown below).
     this.emit("runtime:disposed", {});
+    if (errors.length > 0) {
+      throw new AggregateError(errors, "one or more teardown steps failed during dispose");
+    }
   }
 
   // ---------------------------------------------------------------------
@@ -455,7 +568,10 @@ export class Runtime {
     const finish = (config: unknown): ActivePlugin | Promise<ActivePlugin> => {
       let result: void | Disposer | Promise<void | Disposer>;
       try {
-        result = withOwnerScope(plugin.name, () => plugin.apply(this.ctx, config as never));
+        result = withOwnerScope(plugin.name, () => plugin.apply(this.ctx, config as never), {
+          ...(plugin.provides ? { declared: plugin.provides } : {}),
+          ...(entry.takeover ? { replaceOwner: entry.takeover } : {}),
+        });
       } catch (error) {
         // Sync failure: unwind partial effects (tracked for ready), fail loud.
         this.activating.delete(entry.instanceId);

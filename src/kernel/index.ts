@@ -14,10 +14,12 @@ export {
   DisposedError,
   KernelError,
   OwnershipError,
+  ReloadError,
   ResolutionError,
+  UndeclaredServiceError,
   UnmountError,
 } from "./errors";
-export type { KernelErrorCode, ResolutionErrorCode } from "./errors";
+export type { KernelErrorCode, ReloadErrorCode, ResolutionErrorCode } from "./errors";
 export {
   definePlugin,
   silentLogger,

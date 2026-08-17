@@ -13,10 +13,12 @@ export {
   DisposedError,
   KernelError,
   OwnershipError,
+  ReloadError,
   ResolutionError,
+  UndeclaredServiceError,
   UnmountError,
 } from "./kernel/errors";
-export type { KernelErrorCode, ResolutionErrorCode } from "./kernel/errors";
+export type { KernelErrorCode, ReloadErrorCode, ResolutionErrorCode } from "./kernel/errors";
 export type {
   KernelEventMap,
   PluginInspectInfo,

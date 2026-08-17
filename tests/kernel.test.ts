@@ -3,8 +3,10 @@ import { z } from "zod";
 import {
   ActivationError,
   OwnershipError,
+  ReloadError,
   ResolutionError,
   Runtime,
+  UndeclaredServiceError,
   definePlugin,
   type LogFields,
   type Logger,
@@ -630,5 +632,184 @@ describe("kernel runtime", () => {
     expect(ownership).toBeInstanceOf(ActivationError);
     expect((ownership as ActivationError).code).toBe("activation/failed");
     expect(((ownership as ActivationError).cause as OwnershipError).code).toBe("service/ownership");
+  });
+});
+
+describe("kernel contract & atomic reload", () => {
+  it("fails loud when a plugin provides a service outside its declared provides", () => {
+    const greedy = definePlugin({
+      name: "greedy",
+      provides: ["declared-svc"],
+      apply(ctx) {
+        ctx.provide("undeclared-svc", 1);
+      },
+    });
+    let caught: unknown;
+    try {
+      Runtime.create().use(greedy).start();
+    } catch (error) {
+      caught = error;
+    }
+    expect(caught).toBeInstanceOf(ActivationError);
+    expect((caught as ActivationError).code).toBe("activation/failed");
+    const cause = (caught as ActivationError).cause as UndeclaredServiceError;
+    expect(cause).toBeInstanceOf(UndeclaredServiceError);
+    expect(cause.code).toBe("service/undeclared");
+    expect(cause.detail.serviceKey).toBe("undeclared-svc");
+  });
+
+  it("leaves implicit plugins (no provides declaration) unchecked", () => {
+    const implicit = definePlugin({
+      name: "implicit",
+      apply(ctx) {
+        ctx.provide("implicit-svc", 1);
+      },
+    });
+    const runtime = Runtime.create().use(implicit);
+    runtime.start();
+    expect(runtime.ctx.get("implicit-svc")).toBe(1);
+  });
+
+  it("reload swaps a provider atomically: consumers never see a gap", async () => {
+    const makeProvider = (value: string) =>
+      definePlugin({
+        name: "svc",
+        provides: ["svc"],
+        apply(ctx) {
+          return ctx.effect(() => ctx.provide("svc", value), "svc.provide");
+        },
+      });
+    const consumer = definePlugin({ name: "consumer", inject: ["svc"], apply() {} });
+    const runtime = Runtime.create();
+    runtime.use(makeProvider("v1")).use(consumer).start();
+    expect(runtime.ctx.get("svc")).toBe("v1");
+
+    // unmount is refused while a consumer injects the service; reload is
+    // the safe swap.
+    await expect(runtime.unmount("svc")).rejects.toThrow(/still injected by "consumer"/);
+
+    expect(await runtime.reload("svc", makeProvider("v2"))).toBe(true);
+    expect(runtime.ctx.get("svc")).toBe("v2");
+    expect(runtime.activePlugins()).toEqual(["consumer", "svc"]);
+
+    // The replacement owns the key now: unmounting it removes the service
+    // instead of resurrecting the replaced instance's value.
+    await runtime.unmount("consumer");
+    expect(await runtime.unmount("svc")).toBe(true);
+    expect(runtime.ctx.tryGet("svc")).toBeUndefined();
+    expect(await runtime.reload("svc", makeProvider("v3"))).toBe(false);
+  });
+
+  it("reload restores the old instance's services when the replacement fails", async () => {
+    const makeProvider = (value: string, fail = false) =>
+      definePlugin({
+        name: "svc",
+        provides: ["svc"],
+        async apply(ctx) {
+          // Take the service over first, then fail: the botched swap must
+          // still leave the old instance fully functional.
+          ctx.effect(() => ctx.provide("svc", value), "svc.provide");
+          await Promise.resolve();
+          if (fail) throw new Error("replacement boom");
+        },
+      });
+    const runtime = Runtime.create();
+    runtime.use(makeProvider("v1")).start();
+    await runtime.ready;
+
+    await expect(runtime.reload("svc", makeProvider("v2", true))).rejects.toThrow(/replacement boom/);
+    expect(runtime.ctx.get("svc")).toBe("v1"); // reverted, not dangling
+    expect(runtime.activePlugins()).toEqual(["svc"]);
+
+    expect(await runtime.reload("svc", makeProvider("v2"))).toBe(true);
+    expect(runtime.ctx.get("svc")).toBe("v2");
+  });
+
+  it("reload refuses a replacement that drops declared services", async () => {
+    const provider = definePlugin({
+      name: "svc",
+      provides: ["svc"],
+      apply(ctx) {
+        ctx.provide("svc", "v1");
+      },
+    });
+    const narrower = definePlugin({ name: "svc", provides: [], apply() {} });
+    const runtime = Runtime.create();
+    runtime.use(provider).start();
+    let caught: unknown;
+    try {
+      await runtime.reload("svc", narrower);
+    } catch (error) {
+      caught = error;
+    }
+    expect(caught).toBeInstanceOf(ReloadError);
+    expect((caught as ReloadError).code).toBe("reload/provider-mismatch");
+    expect(runtime.ctx.get("svc")).toBe("v1");
+  });
+
+  it("reload never takes over services owned by other plugins", async () => {
+    const runtime = Runtime.create();
+    runtime
+      .use(
+        definePlugin({
+          name: "a",
+          provides: ["a-svc"],
+          apply(ctx) {
+            ctx.provide("a-svc", "A1");
+          },
+        }),
+      )
+      .use(
+        definePlugin({
+          name: "c",
+          provides: ["c-svc"],
+          apply(ctx) {
+            ctx.provide("c-svc", "C1");
+          },
+        }),
+      )
+      .start();
+    const greedy = definePlugin({
+      name: "a",
+      provides: ["a-svc", "c-svc"],
+      apply(ctx) {
+        ctx.provide("a-svc", "A2"); // takeover: allowed
+        ctx.provide("c-svc", "C2"); // owned by "c": must fail loud
+      },
+    });
+    await expect(runtime.reload("a", greedy)).rejects.toThrow(/owned by plugin "c"/);
+    expect(runtime.ctx.get("a-svc")).toBe("A1"); // taken-over key reverted
+    expect(runtime.ctx.get("c-svc")).toBe("C1");
+  });
+
+  it("dispose aggregates teardown errors and still emits runtime:disposed", async () => {
+    const logger = spyLogger();
+    const runtime = Runtime.create({ logger });
+    let disposedSeen = false;
+    runtime.on("runtime:disposed", () => {
+      disposedSeen = true;
+    });
+    const flaky = definePlugin({
+      name: "flaky-dispose",
+      apply() {
+        return () => {
+          throw new Error("disposer boom");
+        };
+      },
+    });
+    runtime.use(flaky).start();
+    // A scoped effect whose disposer fails surfaces at context-level teardown.
+    runtime.ctx.effect(() => () => {
+      throw new Error("effect boom");
+    });
+    let caught: unknown;
+    try {
+      await runtime.dispose();
+    } catch (error) {
+      caught = error;
+    }
+    expect(caught).toBeInstanceOf(AggregateError);
+    expect((caught as AggregateError).errors).toHaveLength(2);
+    expect(disposedSeen).toBe(true); // guaranteed even when teardown failed
   });
 });

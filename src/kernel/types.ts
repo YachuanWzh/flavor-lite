@@ -90,7 +90,11 @@ export interface Plugin<C = unknown> {
   name: string;
   /** Service keys that must exist before this plugin activates. */
   inject?: string[];
-  /** Service keys this plugin claims via ctx.provide(). Explicit > implicit. */
+  /**
+   * Service keys this plugin claims via ctx.provide(). Enforced while the
+   * plugin activates: providing a key outside this list fails loud
+   * (code "service/undeclared"). Omit for implicit (unchecked) providing.
+   */
   provides?: string[];
   /** Optional Standard Schema v1 validated before apply(); the validated (possibly transformed) value is passed to apply(). */
   config?: StandardSchemaV1<unknown, C>;

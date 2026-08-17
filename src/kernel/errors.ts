@@ -14,6 +14,9 @@ export type KernelErrorCode =
   | "activation/timeout"
   | "activation/invalid-config"
   | "service/ownership"
+  | "service/undeclared"
+  | "reload/provider-mismatch"
+  | "reload/in-progress"
   | "unmount/dangling-consumers";
 
 export class KernelError extends Error {
@@ -107,6 +110,26 @@ export class OwnershipError extends KernelError {
       `service "${serviceKey}" is owned by plugin "${currentOwner}"; plugin "${newOwner}" cannot provide it (pass { override: true } to shadow deliberately)`,
       { serviceKey, currentOwner, newOwner },
     );
+  }
+}
+
+/** A plugin provided a service key outside its declared `provides` list. */
+export class UndeclaredServiceError extends KernelError {
+  constructor(serviceKey: string, plugin: string, declared: readonly string[]) {
+    super(
+      "service/undeclared",
+      `plugin "${plugin}" provides service "${serviceKey}", which is not in its declared provides [${declared.join(", ")}]`,
+      { serviceKey, plugin, declared: [...declared] },
+    );
+  }
+}
+
+export type ReloadErrorCode = "reload/provider-mismatch" | "reload/in-progress";
+
+/** Reload refused: the replacement is incompatible or one is already running. */
+export class ReloadError extends KernelError {
+  constructor(code: ReloadErrorCode, message: string, detail: Record<string, unknown> = {}) {
+    super(code, message, detail);
   }
 }
 
