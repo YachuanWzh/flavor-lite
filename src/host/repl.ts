@@ -21,6 +21,18 @@ export interface ReplOptions {
   resume?: string;
 }
 
+/**
+ * A previous TUI in the same terminal may leave mouse tracking enabled
+ * (it was never ours: the host never requests it). The terminal then
+ * reports wheel/pointer events as SGR sequences (`ESC[<cb;col;rowM`) that
+ * readline cannot parse and inserts as literal text into the input line.
+ * Reset every known mouse mode before attaching readline.
+ */
+export function resetMouseTracking(): void {
+  if (process.stdin.isTTY !== true || process.stdout.isTTY !== true) return;
+  process.stdout.write("\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?1015l");
+}
+
 export async function runRepl(handle: AgentHandle, options: ReplOptions = {}): Promise<void> {
   const ctx = handle.runtime.ctx;
   const commands = ctx.get("commands") as CommandsService;
@@ -42,6 +54,8 @@ export async function runRepl(handle: AgentHandle, options: ReplOptions = {}): P
   let busy = false;
   let aborter: AbortController | undefined;
   let closing = false;
+
+  resetMouseTracking();
 
   // The readline interface is created before disk plugins load: the host
   // owns the terminal, and plugins attach /-completion providers through
