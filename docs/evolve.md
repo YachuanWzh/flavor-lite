@@ -28,11 +28,11 @@ flavor-lite 的独特资产是第三层的**热加载部署能力**——磁盘�
 |---|---|---|
 | 部署 | ✅ 成熟 | pluginsLoader：磁盘发现、热重载、watch 同步、error 隔离、依赖拓扑、eager/dynamic 激活 |
 | 评估/选择 | 🟡 部分 | router：指纹反馈 boost/penalty + 空闲 eject —— 只调**路由分数**，不触碰插件本体 |
-| 信号感知 | 🟡 零散 | error-monitor 记录错误、memory 插件会话后提取持久事实、router-memory.json |
+| 信号感知 | ✅ 已增强 | `loop/after-run` 载荷扩展为 `{ iterations, reason, toolCalls, toolErrors, steers, inputTokens, outputTokens }`；error-monitor / memory / router-memory.json 继续积累 |
 | 生成知识 | 🟡 半自动 | `.flavorlite/skills/create-flavor-plugin/` 技能已教会模型写插件；`/plugin new` 脚手架 |
-| 反思 | 🟡 薄弱 | `loop/after-run` 载荷仅 `{ iterations, reason }`，反思插件拿不到足够素材 |
-| 验证 | ❌ 缺失 | 模型写出的插件落盘即激活，没有免疫系统 |
-| 版本/回滚 | ❌ 缺失 | reload 直接覆盖，坏了只能人工修 |
+| 反思 | ✅ 已落地 | evolve 插件消费扩展后的 after-run 载荷，reflections 记录真实统计与 signalDelta |
+| 验证 | ✅ 已落地 | `loader.verify()` 影子 Runtime 沙箱冒烟（`/plugin verify`、`/evolve verify`）；`/evolve test` 跑套件 |
+| 版本/回滚 | ✅ 已落地 | 每次成功激活快照至 `.versions/<name>/`（留 5 份），`/plugin revert`、`/evolve revert` 恢复最后良好版本 |
 
 **结论**：部署层是这套架构最强的资产；自进化最大的短板在
 "生成之后、激活之前"的中间地带，以及反馈信号的质量。
@@ -137,19 +137,21 @@ manifest 声明 `capabilities`（shell / 网络 / 写宿主文件等），permis
 - **不要让自进化绕过 fail-loud**：验证失败的插件宁可进 error 状态暴露，
   也不要静默降级激活。
 
-## 5. 最小起步：三件事先跑通循环
+## 5. 最小起步：三件事先跑通循环（✅ 均已落地）
 
 1. **evolve 元插件**（loader 能力工具化）—— 打通模型的手；
-2. **loader.verify() 沙箱冒烟** —— 建立免疫系统；
-3. **`loop/after-run` 载荷扩展 + `session/end` hook** —— 给反思供料。
+2. **loader.verify() 沙箱冒烟** —— 建立免疫系统（影子 Runtime + 依赖 stub，激活前干跑）；
+3. **`loop/after-run` 载荷扩展** —— 给反思供料（reflections 记录 toolCalls/toolErrors/steers/tokens 与真实 signalDelta）。
+
+加固项也已跟进：每次成功激活自动快照，`/plugin revert` / `/evolve revert` 一键回滚。
 
 三者合起来即最小可运行的自进化循环：
 
 ```
-会话结束 → 反思发现重复模式 → 生成插件 → 沙箱验证 → 热激活 → router 反馈决定去留
+会话结束 → 反思发现重复模式 → 生成插件 → 沙箱验证 → 热激活 → 测试验证 → router 反馈决定去留
 ```
 
-其余（回滚、晋升阶梯、能力分级）均为循环跑通后的加固项。
+其余（晋升阶梯、triggers 回写、能力分级、session/end hook）均为循环跑通后的加固项。
 
 ## 附：相关现有资产索引
 

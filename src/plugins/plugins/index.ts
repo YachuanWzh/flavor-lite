@@ -16,18 +16,22 @@
  */
 
 import { existsSync, watch, type FSWatcher } from "node:fs";
-import { mkdir, readdir, readFile, writeFile } from "node:fs/promises";
-import { homedir } from "node:os";
+import { cp, mkdir, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
+import { homedir, tmpdir } from "node:os";
 import { isAbsolute, join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { z } from "zod";
 import { definePlugin, errorMessage } from "../../kernel";
 import type { Plugin, PluginContext } from "../../kernel/types";
-import type { Runtime } from "../../kernel/runtime";
+import { Runtime } from "../../kernel/runtime";
 import type { CommandsService } from "../commands";
 import { PLUGIN_TEMPLATE_FILES } from "./template";
 
 const MANIFEST_FILE = "flavor-plugin.json";
+/** Last-known-good copies kept per plugin for revert(). */
+const MAX_SNAPSHOTS = 5;
+/** Sandbox activation must settle fast or the plugin is suspect. */
+const VERIFY_TIMEOUT_MS = 5000;
 
 const triggersSchema = z.object({
   /** Case-insensitive substrings that recall the plugin (router L0). */
@@ -66,6 +70,19 @@ const manifestSchema = z.object({
 export type PluginManifest = z.infer<typeof manifestSchema>;
 
 export type PluginLoadStatus = "loaded" | "error" | "unloaded";
+
+/** Outcome of a sandbox dry-run (loader.verify). */
+export interface VerifyReport {
+  ok: boolean;
+  name: string;
+  /** Service keys the plugins registered via ctx.provide(). */
+  provided: string[];
+  /** Tool names registered against the stub registry. */
+  tools: string[];
+  /** Command names registered against the stub command service. */
+  commands: string[];
+  error?: string;
+}
 
 export interface PluginStatus {
   name: string;
@@ -112,6 +129,17 @@ export interface PluginsLoaderService {
   eject(name: string): Promise<void>;
   /** Scaffold a new plugin dir from the template. Returns the dir. */
   scaffold(name: string): Promise<string>;
+  /**
+   * Sandbox smoke test: import the entry and dry-run it on a shadow runtime
+   * with stubbed dependencies, without touching the live host. Reports what
+   * the plugin would register.
+   */
+  verify(name: string): Promise<VerifyReport>;
+  /**
+   * Restore the latest last-known-good snapshot over the plugin dir and
+   * reload. Snapshots are taken on every successful activation.
+   */
+  revert(name: string): Promise<string>;
 }
 
 interface DiscoveredPlugin {
@@ -186,6 +214,9 @@ class PluginsLoader implements PluginsLoaderService {
           // Reload is an operator action: record the failure in the catalog
           // instead of throwing, and leave the old version unmounted.
           this.failImport(target, errorMessage(error));
+          if ((await this.snapshotList(name)).length > 0) {
+            this.ctx.logger.warn(`hint: /plugin revert ${name} restores the last good version`);
+          }
         }
         return [name];
       }
@@ -217,17 +248,22 @@ class PluginsLoader implements PluginsLoaderService {
   async ensure(name: string): Promise<void> {
     const record = this.records.get(name);
     if (record?.status.status === "loaded") return;
-    let target = this.discoveredCache.find((entry) => entry.manifest.name === name);
-    if (!target) {
-      // No scan yet (or a new dir appeared): rescan once before giving up.
-      const { discovered } = await this.scan();
-      this.discoveredCache = discovered;
-      target = discovered.find((entry) => entry.manifest.name === name);
-    }
+    const target = await this.discover(name);
     if (!target) {
       throw new Error(`plugin "${name}" not found (searched: ${this.roots.map((entry) => entry.root).join(", ")})`);
     }
     await this.loadOne(target);
+  }
+
+  /** Locate a discovered plugin by manifest name, rescanning if needed. */
+  private async discover(name: string): Promise<DiscoveredPlugin | undefined> {
+    let target = this.discoveredCache.find((entry) => entry.manifest.name === name);
+    if (!target) {
+      const { discovered } = await this.scan();
+      this.discoveredCache = discovered;
+      target = discovered.find((entry) => entry.manifest.name === name);
+    }
+    return target;
   }
 
   async eject(name: string): Promise<void> {
@@ -249,6 +285,85 @@ class PluginsLoader implements PluginsLoaderService {
     // The root may not have existed when init() started watching.
     this.startWatch();
     return dir;
+  }
+
+  /**
+   * Sandbox smoke test: import the entry, then dry-run mount it on a shadow
+   * runtime with an isolated cwd and stubbed dependencies. Nothing touches
+   * the live host — no real tools execute, no files in the project change.
+   */
+  async verify(name: string): Promise<VerifyReport> {
+    const report: VerifyReport = { ok: false, name, provided: [], tools: [], commands: [] };
+    const target = await this.discover(name);
+    if (!target) {
+      report.error = `plugin "${name}" not found (searched: ${this.roots.map((entry) => entry.root).join(", ")})`;
+      return report;
+    }
+
+    let plugins: Plugin<unknown>[];
+    try {
+      plugins = await this.importEntry(target);
+    } catch (error) {
+      report.error = errorMessage(error);
+      return report;
+    }
+
+    const shadowCwd = await mkdtemp(join(tmpdir(), "flavor-verify-"));
+    const shadow = Runtime.create({ cwd: shadowCwd });
+    const sink = { tools: report.tools, commands: report.commands };
+    const providedByEntry = new Set(plugins.flatMap((plugin) => plugin.provides ?? []));
+    for (const key of new Set(plugins.flatMap((plugin) => plugin.inject ?? []))) {
+      if (providedByEntry.has(key)) continue;
+      shadow.use(stubPlugin(key, sink));
+    }
+    for (const plugin of plugins) shadow.use(plugin, target.manifest.config as never);
+
+    try {
+      shadow.start();
+      await withTimeout(shadow.ready, VERIFY_TIMEOUT_MS);
+      const pluginNames = new Set(plugins.map((plugin) => plugin.name));
+      report.provided = shadow.ctx
+        .serviceOwners()
+        .filter((info) => info.owner !== undefined && pluginNames.has(info.owner))
+        .map((info) => info.key);
+      report.ok = true;
+    } catch (error) {
+      report.error = errorMessage(error);
+    } finally {
+      try {
+        await shadow.dispose();
+      } catch (error) {
+        // A broken disposer would break hot reload too: fail the dry run.
+        if (report.ok) {
+          report.ok = false;
+          report.error = `disposer failed during teardown: ${errorMessage(error)}`;
+        }
+      }
+      await rm(shadowCwd, { recursive: true, force: true });
+    }
+    return report;
+  }
+
+  async revert(name: string): Promise<string> {
+    const stamps = await this.snapshotList(name);
+    if (stamps.length === 0) {
+      throw new Error(`no snapshot for plugin "${name}" (snapshots are taken on every successful load)`);
+    }
+    const latest = stamps[stamps.length - 1]!;
+    const source = join(this.versionsRoot(), name, latest);
+    const dir = (await this.discover(name))?.dir ?? this.records.get(name)?.status.dir;
+    if (!dir) throw new Error(`plugin "${name}" not found`);
+
+    await rm(dir, { recursive: true, force: true });
+    await cp(source, dir, { recursive: true });
+    await this.reload(name);
+    const record = this.records.get(name);
+    if (record?.status.status !== "loaded") {
+      throw new Error(
+        `restored snapshot ${latest} but "${name}" still fails to load: ${record?.status.error ?? record?.status.status ?? "unknown"}`,
+      );
+    }
+    return `reverted "${name}" to snapshot ${latest}`;
   }
 
   /** Close all watchers and cancel any pending sync. Called on unmount. */
@@ -458,6 +573,39 @@ class PluginsLoader implements PluginsLoaderService {
       status: this.baseStatus(target, "loaded", plugins),
       pluginNames: mounted,
     });
+    // Keep a last-known-good copy so revert() can undo a bad edit.
+    try {
+      await this.snapshot(target);
+    } catch (error) {
+      this.ctx.logger.warn(`plugin "${target.manifest.name}" snapshot failed: ${errorMessage(error)}`);
+    }
+  }
+
+  private versionsRoot(): string {
+    return join(this.ctx.cwd, ".flavorlite", "plugins", ".versions");
+  }
+
+  /** Copy the plugin dir into .versions/<name>/<iso-stamp>, newest last. */
+  private async snapshot(target: DiscoveredPlugin): Promise<void> {
+    if (!existsSync(target.dir)) return;
+    const base = join(this.versionsRoot(), target.manifest.name);
+    let stamp = new Date().toISOString().replace(/[:.]/g, "-");
+    // Rapid successive loads must never clobber each other's snapshots.
+    while (existsSync(join(base, stamp))) stamp = `${stamp}_`;
+    await cp(target.dir, join(base, stamp), { recursive: true });
+    const stamps = await this.snapshotList(target.manifest.name);
+    // ISO stamps sort lexicographically; drop anything beyond the cap.
+    while (stamps.length > MAX_SNAPSHOTS) {
+      await rm(join(base, stamps.shift()!), { recursive: true, force: true });
+    }
+  }
+
+  private async snapshotList(name: string): Promise<string[]> {
+    try {
+      return (await readdir(join(this.versionsRoot(), name))).sort();
+    } catch {
+      return [];
+    }
   }
 
   /** Topological order over entries: inject keys pull providers forward. */
@@ -655,6 +803,100 @@ class PluginsLoader implements PluginsLoaderService {
   }
 }
 
+/** One shadow service standing in for a missing dependency during verify(). */
+function stubPlugin(key: string, sink: { tools: string[]; commands: string[] }): Plugin<never> {
+  return {
+    name: `verify-stub:${key}`,
+    provides: [key],
+    apply(ctx: PluginContext) {
+      return ctx.effect(() => ctx.provide(key, buildStub(key, sink)), `verify-stub:${key}.provide`);
+    },
+  };
+}
+
+/** Functional stand-ins so a dry run registers things but touches nothing. */
+function buildStub(key: string, sink: { tools: string[]; commands: string[] }): unknown {
+  switch (key) {
+    case "hooks":
+      return {
+        hook: () => () => {},
+        waterfall: async <T>(_name: string, value: T): Promise<T> => value,
+      };
+    case "tools":
+      return {
+        register: (tool: { name: string }) => {
+          sink.tools.push(tool.name);
+          return () => {};
+        },
+        list: () => [],
+        schemas: () => [],
+        get: () => undefined,
+        execute: async () => ({ content: "verify sandbox: execution is disabled", isError: false }),
+      };
+    case "commands":
+      return {
+        register: (command: { name: string }) => {
+          sink.commands.push(command.name);
+          return () => {};
+        },
+        execute: async () => "verify sandbox: commands are disabled",
+      };
+    case "pluginsLoader":
+      return {
+        init: async () => {},
+        reload: async () => [] as string[],
+        list: () => [],
+        catalog: () => [],
+        ensure: async () => {},
+        eject: async () => {},
+        scaffold: async (): Promise<string> => {
+          throw new Error("verify sandbox: disk writes are disabled");
+        },
+        verify: async () => ({ ok: false, name: "", provided: [], tools: [], commands: [], error: "nested verify" }),
+        revert: async (): Promise<string> => {
+          throw new Error("verify sandbox: disk writes are disabled");
+        },
+      };
+    default:
+      return permissiveStub();
+  }
+}
+
+/** Absorbs arbitrary property reads and calls so unknown deps dry-run inert. */
+function permissiveStub(): unknown {
+  const target = function noop(): void {};
+  return new Proxy(target, {
+    get(_target, prop) {
+      // Never look thenable to await, never break console/log formatting.
+      if (prop === "then" || typeof prop === "symbol") return undefined;
+      return permissiveStub();
+    },
+    apply() {
+      return undefined;
+    },
+  });
+}
+
+function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
+  return new Promise<T>((resolvePromise, rejectPromise) => {
+    const timer = setTimeout(
+      () => rejectPromise(new Error(`activation did not settle within ${ms}ms (apply() may be waiting on real services)`)),
+      ms,
+    );
+    timer.unref?.();
+    promise.then(
+      (value) => {
+        clearTimeout(timer);
+        resolvePromise(value);
+      },
+      (error) => {
+        clearTimeout(timer);
+        rejectPromise(error);
+      },
+    );
+  });
+}
+
 function normalizeExport(exported: unknown): Plugin<unknown>[] {
   if (exported === undefined || exported === null) {
     throw new Error("entry module must have a default export: a plugin or an array of plugins");
@@ -688,7 +930,7 @@ function registerPluginCommand(ctx: PluginContext, loader: PluginsLoader): () =>
   if (!commands) return () => {};
   return commands.register({
     name: "plugin",
-    description: "Manage plugins (/plugin list | reload [name] | eject <name> | new <name>)",
+    description: "Manage plugins (/plugin list | reload [name] | eject <name> | new <name> | verify <name> | revert <name>)",
     async run(args) {
       const [sub, ...rest] = args.trim() === "" ? [] : args.trim().split(/\s+/);
       switch (sub ?? "list") {
@@ -747,8 +989,29 @@ function registerPluginCommand(ctx: PluginContext, loader: PluginsLoader): () =>
             return `error: ${errorMessage(error)}`;
           }
         }
+        case "verify": {
+          const name = rest[0];
+          if (!name) return "usage: /plugin verify <name>";
+          const report = await loader.verify(name);
+          if (!report.ok) return `verify FAILED: ${name}\n  ${report.error ?? "unknown error"}`;
+          return [
+            `verify OK: ${name}`,
+            `  provides: ${report.provided.join(", ") || "-"}`,
+            `  tools: ${report.tools.join(", ") || "-"}`,
+            `  commands: ${report.commands.join(", ") || "-"}`,
+          ].join("\n");
+        }
+        case "revert": {
+          const name = rest[0];
+          if (!name) return "usage: /plugin revert <name>";
+          try {
+            return await loader.revert(name);
+          } catch (error) {
+            return `error: ${errorMessage(error)}`;
+          }
+        }
         default:
-          return `unknown subcommand "${sub}" (use: list | reload [name] | eject <name> | new <name>)`;
+          return `unknown subcommand "${sub}" (use: list | reload [name] | eject <name> | new <name> | verify <name> | revert <name>)`;
       }
     },
   });

@@ -1,4 +1,4 @@
-import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -196,6 +196,116 @@ export default {
     await loader.scaffold("gen");
     await expect(loader.scaffold("gen")).rejects.toThrow(/already exists/);
     await expect(loader.scaffold("9bad")).rejects.toThrow(/invalid plugin name/);
+  });
+
+  describe("verify() sandbox dry-run", () => {
+    it("reports what a healthy plugin would register, without touching the host", async () => {
+      await writePlugin("demo", { name: "demo" }, demoEntry("v1"));
+      createStack();
+      await loader.init();
+      const tools = runtime.ctx.get("tools") as ToolRegistry;
+
+      const report = await loader.verify("demo");
+      expect(report.ok).toBe(true);
+      expect(report.tools).toEqual(["demo_tool"]);
+      expect(report.commands).toEqual(["demo"]);
+      // The dry run must not leak into the live host.
+      expect(tools.list().filter((tool) => tool.name === "demo_tool")).toHaveLength(1);
+      expect(tools.get("demo_tool")?.description).toBe("demo tool v1");
+    });
+
+    it("reports activation failures instead of throwing", async () => {
+      await writePlugin(
+        "boom",
+        { name: "boom" },
+        `export default { name: "boom", apply() { throw new Error("kaboom"); } };`,
+      );
+      createStack();
+      await loader.init();
+
+      // Catalog state right after init (boom failed to load there, as expected).
+      const before = loader.list().find((entry) => entry.name === "boom");
+
+      const report = await loader.verify("boom");
+      expect(report.ok).toBe(false);
+      expect(report.error).toContain("kaboom");
+      // The dry run must not mutate the host catalog entry in any way.
+      expect(loader.list().find((entry) => entry.name === "boom")).toEqual(before);
+      expect(runtime.activePlugins()).not.toContain("boom");
+    });
+
+    it("reports missing plugins and broken imports", async () => {
+      createStack();
+      await loader.init();
+      expect((await loader.verify("ghost")).error).toMatch(/not found/);
+
+      await writePlugin("bad-import", { name: "bad-import" }, "export default {");
+      const report = await loader.verify("bad-import");
+      expect(report.ok).toBe(false);
+      expect(report.error).toMatch(/import failed/);
+    });
+
+    it("is exposed as /plugin verify", async () => {
+      await writePlugin("demo", { name: "demo" }, demoEntry("v1"));
+      createStack();
+      await loader.init();
+      const commands = runtime.ctx.get("commands") as CommandsService;
+
+      const ok = await commands.execute("/plugin verify demo");
+      expect(ok).toContain("verify OK");
+      expect(ok).toContain("demo_tool");
+      expect(await commands.execute("/plugin verify ghost")).toContain("verify FAILED");
+    });
+  });
+
+  describe("snapshots and revert()", () => {
+    it("revert() restores the last good version after a broken edit", async () => {
+      await writePlugin("demo", { name: "demo" }, demoEntry("v1"));
+      createStack();
+      await loader.init();
+      const tools = runtime.ctx.get("tools") as ToolRegistry;
+      expect(tools.get("demo_tool")?.description).toBe("demo tool v1");
+
+      // Break the plugin and fail a reload.
+      await writePlugin("demo", { name: "demo" }, "export default {");
+      await loader.reload("demo");
+      expect(loader.list().find((entry) => entry.name === "demo")?.status).toBe("error");
+      expect(tools.get("demo_tool")).toBeUndefined();
+
+      // A snapshot was taken when v1 loaded; revert brings it back.
+      const snapshots = await readdir(join(tmp, ".flavorlite", "plugins", ".versions", "demo"));
+      expect(snapshots.length).toBeGreaterThan(0);
+
+      const message = await loader.revert("demo");
+      expect(message).toContain("reverted");
+      expect(loader.list().find((entry) => entry.name === "demo")?.status).toBe("loaded");
+      expect(tools.get("demo_tool")?.description).toBe("demo tool v1");
+    });
+
+    it("keeps the newest snapshot when reverting a healthy plugin chain", async () => {
+      await writePlugin("demo", { name: "demo" }, demoEntry("v1"));
+      createStack();
+      await loader.init();
+      // v2 loads fine — its snapshot supersedes v1's as the restore target.
+      await writePlugin("demo", { name: "demo" }, demoEntry("v2"));
+      await loader.reload("demo");
+      // Now break v3 and revert: v2 must come back, not v1.
+      await writePlugin("demo", { name: "demo" }, "export default {");
+      await loader.reload("demo");
+
+      await loader.revert("demo");
+      const tools = runtime.ctx.get("tools") as ToolRegistry;
+      expect(tools.get("demo_tool")?.description).toBe("demo tool v2");
+    });
+
+    it("throws for unknown plugins and is exposed as /plugin revert", async () => {
+      createStack();
+      await loader.init();
+      await expect(loader.revert("ghost")).rejects.toThrow(/no snapshot/);
+
+      const commands = runtime.ctx.get("commands") as CommandsService;
+      expect(await commands.execute("/plugin revert ghost")).toMatch(/error.*no snapshot/);
+    });
   });
 
   it("exposes the /plugin command for list and reload and eject", async () => {

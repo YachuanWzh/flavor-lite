@@ -67,6 +67,24 @@ export interface LoopCompact {
 export interface LoopAfterRun {
   iterations: number;
   reason: "finished" | "max_iterations" | "aborted";
+  /** Tool calls executed this run (aborted placeholders excluded). */
+  toolCalls: number;
+  /** Tool calls whose result carried isError. */
+  toolErrors: number;
+  /** Steering messages consumed mid-run. */
+  steers: number;
+  /** Accumulated provider usage across every turn. */
+  inputTokens: number;
+  outputTokens: number;
+}
+
+/** Counters fed into loop/after-run; reflection plugins consume them. */
+interface RunStats {
+  toolCalls: number;
+  toolErrors: number;
+  steers: number;
+  inputTokens: number;
+  outputTokens: number;
 }
 
 const DEFAULT_MAX_ITERATIONS = 50;
@@ -103,10 +121,11 @@ class AgentServiceImpl implements AgentService {
     let warned = false;
     let compacted = false;
     let iteration = 0;
+    const stats: RunStats = { toolCalls: 0, toolErrors: 0, steers: 0, inputTokens: 0, outputTokens: 0 };
 
     while (iteration < maxIterations) {
       if (options.signal?.aborted) {
-        await this.afterRun(hooks, iteration, "aborted");
+        await this.afterRun(hooks, iteration, "aborted", stats);
         yield { type: "agent_end", iterations: iteration, reason: "aborted" };
         return;
       }
@@ -120,7 +139,10 @@ class AgentServiceImpl implements AgentService {
       // Steering messages join the conversation before the next request.
       while (this.steeringQueue.length > 0) {
         const text = this.steeringQueue.shift();
-        if (text) await this.record(session, messages, { role: "user", content: `[steering] ${text}` });
+        if (text) {
+          stats.steers += 1;
+          await this.record(session, messages, { role: "user", content: `[steering] ${text}` });
+        }
       }
 
       // Re-snapshot tools per iteration: plugins recalled or mounted
@@ -138,7 +160,13 @@ class AgentServiceImpl implements AgentService {
       const channel = new EventChannel();
       const turnPromise = this.requestTurn(llm, request, options, channel);
       // Stream turn events (text_delta, usage) to the caller in real time.
-      for await (const event of channel) yield event;
+      for await (const event of channel) {
+        if (event.type === "usage") {
+          stats.inputTokens += event.inputTokens;
+          stats.outputTokens += event.outputTokens;
+        }
+        yield event;
+      }
       const turn = await turnPromise;
       if (turn.error) {
         const error = turn.error;
@@ -157,7 +185,7 @@ class AgentServiceImpl implements AgentService {
           }
         }
         yield { type: "warning", message: `Model request failed (${error.code}): ${error.message}` };
-        await this.afterRun(hooks, iteration, "finished");
+        await this.afterRun(hooks, iteration, "finished", stats);
         yield { type: "agent_end", iterations: iteration, reason: "finished" };
         return;
       }
@@ -170,7 +198,7 @@ class AgentServiceImpl implements AgentService {
       yield { type: "message_end", message: assistantMessage };
 
       if (turn.toolCalls.length === 0) {
-        await this.afterRun(hooks, iteration, "finished");
+        await this.afterRun(hooks, iteration, "finished", stats);
         yield { type: "agent_end", iterations: iteration, reason: "finished" };
         return;
       }
@@ -196,6 +224,8 @@ class AgentServiceImpl implements AgentService {
           cwd: this.ctx.cwd,
           ...(options.signal ? { signal: options.signal } : {}),
         });
+        stats.toolCalls += 1;
+        if (result.isError) stats.toolErrors += 1;
         await this.record(session, messages, {
           role: "tool",
           toolCallId: toolCall.id,
@@ -207,7 +237,7 @@ class AgentServiceImpl implements AgentService {
       }
     }
 
-    await this.afterRun(hooks, iteration, "max_iterations");
+    await this.afterRun(hooks, iteration, "max_iterations", stats);
     yield { type: "agent_end", iterations: iteration, reason: "max_iterations" };
   }
 
@@ -215,9 +245,14 @@ class AgentServiceImpl implements AgentService {
    * Run the `loop/after-run` waterfall. Lifecycle listeners (router ejection,
    * telemetry) must never break the loop, so failures are only warned.
    */
-  private async afterRun(hooks: HookBusService, iterations: number, reason: LoopAfterRun["reason"]): Promise<void> {
+  private async afterRun(
+    hooks: HookBusService,
+    iterations: number,
+    reason: LoopAfterRun["reason"],
+    stats: RunStats,
+  ): Promise<void> {
     try {
-      await hooks.waterfall<LoopAfterRun>("loop/after-run", { iterations, reason });
+      await hooks.waterfall<LoopAfterRun>("loop/after-run", { iterations, reason, ...stats });
     } catch (error) {
       this.ctx.logger.warn(`loop/after-run hook failed: ${error instanceof Error ? error.message : String(error)}`);
     }

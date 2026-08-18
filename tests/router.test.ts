@@ -108,7 +108,15 @@ describe("router plugin", () => {
   }
 
   async function endRun(): Promise<void> {
-    await hooks().waterfall<LoopAfterRun>("loop/after-run", { iterations: 1, reason: "finished" });
+    await hooks().waterfall<LoopAfterRun>("loop/after-run", {
+      iterations: 1,
+      reason: "finished",
+      toolCalls: 0,
+      toolErrors: 0,
+      steers: 0,
+      inputTokens: 0,
+      outputTokens: 0,
+    });
   }
 
   beforeEach(async () => {
