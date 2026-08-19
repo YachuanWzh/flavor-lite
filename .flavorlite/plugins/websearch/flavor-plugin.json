@@ -1,0 +1,31 @@
+{
+  "name": "websearch",
+  "version": "0.1.0",
+  "entry": "index.js",
+  "activation": "dynamic",
+  "description": "Web search tool for the agent: DuckDuckGo by default (no API key), optional Brave or a custom SearXNG-style JSON endpoint.",
+  "triggers": {
+    "keywords": [
+      "搜索",
+      "查一下",
+      "查资料",
+      "检索",
+      "网页",
+      "资讯",
+      "新闻",
+      "web",
+      "search"
+    ],
+    "tools": [
+      "websearch"
+    ],
+    "commands": [
+      "websearch"
+    ]
+  },
+  "config": {
+    "provider": "duckduckgo",
+    "maxResults": 5,
+    "timeoutMs": 15000
+  }
+}

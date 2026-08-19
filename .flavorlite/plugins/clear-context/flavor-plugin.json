@@ -1,0 +1,6 @@
+{
+  "name": "clear-context",
+  "version": "0.1.0",
+  "entry": "index.js",
+  "description": "Adds /clear: clears the terminal screen and resets the conversation context."
+}

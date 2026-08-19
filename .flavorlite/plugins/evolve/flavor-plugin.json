@@ -1,0 +1,13 @@
+{
+  "name": "evolve",
+  "version": "0.1.0",
+  "description": "bounded recursive self-improvement: capture repeated failures, propose plugin-level fixes, verify with tests",
+  "entry": "index.js",
+  "activation": "eager",
+  "config": {
+    "promptTop": 3,
+    "minRepeats": 2,
+    "testCommand": "npm test",
+    "testTimeoutMs": 120000
+  }
+}

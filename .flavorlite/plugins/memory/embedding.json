@@ -1,0 +1,8 @@
+{
+  "_comment": "Copy this file to <workspace>/.flavorlite/memory/embedding.json and fill in your endpoint. The plugin reads that path first; the manifest config.embedding is only a fallback. While unset, memory recall runs BM25-only.",
+  "url": "http://127.0.0.1:11434",
+  "model": "bge-m3",
+  "apiKey": "",
+  "timeoutMs": 15000,
+  "batchSize": 8
+}

@@ -1,0 +1,6 @@
+{
+  "name": "command-hints",
+  "version": "0.1.0",
+  "entry": "index.js",
+  "description": "While typing /, show matching commands, plugins and skills with the typed prefix highlighted; Tab completes."
+}

@@ -10,5 +10,10 @@ dist/
 *.bak
 *.tsbuildinfo
 coverage/
-.flavorlite
+# .flavorlite 数据区（sessions/memory/evolve 等）忽略，但放行插件源码；
+# 注意必须用内容级忽略 `.flavorlite/*`，整目录忽略无法被 `!` 穿透。
+.flavorlite/*
+!.flavorlite/plugins/
+# loader 快照为运行时产物，不入库
+.flavorlite/plugins/.versions/
 .flavor

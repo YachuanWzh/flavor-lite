@@ -1,0 +1,22 @@
+{
+  "name": "memory",
+  "version": "0.2.0",
+  "entry": "index.js",
+  "description": "Long-term memory for the agent: durable facts stored under .flavorlite/memory/ with dedupe, heat aging (hot/cold), recall counting, and hybrid multi-path retrieval (BM25 + external-embedding vectors) fused by reciprocal rank.",
+  "config": {
+    "maxEntries": 200,
+    "maxEntryChars": 600,
+    "autoStoreThreshold": 11,
+    "recallTopK": 4,
+    "recallMaxChars": 1600,
+    "bm25": { "k1": 1.5, "b": 0.75 },
+    "fusionK": 60,
+    "embedding": {
+      "url": "",
+      "model": "",
+      "apiKey": "",
+      "timeoutMs": 15000,
+      "batchSize": 8
+    }
+  }
+}

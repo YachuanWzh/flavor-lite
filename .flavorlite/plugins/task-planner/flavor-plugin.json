@@ -1,0 +1,24 @@
+{
+  "name": "task-planner",
+  "version": "0.1.0",
+  "entry": "index.js",
+  "activation": "dynamic",
+  "description": "Complex task planning: atomic task decomposition with a live, color-coded task board (running green, pending orange, error red) printed to the terminal.",
+  "triggers": {
+    "keywords": [
+      "任务规划",
+      "任务分解",
+      "拆解任务",
+      "计划",
+      "任务板",
+      "多步任务",
+      "分步",
+      "plan"
+    ],
+    "tools": [
+      "plan_start",
+      "plan_update",
+      "plan_view"
+    ]
+  }
+}

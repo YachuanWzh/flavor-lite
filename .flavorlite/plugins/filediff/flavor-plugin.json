@@ -1,0 +1,12 @@
+{
+  "name": "filediff",
+  "version": "0.1.0",
+  "entry": "index.js",
+  "description": "Print a colored +/- diff after file-modifying tools (Write/Edit/Shell rm/mv): new files in green, deletions in red, edits as separate -/+ blocks.",
+  "config": {
+    "color": "auto",
+    "maxDiffLines": 500,
+    "maxFileBytes": 524288,
+    "maxTreeFiles": 200
+  }
+}
