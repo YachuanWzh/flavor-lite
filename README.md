@@ -84,39 +84,22 @@ src/
 | Reloads are atomic | `runtime.reload()` activates the replacement first, then it takes over the old registrations: consumers never see a gap |
 | Late services are waitable | `ctx.whenAvailable(key)` resolves now or as soon as a dynamic plugin mounts it |
 
-### Kernel hardening (0.1.2)
+### Reliability
 
-Since 0.1.1 the kernel grew a stability and operability layer without changing
-its shape — still a tiny context plus a topo-sorting runtime, still zero
-runtime dispatch:
+The kernel fails loud and stays observable: typed errors with stable codes
+and structured details, service ownership with explicit `{ override: true }`,
+declared `provides` contracts, atomic plugin reloads, bounded async
+activation, resource caps, an event bus, and `runtime.inspect()` /
+`runtime.plan()` for introspection.
 
-- **Typed kernel errors** — every failure carries a stable `code` plus
-  structured `detail` (`KernelError` base): `resolution/*`, `activation/*`,
-  `service/ownership`, `service/undeclared`, `reload/*`,
-  `unmount/dangling-consumers`, `kernel/limit-exceeded`, `runtime/disposed`.
-  Hosts and monitoring branch on codes, never on message text.
-- **Service ownership** — who provides a key is tracked (owner propagates
-  through `AsyncLocalStorage`, so async `apply()` stays scoped). Silently
-  shadowing another plugin's service is a startup error unless you pass
-  `{ override: true }` on purpose.
-- **Declared `provides` contract** — a plugin listing `provides` may only
-  register those keys; anything else fails activation (`service/undeclared`).
-- **Atomic reload** — `runtime.reload(name, replacement)` activates the new
-  plugin first, then hands over the old registrations. Consumers never see a
-  service gap; if the replacement fails, the old instance is left untouched.
-- **Async activation, bounded** — `apply()` may be async; effects registered
-  after an `await` still belong to the plugin. `activationTimeoutMs` fails a
-  stalled activation (`activation/timeout`); `teardownTimeoutMs` warns and
-  moves on so shutdown never wedges.
-- **Kernel event bus** — `runtime.on()` subscribes to lifecycle events:
-  `plugin:activating|activated|failed|unmounted`, `batch:rolled-back`,
-  `service:provided|removed`, `runtime:disposed`.
-- **Resource caps** — optional `maxEffects` / `maxServices` /
-  `maxListenersPerEvent` make a runaway plugin fail loud at registration
-  instead of growing kernel state without bound.
-- **Introspection** — `runtime.inspect()` snapshots services/plugins/effects;
-  `runtime.plan()` previews the topological order; logs carry structured
-  fields (`plugin`, `serviceKey`, `code`, ...) for audit and metrics.
+### Self-evolution
+
+A bounded, human-gated improvement loop lives entirely in disk plugins on the
+standard seams: repeated tool failures become fix suggestions, recurring
+success sequences are proposed as new tools, fixes can be distilled into
+permanent prompt rules (`rules.md`), successful sessions are distilled into
+reusable `SKILL.md` SOPs, and finished task plans are archived for reuse. See
+`docs/self-evolve.md` and the specs in `docs/specs/`.
 
 ### Extension points
 
@@ -187,10 +170,11 @@ Configuration merges from (low → high): `~/.flavorlite/config.json`,
 ## Development
 
 ```bash
-npm test          # 271 tests: kernel (42), loop, permission, session, compaction,
-                  # plus disk plugins, router, memory, error-monitor, subagent, ...
+npm test          # 304 tests: kernel (42), loop, permission, session, compaction,
+                  # plus disk plugins, router, memory, error-monitor, subagent,
+                  # skill-distiller, task-planner, evolve, ...
 npm run typecheck # strict + noUncheckedIndexedAccess
 npm run build     # tsup → dist/ (index + cli)
 ```
 
-Requirements: Node 20+.
+Requirements: Node 20+. See [CHANGELOG.md](CHANGELOG.md) for release notes.

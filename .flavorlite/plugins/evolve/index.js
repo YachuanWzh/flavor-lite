@@ -2,14 +2,18 @@
 //
 // RSI in one closed loop, kept deliberately bounded and human-gated:
 //   1. CAPTURE  tools/after-call records failing tool results into a
-//                deduped signal store (tool + normalized error).
-//   2. ASSESS   prompt/assemble surfaces open suggestions in the system
+//                deduped signal store (tool + normalized error), and
+//                buffers successful call names so recurring workflows
+//                (trigrams across runs) can be mined into tool proposals.
+//   2. ASSESS   prompt/assemble surfaces open suggestions (fixes and tool
+//                proposals) plus distilled rules.md rules in the system
 //                prompt; the model decides whether any code/tool change
 //                would fix the repeated failure.
 //   3. MODIFY   the /evolve suggest command hands the model's proposal back
-//                to the running agent, which implements it as a plugin via
-//                the normal tool loop (Write/Edit + hot reload). The
-//                evolve_improve tool scaffolds the fix directory.
+//                to the running agent, which implements it via the normal
+//                tool loop (Write/Edit + hot reload). The evolve_improve
+//                tool scaffolds the fix dir (kind=plugin) or distills a
+//                permanent prompt rule (kind=prompt_rule).
 //   4. VERIFY   /evolve verify <name> sandbox-dry-runs the plugin on a
 //                shadow runtime BEFORE activation; /evolve test runs the
 //                suite afterwards — green runs are genuine capability gains
@@ -36,6 +40,8 @@ import { EvolveStore } from "./store.js";
 
 const DEFAULT_PROMPT_TOP = 3;
 const MIN_REPEATS = 2;
+const PATTERN_THRESHOLD = 3;
+const DEFAULT_PATTERN_TOP = 2;
 const TEST_TIMEOUT_MS = 120000;
 
 const SUGGEST_SECTION = `# self-improvement suggestions (evolve plugin)
@@ -47,6 +53,13 @@ this session when it is in scope; otherwise ignore them. Never act on them
 without running the test suite afterwards.
 
 {{SUGGESTIONS}}
+`;
+
+const RULES_SECTION = `# self-improvement rules (evolve plugin)
+
+Rules below were distilled from past fixes and always apply:
+
+{{RULES}}
 `;
 
 /** Sanitize a tool name into a valid fix-plugin dir name (letters/digits/-/_). */
@@ -96,6 +109,8 @@ export default {
     return ctx.effect(() => {
       const promptTop = Number.isFinite(config.promptTop) ? config.promptTop : DEFAULT_PROMPT_TOP;
       const minRepeats = Number.isFinite(config.minRepeats) ? config.minRepeats : MIN_REPEATS;
+      const patternThreshold = Number.isFinite(config.patternThreshold) ? config.patternThreshold : PATTERN_THRESHOLD;
+      const patternTop = Number.isFinite(config.patternTop) ? config.patternTop : DEFAULT_PATTERN_TOP;
       const testCommand = typeof config.testCommand === "string" && config.testCommand.trim() !== ""
         ? config.testCommand
         : "npm test";
@@ -103,6 +118,9 @@ export default {
 
       const store = new EvolveStore({ cwd: ctx.cwd });
       const disposers = [];
+      // Success-call names of the current run (values never recorded);
+      // flushed into trigram patterns on loop/after-run.
+      const recentCalls = [];
 
       // Service: exposes the store for other plugins and the tools below.
       disposers.push(
@@ -123,7 +141,8 @@ export default {
         }),
       );
 
-      // CAPTURE: dedupe failing tool results into the signal store.
+      // CAPTURE: dedupe failing tool results into the signal store; buffer
+      // successful call names so after-run can mine recurring trigrams.
       disposers.push(
         ctx.get("hooks").hook("tools/after-call", async (event, next) => {
           try {
@@ -133,6 +152,8 @@ export default {
                 args: event.args ?? event.toolCall.args,
                 error: event.result.content,
               });
+            } else {
+              recentCalls.push(event.toolCall.name);
             }
           } catch (error) {
             ctx.logger.warn(`evolve: capture failed — ${error instanceof Error ? error.message : String(error)}`);
@@ -141,18 +162,25 @@ export default {
         }),
       );
 
-      // ASSESS: surface open suggestions to the model.
+      // ASSESS: surface open suggestions and distilled rules to the model.
       disposers.push(
         ctx.get("hooks").hook("prompt/assemble", async (event, next) => {
           try {
             const suggestions = await store.openSuggestions({ threshold: minRepeats, limit: promptTop });
-            if (suggestions.length > 0) {
+            const proposals = await store.openPatternSuggestions({ threshold: patternThreshold, limit: patternTop });
+            if (suggestions.length > 0 || proposals.length > 0) {
+              const lines = suggestions.map((s) => `- [${s.id}] ${s.hint}`);
+              for (const p of proposals) lines.push(`- [${p.id}] (tool proposal) ${p.hint}`);
               event.sections.push({
                 name: "evolve",
-                content: SUGGEST_SECTION.replace(
-                  "{{SUGGESTIONS}}",
-                  suggestions.map((s) => `- [${s.id}] ${s.hint}`).join("\n"),
-                ),
+                content: SUGGEST_SECTION.replace("{{SUGGESTIONS}}", lines.join("\n")),
+              });
+            }
+            const rules = (await store.readRules()).trim();
+            if (rules) {
+              event.sections.push({
+                name: "evolve-rules",
+                content: RULES_SECTION.replace("{{RULES}}", rules),
               });
             }
           } catch (error) {
@@ -168,6 +196,18 @@ export default {
       disposers.push(
         ctx.get("hooks").hook("loop/after-run", async (event, next) => {
           try {
+            // Mine this run's success sequence into trigrams. A trigram counts
+            // once per run: only cross-run recurrence signals a real workflow.
+            const seen = new Set();
+            for (let i = 0; i + 3 <= recentCalls.length; i += 1) {
+              const trigram = recentCalls.slice(i, i + 3);
+              const key = trigram.join("->");
+              if (seen.has(key)) continue;
+              seen.add(key);
+              await store.recordPattern({ sequence: trigram });
+            }
+            recentCalls.length = 0;
+
             const current = await store.signals();
             const failedTools = current
               .filter((signal) => (signal.count ?? 1) >= minRepeats)
@@ -191,35 +231,58 @@ export default {
         }),
       );
 
-      // MODIFY: scaffold a fix plugin dir for one repeated failure, then the
-      // running agent implements it with its own tools and verifies with tests.
+      // MODIFY: scaffold a fix plugin dir (kind=plugin) or distill a prompt
+      // rule (kind=prompt_rule) for one open suggestion, then the running
+      // agent implements/verifies it with its own tools.
       disposers.push(
         ctx.get("tools").register({
           name: "evolve_improve",
           description:
-            "Implement a fix for one repeated tool failure as a flavor-lite plugin: scaffolds the plugin dir " +
-            "and returns instructions for implementing, hot-reloading, and verifying it. " +
-            "Use when the model proposes a concrete plugin-level fix for a suggestion in the system prompt.",
+            "Act on one open evolve suggestion. kind=plugin (default): scaffolds a fix plugin dir and returns " +
+            "instructions for implementing, hot-reloading, and verifying it. kind=prompt_rule: distills the " +
+            "implementation text into a permanent behavior rule injected into the system prompt (no plugin). " +
+            "Use when the model proposes a concrete fix for a suggestion in the system prompt.",
           category: "write",
           inputSchema: {
             type: "object",
             properties: {
               suggestionId: { type: "string", description: "Signal id from the evolve suggestions" },
-              implementation: { type: "string", description: "Concise description of the plugin fix to implement" },
+              implementation: { type: "string", description: "Concise description of the fix to implement" },
+              kind: {
+                type: "string",
+                enum: ["plugin", "prompt_rule"],
+                description: "Fix shape: scaffold a plugin (default) or append a prompt rule.",
+              },
             },
             required: ["suggestionId", "implementation"],
           },
           async execute(args) {
             const suggestionId = String(args?.suggestionId ?? "");
             const implementation = String(args?.implementation ?? "");
-            const suggestions = await store.openSuggestions({ threshold: minRepeats, limit: 100 });
+            const kind = args?.kind === "prompt_rule" ? "prompt_rule" : "plugin";
+            const suggestions = [
+              ...(await store.openSuggestions({ threshold: minRepeats, limit: 100 })),
+              ...(await store.openPatternSuggestions({ threshold: patternThreshold, limit: 100 })),
+            ];
             const suggestion = suggestions.find((s) => s.id === suggestionId);
             if (!suggestion) {
               return { content: `No open suggestion with id "${suggestionId}".`, isError: true };
             }
 
+            if (kind === "prompt_rule") {
+              await store.appendRule(implementation);
+              await store.markSuggestionDone(suggestion.id);
+              return {
+                content: [
+                  `Distilled suggestion [${suggestion.id}] into a prompt rule and marked it done.`,
+                  `Rule: ${implementation}`,
+                  `It is injected into the system prompt from .flavorlite/evolve/rules.md on every run.`,
+                ].join("\n"),
+              };
+            }
+
             const loader = ctx.get("pluginsLoader");
-            const name = sanitizePluginName(suggestion.tool);
+            const name = sanitizePluginName(suggestion.tool ?? suggestion.sequence?.join("-") ?? "fix");
             let dir;
             try {
               dir = await loader.scaffold(name);
@@ -232,14 +295,15 @@ export default {
 
             // Record the implementation plan next to the scaffold so the
             // running agent (and the human) can see what was intended.
+            const subject = suggestion.tool ?? suggestion.sequence?.join("->") ?? "pattern";
             try {
               await writeFile(
                 `${dir}/PLAN.md`,
                 [
                   "# evolve fix plan",
                   "",
-                  `Suggestion: [${suggestion.id}] ${suggestion.tool} x${suggestion.count}`,
-                  `Error: ${suggestion.error}`,
+                  `Suggestion: [${suggestion.id}] ${subject} x${suggestion.count}`,
+                  `Error: ${suggestion.error ?? "(recurring success pattern — package the sequence as one tool)"}`,
                   "",
                   "## Implementation",
                   "",
@@ -263,7 +327,7 @@ export default {
 
             return {
               content: [
-                `Scaffolded fix plugin at ${dir} for suggestion [${suggestion.id}] (${suggestion.tool} x${suggestion.count}).`,
+                `Scaffolded fix plugin at ${dir} for suggestion [${suggestion.id}] (${subject} x${suggestion.count}).`,
                 `Plan written to PLAN.md.`,
                 ``,
                 `Now implement it yourself:`,
@@ -298,8 +362,15 @@ export default {
 
             if (arg === "suggest") {
               const suggestions = await store.openSuggestions({ threshold: minRepeats, limit: 100 });
-              if (suggestions.length === 0) return "no open suggestions (need >= 2 repeats of the same failure)";
-              return suggestions.map((s) => `[${s.id}] ${s.tool} x${s.count}: ${s.error}\n  fix idea: ${s.hint}`).join("\n");
+              const proposals = await store.openPatternSuggestions({ threshold: patternThreshold, limit: 100 });
+              if (suggestions.length === 0 && proposals.length === 0) {
+                return "no open suggestions (need >= 2 repeats of the same failure, or a recurring success trigram)";
+              }
+              const lines = suggestions.map((s) => `[${s.id}] ${s.tool} x${s.count}: ${s.error}\n  fix idea: ${s.hint}`);
+              for (const p of proposals) {
+                lines.push(`[${p.id}] (tool proposal) ${p.sequence.join("->")} x${p.count}\n  fix idea: ${p.hint}`);
+              }
+              return lines.join("\n");
             }
 
             if (arg === "test") {
@@ -311,7 +382,7 @@ export default {
 
             if (arg === "clear") {
               await store.clearSignals();
-              return "cleared signals and done markers";
+              return "cleared signals, patterns and done markers";
             }
 
             if (arg.startsWith("verify ")) {
@@ -369,12 +440,12 @@ export default {
             return [
               "usage: /evolve <signals|suggest|improve <id>|verify <plugin>|revert <plugin>|test|clear|done <id>>",
               "  signals   list recent failing tool results",
-              "  suggest   aggregate repeated failures into fix suggestions",
+              "  suggest   aggregate repeated failures and recurring success trigrams into suggestions",
               "  improve   scaffold a plugin dir for one suggestion",
               "  verify    sandbox dry-run a plugin before activating it",
               "  revert    restore the last good snapshot of a plugin",
               "  test      run the test suite (npm test)",
-              "  clear     reset signals and done markers",
+              "  clear     reset signals, patterns and done markers",
             ].join("\n");
           },
         }),

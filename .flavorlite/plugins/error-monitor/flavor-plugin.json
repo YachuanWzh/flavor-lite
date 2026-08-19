@@ -1,0 +1,29 @@
+{
+  "name": "error-monitor",
+  "version": "0.2.0",
+  "entry": "index.js",
+  "description": "Monitors erroneous tool calls (especially Windows shell commands), records them with deduplication, has the background LLM analyze each new failure (with a confidence score), distills high-confidence analyses into long-term memory, and injects them into the system prompt to guide future tool calls.",
+  "config": {
+    "maxRecords": 200,
+    "maxDetailChars": 500,
+    "maxLessonChars": 560,
+    "maxPromptLessons": 4,
+    "maxPromptChars": 1200,
+    "ignorePatterns": [],
+    "enabled": true,
+    "llm": {
+      "enabled": true,
+      "model": "",
+      "confidenceThreshold": 0.7,
+      "maxTokens": 800,
+      "thinking": "disabled",
+      "maxAnalysisChars": 500,
+      "timeoutMs": 20000,
+      "retryCount": 2,
+      "retryBackoffMs": 1500,
+      "includeArgs": true,
+      "includeEnv": true
+    },
+    "fallbackToRules": false
+  }
+}

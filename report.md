@@ -1,7 +1,7 @@
 # flavor-lite 项目探索报告
 
-> 探索日期：2026-08-18
-> 测试验证：`npm test` 实测 **19 个测试文件 / 271 个用例，全部通过**（相比 8-17 版报告的 238 个用例、4 个失败：新增 33 个用例，且此前 4 个磁盘插件集成测试失败已修复）
+> 探索日期：2026-08-18（2026-08-19 更新至 0.1.3：自进化机制升级）
+> 测试验证：`npm test` 实测 **22 个测试文件 / 304 个用例，全部通过**（相比 8-18 版报告的 19 个文件 / 271 个用例：新增 skill-distiller(7)、task-planner 持久化(6)、evolve 扩展(+5) 等 33 个用例）
 
 ---
 
@@ -58,6 +58,63 @@
 | 配置校验 | 插件 `config` 支持 Standard Schema v1（zod/valibot/arktype…），apply 前校验，失败抛 `activation/invalid-config` |
 | 文档 | `docs/evolve.md`：插件模式自进化路线图（缺口分析 + 分优先级计划） |
 
+### 8-18 → 8-19 自进化机制升级（0.1.3）
+
+0.1.2 加固内核，0.1.3 则把**自进化从"只对失败反应"补成"也学成功轨迹"**。三个方向按
+`docs/self-evolve.md` 的优先级建议落地，全部是磁盘插件改动，**内核与 loop 零改动**，配套
+三个 SDD 规格文档（`docs/specs/`）：
+
+| 方向 | 内容 | 规格 |
+|---|---|---|
+| evolve 增强 | `evolve_improve` 补齐 `prompt_rule` 分支（文档/实现不一致修复）；新增成功轨迹工具提议 | `docs/specs/evolve-enhance.md` |
+| skill 自沉淀 | 新插件 **skill-distiller**：成功会话 → LLM 提炼 SOP → `SKILL.md` 自动被发现注入 | `docs/specs/skill-distiller.md` |
+| plan 持久化 | task-planner 新增 `plan_end` 归档 + `/plan-log`，为"成功计划→模板、失败计划→反模式"留数据面 | `docs/specs/task-planner-persistence.md` |
+
+**1. evolve：`prompt_rule` 分支 + 成功三元组工具提议**（`.flavorlite/plugins/evolve/`）
+
+- **`kind=prompt_rule` 终于实现**：之前 `evolve_improve` 的描述声明支持
+  `kind=plugin|prompt_rule`，但源码只有 plugin 分支。现在 prompt_rule 分支把
+  `implementation` 归一化去重后追加到 `.flavorlite/evolve/rules.md`（一行一条），并
+  标记建议 done、不脚手架任何插件；`prompt/assemble` 在 rules.md 非空时注入
+  `# self-improvement rules (evolve plugin)` 章节——**修复以行为规则的形式永久生效**。
+- **从成功轨迹提议新工具**：`tools/after-call` 现在把成功调用（`isError !== true`）的
+  工具名推进本次 run 的内存缓冲（只记名字不记参数值，无泄密面）；`loop/after-run`
+  对缓冲提取滑动窗口 trigram（**同一 run 内同一 trigram 只计 1 次**，跨 run 累计才有
+  意义），按指纹去重写入 `patterns.jsonl`（上限同 signals，400 条）。某个序列跨 run
+  达到 `patternThreshold`（默认 3）次后，作为 `kind=tool` 建议（"(tool proposal)"）
+  与失败建议同面展示：**"把 Read->Grep->Write 这类高频序列封装成单个工具/命令"**。
+  `/evolve suggest` 合并输出两类建议；`evolve_improve` 的查找范围也扩到两类。
+- 配置新增 `patternThreshold`(3) / `patternTop`(2)，`promptTop`/`minRepeats` 不变。
+
+**2. skill-distiller 插件（新，`.flavorlite/plugins/skill-distiller/`）**
+
+补上 skills 体系缺的"生成"端，完全复用 memory 插件的 `extractMemories` 抽取模式
+（`collectLlmText` + fire-and-forget）：
+
+- **门槛（防滥用）**：`loop/after-run` 且 `reason === "finished"`、
+  `toolCalls >= minToolCalls`(8)、生成总量 < `maxGenerated`(20)、slug 目录不存在；
+  `llm`/`session` 经 `ctx.tryGet` 惰性获取，缺任一静默跳过。
+- **LLM 契约**：喂完整会话 transcript（`session.latest()` → `open().messages()`）+ 既有
+  skill 名单，要求严格 JSON：`{"skip": true, "reason"}`（重复/无新知识）或
+  `{"name", "description", "body"}`；解析失败/skip/字段非法一律不落盘。
+- **落盘**：`.flavorlite/skills/<slug>/SKILL.md`，front-matter 带 `generated: true` +
+  `distilledAt`，slug = name 小写转 `-`；下次会话 skills 插件自动发现注入。
+- **服务与命令**：provides `skillDistiller`（`idle()` 等全部 pending 提炼，供测试/诊断）；
+  `/distill` 列出、`/distill rm <slug>` 只删 generated 的 skill，**人写的 skill 拒绝删除**。
+
+**3. task-planner 持久化（`.flavorlite/plugins/task-planner/`）**
+
+纯内存的任务板有了归档面：
+
+- **`plan_start`**：计划对象新增 `startedAt`。
+- **`plan_end`（新工具，control）**：参数 `outcome`（success|partial|failed，必填），
+  把 goal + 各任务终态 + 时间戳序列化追加到 `.flavorlite/task-planner/plans.jsonl`
+  （一行一条），归档后清空内存态（plan_view 回到 "No active plan."）；无活动计划或
+  非法 outcome → isError，且归档失败时**保留内存态不丢板**。终端打印归档提示。
+- **`/plan-log [n]`（新命令）**：列出最近 n 条（默认 10）归档：goal、outcome、
+  done/总数、endedAt；无归档时给空提示。
+- GUIDANCE 补一条"多步任务收尾时调用 plan_end 归档"；inject 追加 `"commands"`。
+
 ---
 
 ## 二、技术栈与工程配置
@@ -66,7 +123,7 @@
 |---|---|
 | 语言 | TypeScript（strict 模式 + `noUncheckedIndexedAccess`） |
 | 包管理器 | npm |
-| 版本 | 0.1.2 |
+| 版本 | 0.1.3 |
 | Node 要求 | >= 20（astgraph 插件额外要求 >= 22.5，用 `node:sqlite`） |
 | 运行时依赖 | 仅 `zod`（^4.4.3） |
 | 开发依赖 | `tsup`（打包）、`typescript@7`、`vitest`（测试） |
@@ -88,8 +145,11 @@ npm start         # node dist/cli.js 启动
 - `tsup.config.ts`：入口 `cli` 和 `index`，只输出 ESM；`dts` 关闭（TypeScript 7 兼容问题），需要类型声明时跑 `npm run types`
 - `vitest.config.ts`：只收集 `tests/**/*.test.ts`，Node 环境，超时 20 秒
 - `.env.example`：模板，只需设置一个 API Key（OpenAI 系或 Anthropic 系）即可运行
+- `CHANGELOG.md`：**版本变更记录**（0.1.3 自进化升级、0.1.2 内核加固等逐版明细，README 不承载版本历史）
 - `docs/plugin-dev.md`：**插件开发规范**，磁盘插件契约的唯一权威文档
 - `docs/evolve.md`：**【新】插件模式自进化路线图**（现状盘点 → 缺口分析 → 分优先级路线图 → 反模式清单）
+- `docs/self-evolve.md`：**自进化方向探索报告**（五个方向评估 + 优先级建议，0.1.3 按此落地）
+- `docs/specs/`：**【新】0.1.3 自进化 SDD 规格**（`evolve-enhance.md`、`skill-distiller.md`、`task-planner-persistence.md`）
 - `templates/plugin-template/`：`/plugin new` 用的脚手架模板（源码里也内嵌了一份，保证 dist 自包含）
 
 ---
@@ -134,10 +194,11 @@ flavor-lite/
 │       ├── completions.ts        #   【新】REPL 补全控制器：repl 服务 + 建议渲染 + Tab 补全
 │       └── repl.ts               #   交互式 REPL
 ├── docs/
-│   └── plugin-dev.md             # 【新】插件开发规范
+│   ├── plugin-dev.md             # 【新】插件开发规范
+│   └── specs/                    # 【新】0.1.3 自进化 SDD 规格（evolve-enhance / skill-distiller / task-planner-persistence）
 ├── templates/
 │   └── plugin-template/          # 【新】/plugin new 脚手架模板
-├── .flavorlite/plugins/          # 【新】磁盘插件根（本项目自带的 10 个插件）
+├── .flavorlite/plugins/          # 【新】磁盘插件根（本项目自带的 12 个插件）
 │   ├── memory/                   #   长期记忆：BM25 + 向量 + RRF 混合检索
 │   ├── error-monitor/            #   工具错误监控 + LLM 分析蒸馏到记忆
 │   ├── websearch/                #   网络搜索：DuckDuckGo / Brave / SearXNG
@@ -147,8 +208,10 @@ flavor-lite/
 │   ├── filediff/                 #   文件修改后终端打印 +/- diff
 │   ├── clear-context/            #   /clear：清屏 + 重置上下文
 │   ├── command-hints/            #   REPL 斜杠补全候选提供者
-│   └── task-planner/             #   任务规划：彩色任务面板
-├── tests/                        # 19 个测试文件，238 个用例
+│   ├── task-planner/             #   任务规划：彩色任务面板 + plan_end 归档 + /plan-log
+│   ├── evolve/                   #   自进化 RSI 闭环：失败建议 + 成功 trigram 工具提议 + prompt_rule 规则
+│   └── skill-distiller/          #   【新】成功会话自沉淀 SOP（LLM 提炼 → generated SKILL.md）
+├── tests/                        # 22 个测试文件，304 个用例
 └── dist/                         # 构建产物（已 gitignore）
 ```
 
@@ -445,7 +508,7 @@ dynamic 插件平时不占内存不占提示词；每个模型请求过一个**�
 - **空闲弹出**：turn 结束时把加载了但没用到工具、也没有反向依赖的 dynamic 插件 eject 回目录（`pinned` 名单可豁免）
 - 召回时往请求里插一条 `[system] Plugins activated for this task: ...` 消息并刷新工具 schema，让模型知道新工具可用
 
-### 3. 自带磁盘插件（本项目 `.flavorlite/plugins/` 下的 10 个）
+### 3. 自带磁盘插件（本项目 `.flavorlite/plugins/` 下的 12 个）
 
 #### memory —— 长期记忆
 - 存储：`.flavorlite/memory/MEMORY.md` 路由索引 + `tasks/<id>.md` 全文，文件锁 + 原子改名 + `.bak` 兜底，崩溃不丢
@@ -509,6 +572,21 @@ dynamic 插件平时不占内存不占提示词；每个模型请求过一个**�
 - 工具 `plan_start` / `plan_update` / `plan_view`：把复杂工作拆成原子任务，彩色面板（running 绿 / pending 橙 / error 红 / done 暗）直接画到终端
 - 面板只在终端显示，模型只拿纯文本摘要——颜色不污染上下文
 - `control` 类工具在 default/plan 模式下免询问，agent 可以自主规划
+- 【0.1.3】`plan_end` 把 goal + 任务终态 + outcome 归档到 `.flavorlite/task-planner/plans.jsonl` 并清空内存；`/plan-log [n]` 列出最近归档
+
+#### evolve —— 自进化 RSI 闭环
+- 捕获：`tools/after-call` 记失败信号（按 tool+归一化错误去重），成功调用名进 run 缓冲
+- 聚合：`loop/after-run` 统计失败 + 提炼成功 trigram（`patterns.jsonl`，同 run 只计 1 次）
+- 评估：`prompt/assemble` 注入两类建议（失败建议 + `(tool proposal)` 工具提议）
+- 改进：`evolve_improve` 工具 —— `kind=plugin` 脚手架 fix 插件；`kind=prompt_rule` 把修复沉淀为 `rules.md` 规则并在每次运行注入系统提示
+- 验证：`/evolve verify` 沙箱 dry-run、`/evolve test` 跑测试套件、`/evolve revert` 快照回滚
+- 命令：`/evolve signals|suggest|improve|verify|revert|test|clear|done`
+
+#### skill-distiller —— 成功会话自沉淀 SOP（【0.1.3】新插件）
+- 门槛：`loop/after-run` 且 `reason=finished`、`toolCalls >= 8`、生成总量 < 20、slug 不冲突
+- LLM 提炼：喂会话 transcript + 既有 skill 名单，严格 JSON 返回 `{"skip": true}` 或 `{"name","description","body"}`
+- 落盘：`.flavorlite/skills/<slug>/SKILL.md`（front-matter 带 `generated: true`），下次会话被 skills 插件自动发现注入
+- 命令：`/distill` 列出、`/distill rm <slug>` 只删生成的 skill（人写的拒绝删除）；fire-and-forget 不阻塞 loop
 
 ---
 
@@ -564,7 +642,7 @@ hooks → llm → providers(openai/anthropic) → tools → guidance(4个) → �
 
 ## 九、测试情况
 
-`npm test` 实测 **19 个测试文件、271 个用例，全部通过**（约 7.4s）：
+`npm test` 实测 **22 个测试文件、304 个用例，全部通过**（约 8.4s）：
 
 | 文件 | 覆盖内容 |
 |---|---|
@@ -587,8 +665,11 @@ hooks → llm → providers(openai/anthropic) → tools → guidance(4个) → �
 | `filediff.test.ts` | 【新】新增/修改/覆盖/删除的 diff 输出、只读工具不输出、写失败不输出 |
 | `flavor-ui.test.ts` | 【新】时间线渲染、spinner 动画、样式切换、banner、非 TTY 退化 |
 | `clear-context-plugin.test.ts` | 【新】/clear 加载、会话文件重写、请求时裁剪、短历史不裁 |
+| `evolve-plugin.test.ts`（13 个用例） | 信号去重/建议聚合/verify/revert；**【0.1.3】prompt_rule 落规则并关建议、rules.md 节注入、缺省 plugin 分支不回归、成功 trigram 跨 run 提议工具、同 run 去重** |
+| `skill-distiller.test.ts`（7 个用例） | 【0.1.3】门槛达标生成 SKILL.md、未收尾/步骤太少跳过、LLM skip 决策、slug 不覆盖、maxGenerated 上限、/distill 与 rm 保护 |
+| `task-planner-plugin.test.ts`（6 个用例） | 【0.1.3】工具注册与 /plan-log、plan_end 归档终态并清内存、无活动计划报错、非法 outcome 保留板、追加语义、日志列出 |
 
-> 相比 8-17 版报告（238 个用例、4 个失败）：新增 33 个用例（主要是内核 0.1.2 机制：所有权/契约/重载/回滚/事件/上限/等待），且此前 `completions.test.ts` 3 个 + `websearch-plugin.test.ts` 1 个集成测试失败已全部修复。
+> 相比 8-18 版报告（19 个文件 / 271 个用例）：新增 33 个用例（0.1.3 自进化：evolve 扩展 +5、skill-distiller +7、task-planner +6，其余为既有用例计数校正/增长），全部通过。
 
 测试风格很有特点：**用一个脚本化假模型适配器**（`scriptedAdapter`）回放预写的事件序列，捕获每个请求，从而无网络地测整个 agent 循环；磁盘插件测试则把插件目录复制进临时工作区，用真加载器装载；内核测试直接驱动 `Runtime.create()`，验证激活/回滚/重载/销毁的真实时序。
 
@@ -622,7 +703,7 @@ OPENAI_BASE_URL=https://api.deepseek.com
 FLAVOR_OPENAI_MODEL=deepseek-chat
 ```
 
-**装第三方插件**：往 `.flavorlite/plugins/<name>/` 放 `flavor-plugin.json` + `index.js`，然后 `/plugin reload`（或直接 `flavor-lite` 里 `/plugin new <name>` 生成脚手架）。本项目自带的 10 个插件就是现成的参考实现。
+**装第三方插件**：往 `.flavorlite/plugins/<name>/` 放 `flavor-plugin.json` + `index.js`，然后 `/plugin reload`（或直接 `flavor-lite` 里 `/plugin new <name>` 生成脚手架）。本项目自带的 12 个插件就是现成的参考实现。
 
 ---
 
@@ -651,3 +732,5 @@ flavor-lite 的价值不在于功能多，而在于**架构的纯粹性**：一�
 8-15 到 8-17 这一轮演进把"万物皆插件"推到了最后一步：**内核本身更薄了**（瀑布总线、提供商发现都插件化），**扩展成本降到了"放一个目录"**（磁盘插件 + 热重载 + 脚手架 + 开发规范文档），**复杂功能全搬到了插件层**（记忆、错误监控、网络搜索、子代理、代码图谱、UI、diff、规划……），甚至还有了**按需加载**（dynamic 插件 + 路由召回 + 空闲弹出），让"插件多"不再等于"内存多、提示词大"。如果你愿意，这个内核已经可以当作一个通用 agent 平台来用了。
 
 8-17 到 8-18（0.1.2）这一轮则反过来**加固内核本身**：类型化错误让失败可编程化（稳定错误码 + 结构化详情）、服务所有权和 `provides` 声明契约让插件之间的服务边界不再靠默契、原子重载让热更新从"两步有缝隙"变成"一步无感知"、批量激活 + 超时 + 惰性销毁让插件生命周期在任何异常下都能干净回滚、事件总线 + inspect/plan + 结构化日志让内核状态可观察、资源上限和 `whenAvailable` 补齐了"失控插件"与"迟到服务"两个边界。内核的形状没变——还是上下文 + 拓扑排序——但"薄"不再是"弱"：**架构的纯粹性和工程的严谨性在同一层上完成了合流**。
+
+8-18 到 8-19（0.1.3）这一轮把**自进化从"只对失败反应"补成"也学成功轨迹"**：evolve 补齐了声明已久的 `prompt_rule` 分支（修复沉淀为永久行为规则注入系统提示，不再只能脚手架插件），并新增成功 trigram 挖掘——高频工具序列跨 run 重复出现就提议"封装成工具/命令"；skill-distiller 填上了技能体系的"生成"端，让成功会话能自动提炼成可复用 SOP；task-planner 的 `plan_end` 归档给"成功计划→模板、失败计划→反模式"铺好了数据面。**内核与 loop 依旧零改动**——三个新能力全是磁盘插件 + 三个 SDD 规格文档，自进化本身也成了"挂一个插件"的扩展点。这验证了路线图的判断：自进化的瓶颈从来不是内核能力，而是**沿着既有接缝把闭环补完整**。

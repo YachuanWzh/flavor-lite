@@ -3,14 +3,21 @@
 // The agent decides when to use it (see the "task-planner" system-prompt
 // section contributed below): for multi-step work it calls plan_start to
 // decompose the job into atomic tasks, then plan_update after each task
-// finishes or fails.
+// finishes or fails. plan_end archives the finished plan (goal, final task
+// states, outcome, timestamps) to .flavorlite/task-planner/plans.jsonl so
+// execution history survives the process and can later be distilled into
+// reusable templates / anti-patterns (/plan-log lists the archive).
 //
 // Every plan tool call re-renders a color-coded task board straight to the
 // terminal — running green, pending orange, error red, done dim — so the
 // user always sees the live state. The model only receives a plain-text
 // summary, so ANSI codes never pollute its context.
 
+import { appendFile, mkdir, readFile } from "node:fs/promises";
+import { dirname, join } from "node:path";
+
 const TASK_STATUSES = ["pending", "running", "done", "error"];
+const PLAN_OUTCOMES = ["success", "partial", "failed"];
 
 // --- ANSI colors; degrade to plain text when stdout is not a TTY or
 // NO_COLOR is set (same policy as src/host/render.ts). ---
@@ -116,6 +123,7 @@ function createStartTool(store) {
       const plan = {
         goal: typeof args.goal === "string" ? args.goal.trim() : "",
         tasks,
+        startedAt: new Date().toISOString(),
       };
       const replaced = store.get() ? " (replaced the previous plan)" : "";
       store.set(plan);
@@ -210,27 +218,128 @@ function createViewTool(store) {
   };
 }
 
+function createEndTool(store, plansFile) {
+  return {
+    name: "plan_end",
+    category: "control",
+    description:
+      "Archive the current task board and clear it. Call it when multi-step work wraps up: the plan (goal, " +
+      "final task states, outcome) is appended to the plan log for later review. Declare the outcome honestly: " +
+      "success (all tasks done), partial (some tasks unfinished), or failed.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        outcome: {
+          type: "string",
+          enum: PLAN_OUTCOMES,
+          description: "How the plan ended: success, partial, or failed.",
+        },
+      },
+      required: ["outcome"],
+    },
+    async execute(args) {
+      const plan = store.get();
+      if (!plan) {
+        return { content: "No active plan to archive. Call plan_start first.", isError: true };
+      }
+      const outcome = args.outcome;
+      if (!PLAN_OUTCOMES.includes(outcome)) {
+        return { content: `outcome must be one of: ${PLAN_OUTCOMES.join(", ")}.`, isError: true };
+      }
+
+      const record = {
+        goal: plan.goal,
+        tasks: plan.tasks.map((task) => ({ content: task.content, detail: task.detail, status: task.status })),
+        outcome,
+        startedAt: plan.startedAt ?? null,
+        endedAt: new Date().toISOString(),
+      };
+      try {
+        await mkdir(dirname(plansFile), { recursive: true });
+        await appendFile(plansFile, `${JSON.stringify(record)}\n`, "utf-8");
+      } catch (error) {
+        // Archival failure must not lose the board state — keep the plan.
+        return {
+          content: `Failed to archive the plan: ${error instanceof Error ? error.message : String(error)}`,
+          isError: true,
+        };
+      }
+
+      store.set(null);
+      const done = record.tasks.filter((task) => task.status === "done").length;
+      process.stdout.write(`\n${bold("Task Plan archived")} (${outcome}, ${done}/${record.tasks.length} done)\n\n`);
+      return {
+        content: `Plan archived with outcome "${outcome}" (${done}/${record.tasks.length} tasks done). The board is cleared.`,
+      };
+    },
+  };
+}
+
+async function readArchivedPlans(plansFile) {
+  try {
+    const text = await readFile(plansFile, "utf-8");
+    const records = [];
+    for (const line of text.split("\n")) {
+      const trimmed = line.trim();
+      if (!trimmed) continue;
+      try {
+        records.push(JSON.parse(trimmed));
+      } catch {
+        // skip corrupt lines; the archive stays readable
+      }
+    }
+    return records;
+  } catch {
+    return [];
+  }
+}
+
 const GUIDANCE = [
   "- task-planner: for complex multi-step work, call plan_start before editing to create a visible task board. Decompose the work into atomic tasks — each task is one small, independently verifiable unit (e.g. \"add validation to X\", \"run the build and fix failures\"); never one giant compound task.",
   "- Keep the board current: call plan_update immediately after each task finishes (done) or fails (error). plan_start marks the first task running; marking a task done auto-advances the next pending task.",
+  "- When multi-step work wraps up, call plan_end with an honest outcome (success|partial|failed) to archive the plan and clear the board.",
   "- Do not use plan tools for trivial single-step requests — the board is for work with several meaningful steps.",
 ].join("\n");
 
 export default {
   name: "task-planner",
-  inject: ["tools", "hooks"],
+  inject: ["tools", "hooks", "commands"],
   apply(ctx) {
     return ctx.effect(() => {
       const disposers = [];
       const store = createStore();
+      const plansFile = join(ctx.cwd, ".flavorlite", "task-planner", "plans.jsonl");
 
       disposers.push(ctx.get("tools").register(createStartTool(store)));
       disposers.push(ctx.get("tools").register(createUpdateTool(store)));
       disposers.push(ctx.get("tools").register(createViewTool(store)));
+      disposers.push(ctx.get("tools").register(createEndTool(store, plansFile)));
       disposers.push(
         ctx.get("hooks").hook("prompt/assemble", async (event, next) => {
           event.sections.push({ name: "task-planner", content: GUIDANCE });
           return next(event);
+        }),
+      );
+      disposers.push(
+        ctx.get("commands").register({
+          name: "plan-log",
+          description: "List archived task plans (most recent first): /plan-log [count]",
+          async run(args) {
+            const count = Number.parseInt(String(args ?? "").trim(), 10);
+            const limit = Number.isInteger(count) && count > 0 ? count : 10;
+            const plans = await readArchivedPlans(plansFile);
+            if (plans.length === 0) return "no archived plans yet (plan_end appends to the log)";
+            return plans
+              .slice(-limit)
+              .reverse()
+              .map((plan) => {
+                const tasks = Array.isArray(plan.tasks) ? plan.tasks : [];
+                const done = tasks.filter((task) => task.status === "done").length;
+                const goal = plan.goal || "(no goal)";
+                return `- [${plan.outcome ?? "?"}] ${goal} (${done}/${tasks.length} done) — ended ${plan.endedAt ?? "?"}`;
+              })
+              .join("\n");
+          },
         }),
       );
 

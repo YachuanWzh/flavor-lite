@@ -3,7 +3,9 @@
 //
 // Layout under <cwd>/.flavorlite/evolve/:
 //   signals.jsonl      aggregated tool-failure signals (deduped by fingerprint)
+//   patterns.jsonl     recurring success-call trigrams (tool proposals)
 //   reflections.jsonl  one line per agent run (loop/after-run)
+//   rules.md           prompt rules distilled via evolve_improve kind=prompt_rule
 //   done.json          suggestion ids the operator/model already acted on
 
 import { createHash } from "node:crypto";
@@ -22,6 +24,11 @@ export function normalizeError(message) {
 /** Stable id for a (tool, error) pair, so repeated failures coalesce. */
 export function fingerprint(tool, error) {
   return createHash("sha1").update(`${tool}::${normalizeError(error)}`).digest("hex").slice(0, 12);
+}
+
+/** Stable id for a tool-call sequence, so repeated trigrams coalesce. */
+export function patternFingerprint(sequence) {
+  return createHash("sha1").update(sequence.join("->")).digest("hex").slice(0, 12);
 }
 
 /** Value-free summary of tool args: only key names, never secrets. */
@@ -68,7 +75,9 @@ export class EvolveStore {
   constructor({ cwd, maxSignals = 400, maxDetailChars = 300 } = {}) {
     this.dir = join(cwd, ".flavorlite", "evolve");
     this.signalsFile = join(this.dir, "signals.jsonl");
+    this.patternsFile = join(this.dir, "patterns.jsonl");
     this.reflectionsFile = join(this.dir, "reflections.jsonl");
+    this.rulesFile = join(this.dir, "rules.md");
     this.doneFile = join(this.dir, "done.json");
     this.maxSignals = maxSignals;
     this.maxDetailChars = maxDetailChars;
@@ -125,7 +134,87 @@ export class EvolveStore {
   clearSignals() {
     return this._enqueue(async () => {
       await rm(this.signalsFile, { force: true });
+      await rm(this.patternsFile, { force: true });
       await rm(this.doneFile, { force: true });
+    });
+  }
+
+  /**
+   * Record one recurring success-call trigram. Dedupes by sequence
+   * fingerprint; callers dedupe within a run so counts grow across runs.
+   */
+  recordPattern({ sequence }) {
+    return this._enqueue(async () => {
+      const id = patternFingerprint(sequence);
+      const now = new Date().toISOString();
+      const patterns = await readJsonLines(this.patternsFile);
+      const existing = patterns.find((pattern) => pattern.id === id);
+      if (existing) {
+        existing.count = (existing.count ?? 1) + 1;
+        existing.lastAt = now;
+        await writeJsonLines(this.patternsFile, patterns);
+        return { added: false, record: existing };
+      }
+      const record = { id, sequence: [...sequence], firstAt: now, lastAt: now, count: 1 };
+      patterns.push(record);
+      if (patterns.length > this.maxSignals) patterns.splice(0, patterns.length - this.maxSignals);
+      await writeJsonLines(this.patternsFile, patterns);
+      return { added: true, record };
+    });
+  }
+
+  patterns() {
+    return this._enqueue(async () => {
+      const patterns = await readJsonLines(this.patternsFile);
+      return patterns.sort((a, b) => (b.count ?? 1) - (a.count ?? 1) || String(b.lastAt).localeCompare(String(a.lastAt)));
+    });
+  }
+
+  /** Read the distilled prompt rules; empty string when none exist. */
+  readRules() {
+    return this._enqueue(async () => {
+      try {
+        return await readFile(this.rulesFile, "utf-8");
+      } catch {
+        return "";
+      }
+    });
+  }
+
+  /** Append one rule line (deduped by exact normalized text). */
+  appendRule(text) {
+    return this._enqueue(async () => {
+      const line = String(text ?? "").replace(/\s+/g, " ").trim();
+      if (!line) return;
+      let body = "";
+      try {
+        body = await readFile(this.rulesFile, "utf-8");
+      } catch {
+        body = "";
+      }
+      const entry = `- ${line}`;
+      if (body.split("\n").some((existing) => existing.trim() === entry)) return;
+      await mkdir(dirname(this.rulesFile), { recursive: true });
+      const separator = body && !body.endsWith("\n") ? "\n" : "";
+      await writeFile(this.rulesFile, `${body}${separator}${entry}\n`, "utf-8");
+    });
+  }
+
+  /** Aggregate open tool proposals from recurring success trigrams. */
+  openPatternSuggestions({ threshold = 3, limit = 8 } = {}) {
+    return this._enqueue(async () => {
+      const patterns = await readJsonLines(this.patternsFile);
+      const done = new Set(await readJsonArray(this.doneFile));
+      return patterns
+        .filter((pattern) => (pattern.count ?? 1) >= threshold && !done.has(pattern.id))
+        .slice(0, limit)
+        .map((pattern) => ({
+          id: pattern.id,
+          kind: "tool",
+          sequence: pattern.sequence,
+          count: pattern.count,
+          hint: `The tool sequence "${pattern.sequence.join("->")}" recurred ${pattern.count} times across runs. Consider packaging it as one tool or command.`,
+        }));
     });
   }
 

@@ -7,9 +7,9 @@ import { Runtime } from "../src/kernel";
 import { hooksPlugin, type HookBusService } from "../src/plugins/hooks";
 import { toolsPlugin } from "../src/plugins/tools";
 import { commandsPlugin, type CommandsService } from "../src/plugins/commands";
-import { promptPlugin } from "../src/plugins/prompt";
+import { promptPlugin, type PromptAssemble } from "../src/plugins/prompt";
 import { pluginsLoaderPlugin, type PluginsLoaderService } from "../src/plugins/plugins";
-import type { AfterToolCall } from "../src/plugins/tools/registry";
+import type { AfterToolCall, ToolRegistry } from "../src/plugins/tools/registry";
 import type { LoopAfterRun } from "../src/plugins/loop";
 
 /**
@@ -57,6 +57,26 @@ async function readReflections(dir: string): Promise<Array<Record<string, unknow
   }
 }
 
+async function readPatterns(dir: string): Promise<Array<Record<string, unknown> & { sequence: string[] }>> {
+  try {
+    const text = await readFile(join(dir, ".flavorlite", "evolve", "patterns.jsonl"), "utf-8");
+    return text
+      .split("\n")
+      .filter(Boolean)
+      .map((line) => JSON.parse(line));
+  } catch {
+    return [];
+  }
+}
+
+async function readRulesFile(dir: string): Promise<string> {
+  try {
+    return await readFile(join(dir, ".flavorlite", "evolve", "rules.md"), "utf-8");
+  } catch {
+    return "";
+  }
+}
+
 describe("evolve plugin", () => {
   let dir: string;
   let runtime: Runtime;
@@ -95,6 +115,50 @@ describe("evolve plugin", () => {
 
   async function fireError(toolCall: AfterToolCall["toolCall"], result: AfterToolCall["result"]): Promise<void> {
     await hooks().waterfall<AfterToolCall>("tools/after-call", { toolCall, args: toolCall.args, result });
+  }
+
+  function tools(): ToolRegistry {
+    return runtime.ctx.get("tools") as ToolRegistry;
+  }
+
+  async function callTool(name: string, args: Record<string, unknown>) {
+    const tool = tools().get(name);
+    if (!tool) throw new Error(`tool ${name} not registered`);
+    return tool.execute(args, { cwd: dir });
+  }
+
+  async function fireOk(name: string, id = "call_ok"): Promise<void> {
+    await hooks().waterfall<AfterToolCall>("tools/after-call", {
+      toolCall: { id, name, args: {} },
+      args: {},
+      result: { content: "ok", isError: false },
+    });
+  }
+
+  const runStats: LoopAfterRun = {
+    iterations: 3,
+    reason: "finished",
+    toolCalls: 5,
+    toolErrors: 0,
+    steers: 0,
+    inputTokens: 10,
+    outputTokens: 5,
+  };
+
+  /** One simulated run: a sequence of successful tool calls, then after-run. */
+  async function runOnceWithSequence(names: string[]): Promise<void> {
+    for (const name of names) await fireOk(name);
+    await hooks().waterfall<LoopAfterRun>("loop/after-run", runStats);
+  }
+
+  /** Raise one failure signal to threshold (2) and return its suggestion id. */
+  async function raiseSuggestion(command: string): Promise<string> {
+    await fireError(shellCall(command), { content: "boom [exit code: 1]", isError: true });
+    await fireError(shellCall(command), { content: "boom [exit code: 1]", isError: true });
+    const listing = (await commands().execute("/evolve suggest")) ?? "";
+    const id = listing.match(/\[([0-9a-f]{12})\]/)?.[1];
+    if (!id) throw new Error(`no suggestion id found in: ${listing}`);
+    return id;
   }
 
   it("loads and registers /evolve", async () => {
@@ -200,5 +264,86 @@ describe("evolve plugin", () => {
 
     const unknown = await commands().execute("/evolve verify ghost");
     expect(unknown).toContain("verify FAILED");
+  });
+
+  it("evolve_improve kind=prompt_rule appends a rule, closes the suggestion, scaffolds nothing", async () => {
+    const id = await raiseSuggestion("frobnicate");
+
+    const improve = tools().get("evolve_improve");
+    expect(improve).toBeTruthy();
+    const result = await callTool("evolve_improve", {
+      suggestionId: id,
+      implementation: "Always quote Windows paths passed to Shell commands.",
+      kind: "prompt_rule",
+    });
+    expect(result.isError).not.toBe(true);
+
+    const rules = await readRulesFile(dir);
+    expect(rules).toContain("Always quote Windows paths passed to Shell commands.");
+
+    // Suggestion closed: nothing open remains.
+    expect(await commands().execute("/evolve suggest")).toContain("no open suggestions");
+
+    // No plugin dir scaffolded for prompt_rule fixes.
+    const pluginDirs = await readdir(join(dir, ".flavorlite", "plugins"));
+    expect(pluginDirs.filter((entry) => entry.startsWith("fix-"))).toHaveLength(0);
+  });
+
+  it("injects an evolve-rules section only once rules.md has content", async () => {
+    const assemble = () =>
+      hooks().waterfall<PromptAssemble>("prompt/assemble", { cwd: dir, sections: [] });
+
+    let payload = await assemble();
+    expect(payload.sections.find((section) => section.name === "evolve-rules")).toBeUndefined();
+
+    const id = await raiseSuggestion("frobnicate");
+    await callTool("evolve_improve", {
+      suggestionId: id,
+      implementation: "Never run rm -rf without an explicit user confirmation.",
+      kind: "prompt_rule",
+    });
+
+    payload = await assemble();
+    const rulesSection = payload.sections.find((section) => section.name === "evolve-rules");
+    expect(rulesSection?.content).toContain("Never run rm -rf without an explicit user confirmation.");
+  });
+
+  it("evolve_improve default kind still scaffolds a fix plugin", async () => {
+    const id = await raiseSuggestion("shell");
+
+    const result = await callTool("evolve_improve", {
+      suggestionId: id,
+      implementation: "wrap shell with safer defaults",
+    });
+    expect(result.isError).not.toBe(true);
+    expect(String(result.content)).toContain("Scaffolded fix plugin");
+
+    const pluginDirs = await readdir(join(dir, ".flavorlite", "plugins"));
+    expect(pluginDirs).toContain("fix-shell");
+  });
+
+  it("proposes a new tool once a success trigram repeats across enough runs", async () => {
+    expect(await commands().execute("/evolve suggest")).toContain("no open suggestions");
+
+    await runOnceWithSequence(["Read", "Grep", "Write"]);
+    await runOnceWithSequence(["Read", "Grep", "Write"]);
+    let patterns = await readPatterns(dir);
+    expect(patterns.find((p) => p.sequence.join("->") === "Read->Grep->Write")?.count).toBe(2);
+    expect(await commands().execute("/evolve suggest")).not.toContain("tool proposal");
+
+    await runOnceWithSequence(["Read", "Grep", "Write"]);
+    patterns = await readPatterns(dir);
+    expect(patterns.find((p) => p.sequence.join("->") === "Read->Grep->Write")?.count).toBe(3);
+
+    const suggest = await commands().execute("/evolve suggest");
+    expect(suggest).toContain("tool proposal");
+    expect(suggest).toContain("Read->Grep->Write");
+  });
+
+  it("counts a trigram once per run even if it repeats within the run", async () => {
+    await runOnceWithSequence(["Read", "Grep", "Write", "Read", "Grep", "Write"]);
+
+    const patterns = await readPatterns(dir);
+    expect(patterns.find((p) => p.sequence.join("->") === "Read->Grep->Write")?.count).toBe(1);
   });
 });
