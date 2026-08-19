@@ -6,6 +6,55 @@ follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.1.4] - 2026-08-19
+
+### Added
+
+- **evolve: SFT export (`/evolve export [limit]`)** — clean fine-tune
+  trajectories from real sessions. Reads the optional `session` service (absent
+  → graceful `no session service available`), keeps only `user`/`assistant`
+  string messages, drops `[steering]`/`[system]` meta, truncates each message
+  at 20000 chars, skips sessions with fewer than 4 clean messages, and
+  overwrites `.flavorlite/evolve/sft.jsonl` (one `{sessionId, exportedAt,
+  messages}` record per line). Read-only over session storage; `/evolve clear`
+  never deletes the export.
+- **evolve: trigger write-back (`/evolve learn`)** — turns confirmed router
+  recall feedback (`.flavorlite/router-memory.json`, `used: true/false` per
+  plugin fingerprint) into deterministic L0 manifest keywords: tokens score +1
+  on used recalls and −1 on unused ones; candidates scoring ≥ 1 (length ≥ 2)
+  are merged into each plugin's `triggers.keywords` (case-insensitive dedupe,
+  cap 16, 2-space JSON preserved, idempotent, fail-safe per plugin).
+- **evolve × error-monitor signal link** — `/evolve suggest` and
+  `evolve_improve` now consume error-monitor's high-confidence LLM analyses
+  (`.flavorlite/error-monitor/records.json`, `analysis` present and
+  `confidence >= config.emConfidence` default 0.7), surfaced as
+  `[em:<id>] (analyzed error)` entries and closable via `done.json` — file-level
+  integration, the error-monitor plugin is untouched.
+- **skill-distiller: promotion ladder (`/distill promote <slug>`)** — the
+  human gate of the generated → curated rung: rewrites front-matter to
+  `generated: false` + `promoted: true` + `promotedAt`, so the skill leaves the
+  generation quota and becomes protected from `/distill rm`; the list shows
+  `(promoted)`. Non-generated skills are refused.
+- **knowledge-promoter plugin (new)** — the memory → skill → plugin promotion
+  ladder, deterministic with no LLM dependency: repeated memory topics
+  (`memoryTopicThreshold`, default 3) are proposed as skills
+  (`/ladder to-skill <topic>`, drafts a `generated: true` + `promotedFrom:
+  memory` SKILL.md), and skills mentioned in ≥ `skillUsageThreshold` (default 3)
+  finished runs are proposed as plugins (`/ladder to-plugin <slug>`, scaffolds
+  the plugin dir with a PLAN.md carrying the skill body). Proposals surface via
+  a `knowledge-promoter` prompt section and `/ladder`; acted-on subjects are
+  marked done and never re-proposed.
+- **Specs** — `docs/specs/evolve-batch2.md` (export / promote / learn / signal
+  link) and `docs/specs/knowledge-promoter.md` (promotion ladder), both SDD +
+  TDD.
+
+### Changed
+
+- `evolve_improve` and `/evolve suggest` suggestion pool now spans failure
+  signals, success-trigram tool proposals, and analyzed error-monitor records;
+  `evolve_improve`'s `tool` field drives both `kind=plugin` and
+  `kind=prompt_rule` paths for `em:` entries.
+
 ## [0.1.3] - 2026-08-19
 
 ### Added

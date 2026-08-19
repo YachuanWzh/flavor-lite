@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { Runtime } from "../src/kernel";
+import { Runtime, definePlugin } from "../src/kernel";
 import { hooksPlugin, type HookBusService } from "../src/plugins/hooks";
 import { toolsPlugin } from "../src/plugins/tools";
 import { commandsPlugin, type CommandsService } from "../src/plugins/commands";
@@ -31,6 +31,36 @@ async function copyDir(source: string, targetRoot: string): Promise<string> {
 
 function shellCall(command: string, id = "call_1"): AfterToolCall["toolCall"] {
   return { id, name: "Shell", args: { command } };
+}
+
+interface StubSession {
+  id: string;
+  messages: Array<{ role: string; content: string }>;
+}
+
+/** Controllable session stub (evolve only reads it via tryGet). */
+let stubSessions: StubSession[] = [];
+
+function stubSessionPlugin() {
+  return definePlugin({
+    name: "stub-session",
+    provides: ["session"],
+    apply(ctx) {
+      return ctx.effect(
+        () =>
+          ctx.provide("session", {
+            list: async () => stubSessions.map((session) => ({ id: session.id })),
+            latest: async () => stubSessions[0]?.id,
+            open: async (id: string) => {
+              const found = stubSessions.find((session) => session.id === id);
+              if (!found) throw new Error(`no session ${id}`);
+              return { messages: () => found.messages };
+            },
+          }),
+        "stub-session.install",
+      );
+    },
+  });
 }
 
 async function readSignals(dir: string): Promise<Array<Record<string, unknown>>> {
@@ -84,6 +114,7 @@ describe("evolve plugin", () => {
 
   beforeEach(async () => {
     dir = await mkdtemp(join(tmpdir(), "flavor-evolve-"));
+    stubSessions = [];
     const pluginsRoot = join(dir, ".flavorlite", "plugins");
     await mkdir(pluginsRoot, { recursive: true });
     await copyDir(PLUGIN_SOURCE, pluginsRoot);
@@ -94,6 +125,7 @@ describe("evolve plugin", () => {
       .use(toolsPlugin)
       .use(commandsPlugin)
       .use(promptPlugin)
+      .use(stubSessionPlugin())
       .use(pluginsLoaderPlugin, { runtime, roots: [pluginsRoot], watch: false });
     runtime.start();
     loader = runtime.ctx.get("pluginsLoader") as PluginsLoaderService;
@@ -345,5 +377,185 @@ describe("evolve plugin", () => {
 
     const patterns = await readPatterns(dir);
     expect(patterns.find((p) => p.sequence.join("->") === "Read->Grep->Write")?.count).toBe(1);
+  });
+
+  it("/evolve export writes clean SFT trajectories, dropping meta and short sessions", async () => {
+    stubSessions.push(
+      {
+        id: "s1",
+        messages: [
+          { role: "user", content: "fix the parser bug" },
+          { role: "assistant", content: "I will inspect parser.ts first." },
+          { role: "user", content: "[steering] no, use the lexer instead" },
+          { role: "assistant", content: "Switching to the lexer path." },
+          { role: "user", content: "great, run the tests" },
+          { role: "assistant", content: "All tests pass." },
+        ],
+      },
+      // Too short after filtering: not a complete trajectory.
+      {
+        id: "s2",
+        messages: [
+          { role: "user", content: "hi" },
+          { role: "assistant", content: "hello" },
+        ],
+      },
+    );
+
+    const out = (await commands().execute("/evolve export")) ?? "";
+    expect(out).toContain("exported 1 session");
+    expect(out).toContain("sft.jsonl");
+
+    const text = await readFile(join(dir, ".flavorlite", "evolve", "sft.jsonl"), "utf-8");
+    const lines = text
+      .split("\n")
+      .filter(Boolean)
+      .map((line) => JSON.parse(line) as { sessionId: string; messages: Array<{ role: string; content: string }> });
+    expect(lines).toHaveLength(1);
+    expect(lines[0]!.sessionId).toBe("s1");
+    expect(lines[0]!.messages).toHaveLength(5); // steering meta dropped
+    expect(JSON.stringify(lines[0]!.messages)).not.toContain("[steering]");
+    expect(lines[0]!.messages.every((message) => message.role === "user" || message.role === "assistant")).toBe(true);
+  });
+
+  it("/evolve export reports when no session qualifies", async () => {
+    const out = (await commands().execute("/evolve export")) ?? "";
+    expect(out).toContain("exported 0 session");
+  });
+
+  it("/evolve learn writes confirmed recall tokens back into manifest triggers", async () => {
+    const memory = [
+      { fp: ["hotreload", "plugin"], plugin: "evolve", used: true },
+      { fp: ["hotreload", "noise"], plugin: "evolve", used: false },
+    ];
+    await writeFile(join(dir, ".flavorlite", "router-memory.json"), JSON.stringify(memory), "utf-8");
+
+    const out = (await commands().execute("/evolve learn")) ?? "";
+    expect(out).toContain("learned triggers: evolve");
+    expect(out).toContain("plugin");
+
+    const manifest = JSON.parse(
+      await readFile(join(dir, ".flavorlite", "plugins", "evolve", "flavor-plugin.json"), "utf-8"),
+    );
+    // "plugin" scores +1; "hotreload" nets 0; "noise" nets -1.
+    expect(manifest.triggers.keywords).toContain("plugin");
+    expect(manifest.triggers.keywords).not.toContain("noise");
+    expect(manifest.triggers.keywords).not.toContain("hotreload");
+
+    // Idempotent: a second pass finds nothing new.
+    expect(await commands().execute("/evolve learn")).toContain("no new triggers learned");
+  });
+
+  it("/evolve learn degrades gracefully without router feedback", async () => {
+    expect(await commands().execute("/evolve learn")).toContain("no router feedback memory found");
+  });
+
+  it("/evolve suggest surfaces analyzed error-monitor records and done closes them", async () => {
+    const recordId = "abc123def456";
+    await mkdir(join(dir, ".flavorlite", "error-monitor"), { recursive: true });
+    await writeFile(
+      join(dir, ".flavorlite", "error-monitor", "records.json"),
+      JSON.stringify({
+        version: 1,
+        records: [
+          {
+            id: recordId,
+            tool: "Shell",
+            kind: "shell_exit",
+            count: 3,
+            lesson: "rule-based lesson",
+            analysis: "Quote Windows paths in shell commands.",
+            confidence: 0.9,
+            lastAt: new Date().toISOString(),
+          },
+          {
+            id: "lowconf000001",
+            tool: "Shell",
+            kind: "shell_exit",
+            count: 2,
+            lesson: "x",
+            analysis: "unsure what happened",
+            confidence: 0.3,
+            lastAt: new Date().toISOString(),
+          },
+        ],
+      }),
+      "utf-8",
+    );
+
+    const suggest = (await commands().execute("/evolve suggest")) ?? "";
+    expect(suggest).toContain(`[em:${recordId}]`);
+    expect(suggest).toContain("Quote Windows paths in shell commands.");
+    expect(suggest).not.toContain("[em:lowconf");
+
+    await commands().execute(`/evolve done em:${recordId}`);
+    expect(await commands().execute("/evolve suggest")).not.toContain(`[em:${recordId}]`);
+  });
+
+  it("evolve_improve consumes an error-monitor suggestion as a prompt rule", async () => {
+    const recordId = "em0000feed01";
+    await mkdir(join(dir, ".flavorlite", "error-monitor"), { recursive: true });
+    await writeFile(
+      join(dir, ".flavorlite", "error-monitor", "records.json"),
+      JSON.stringify({
+        version: 1,
+        records: [
+          {
+            id: recordId,
+            tool: "Shell",
+            kind: "shell_exit",
+            count: 4,
+            lesson: "rule-based lesson",
+            analysis: "Always forward-slash paths passed to cmd.exe.",
+            confidence: 0.85,
+            lastAt: new Date().toISOString(),
+          },
+        ],
+      }),
+      "utf-8",
+    );
+
+    const result = await callTool("evolve_improve", {
+      suggestionId: `em:${recordId}`,
+      implementation: "Forward-slash all paths passed to cmd.exe.",
+      kind: "prompt_rule",
+    });
+    expect(result.isError).not.toBe(true);
+    expect(await readRulesFile(dir)).toContain("Forward-slash all paths passed to cmd.exe.");
+    expect(await commands().execute("/evolve suggest")).not.toContain(`[em:${recordId}]`);
+  });
+});
+
+describe("evolve export without a session service", () => {
+  let dir: string;
+  let runtime: Runtime;
+
+  beforeEach(async () => {
+    dir = await mkdtemp(join(tmpdir(), "flavor-evolve-nosession-"));
+    const pluginsRoot = join(dir, ".flavorlite", "plugins");
+    await mkdir(pluginsRoot, { recursive: true });
+    await copyDir(PLUGIN_SOURCE, pluginsRoot);
+
+    runtime = Runtime.create({ cwd: dir });
+    runtime
+      .use(hooksPlugin)
+      .use(toolsPlugin)
+      .use(commandsPlugin)
+      .use(promptPlugin)
+      .use(pluginsLoaderPlugin, { runtime, roots: [pluginsRoot], watch: false });
+    runtime.start();
+    const loader = runtime.ctx.get("pluginsLoader") as PluginsLoaderService;
+    await loader.init();
+  });
+
+  afterEach(async () => {
+    await runtime.dispose();
+    await rm(dir, { recursive: true, force: true });
+  });
+
+  it("reports the missing service instead of throwing", async () => {
+    const commands = runtime.ctx.get("commands") as CommandsService;
+    const out = (await commands.execute("/evolve export")) ?? "";
+    expect(out).toContain("no session service available");
   });
 });

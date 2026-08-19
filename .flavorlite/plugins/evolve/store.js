@@ -276,4 +276,9 @@ export class EvolveStore {
       }
     });
   }
+
+  /** Raw done-marker ids (failure fingerprints, pattern ids, em:<record> ids). */
+  readDoneIds() {
+    return this._enqueue(async () => readJsonArray(this.doneFile));
+  }
 }

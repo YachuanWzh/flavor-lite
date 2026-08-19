@@ -99,6 +99,10 @@ router 目前只记录"召回后工具是否被调用"。更强的信号：
 evolve 插件共享消费——避免每个插件各自维护一份记忆文件
 （当前已有 router-memory.json、error-monitor/records.json、memory/MEMORY.md 三份割裂信号源）。
 
+**已落地的信号联动**（批次二）：evolve 直接读 error-monitor/records.json，
+将高置信度（≥ emConfidence，默认 0.7）LLM 分析记录并入 `/evolve suggest` 与
+`evolve_improve` 建议池（id 前缀 `em:`，复用 done.json 关闭），error-monitor 插件零改动。
+
 #### 3.6 memory → skill → plugin 晋升阶梯
 
 三种知识形态已存在但没有流动。做一个反思插件（挂 `session/end`）：
@@ -108,11 +112,31 @@ evolve 插件共享消费——避免每个插件各自维护一份记忆文件
 
 这是自进化最有复利的部分：每次进化都让下一次任务更便宜。
 
+**已落地 skill 层阶梯**（批次二）：skill-distiller 蒸馏 generated 技能
+（`loop/after-run` 门控 + LLM 严格 JSON 契约 + 配额上限）；`/distill promote <slug>`
+是人工闸门，把 generated 技能晋升为 curated（front-matter `generated: false` +
+`promoted: true`），晋升后脱离生成配额、免于 `/distill rm`。
+
+**已落地两段提议与转化**（批次三，knowledge-promoter 插件，spec 见
+docs/specs/knowledge-promoter.md）：
+
+- memory → skill：memory `references()` 按 topicKey 分组，同主题 ≥3 条即提议；
+  `/ladder to-skill <topic>` 用记忆 summary 合成 SKILL.md 草稿
+  （`generated: true` + `promotedFrom: memory`，纳入 /distill 管理面）。
+- skill → plugin：每个 finished run 扫描 transcript 统计技能提及（每 run 每技能
+  最多 +1），使用度 ≥3 且无同名插件即提议；`/ladder to-plugin <slug>` 脚手架
+  插件 + PLAN.md（技能正文 + verify/reload/test 步骤）。提议经 prompt section
+  与 `/ladder` 可见，done.json 防重复，全程无 LLM 依赖。
+
 #### 3.7 triggers 自动维护
 
 自产插件的"作者"（模型自己）写的 keywords 往往不准。router-memory.json 里已有
 召回失败的 fp 数据，只差一个消费者把它回写进 manifest 的 `triggers` ——
 等于让插件自己学会"什么请求该叫我"。
+
+**已落地**（批次二）：`/evolve learn` 读 router-memory.json，按插件计 token 净得分
+（used:true +1 / used:false -1），得分 ≥1 的 token 合并进对应 manifest 的
+`triggers.keywords`（去重、上限 16、幂等），L0 确定性召回随之变准。
 
 ### 第三梯队：治理与安全
 
@@ -152,6 +176,29 @@ manifest 声明 `capabilities`（shell / 网络 / 写宿主文件等），permis
 ```
 
 其余（晋升阶梯、triggers 回写、能力分级、session/end hook）均为循环跑通后的加固项。
+
+## 6. 批次二加固（✅ 已落地，spec 见 docs/specs/evolve-batch2.md）
+
+1. **SFT 导出**：`/evolve export [limit]` 将干净会话轨迹（去 steering/system
+   meta、≥4 条消息、单条截断 20k）覆盖写 `.flavorlite/evolve/sft.jsonl`，
+   供蒸馏/微调管道直接消费；
+2. **技能晋升阶梯**：`/distill promote <slug>`（见 3.6）；
+3. **triggers 回写**：`/evolve learn`（见 3.7）；
+4. **信号联动**：evolve 消费 error-monitor 高置信度分析（见 3.5）。
+
+待办：manifest provenance（origin/generatedFrom）、统一 telemetry 服务、
+自产插件能力分级（3.8）、进化预算熔断（3.9）。
+
+## 7. 批次三：晋升阶梯全通（✅ 已落地，spec 见 docs/specs/knowledge-promoter.md）
+
+新插件 `knowledge-promoter`（eager、无 LLM 依赖）补齐 3.6 剩余两段：
+memory→skill 提议与 `/ladder to-skill` 转化、skill→plugin 使用度追踪与
+`/ladder to-plugin` 转化。至此三层知识形态（memory/skill/plugin）全链路可流动：
+
+```
+memory 积累 → /ladder to-skill → SKILL.md 草稿 → /distill promote → curated 技能
+技能反复使用 → /ladder to-plugin → 脚手架+PLAN.md → verify/reload/test → 新能力
+```
 
 ## 附：相关现有资产索引
 

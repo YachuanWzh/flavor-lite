@@ -230,4 +230,36 @@ describe("skill-distiller plugin", () => {
     expect(removed.toLowerCase()).toContain("removed");
     expect(await listSkillDirs()).not.toContain("deploy-to-staging");
   });
+
+  it("/distill promote upgrades a generated skill to curated", async () => {
+    await setup(VALID_REPLY);
+    await endRun(finishedRun(10));
+
+    const commands = runtime.ctx.get("commands") as CommandsService;
+    const promoted = (await commands.execute("/distill promote deploy-to-staging")) ?? "";
+    expect(promoted.toLowerCase()).toContain("promoted");
+
+    const content = await readFile(join(dir, ".flavorlite", "skills", "deploy-to-staging", "SKILL.md"), "utf-8");
+    expect(content).toContain("generated: false");
+    expect(content).toContain("promoted: true");
+    expect(content).toContain("promotedAt:");
+
+    // Promoted skills are protected from rm and free their generation quota.
+    const refused = (await commands.execute("/distill rm deploy-to-staging")) ?? "";
+    expect(refused.toLowerCase()).toContain("not generated");
+    const listing = (await commands.execute("/distill")) ?? "";
+    expect(listing).toContain("(promoted)");
+    expect(listing).toContain("generated skills: 0/");
+  });
+
+  it("/distill promote refuses non-generated skills and unknown slugs", async () => {
+    await setup(VALID_REPLY);
+    await writeSkill("human-skill", "---\nname: Human\ndescription: hand-written\n---\nbody");
+
+    const commands = runtime.ctx.get("commands") as CommandsService;
+    const refused = (await commands.execute("/distill promote human-skill")) ?? "";
+    expect(refused.toLowerCase()).toContain("refusing");
+    const unknown = (await commands.execute("/distill promote ghost")) ?? "";
+    expect(unknown).toContain("no skill named");
+  });
 });

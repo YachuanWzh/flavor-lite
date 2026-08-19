@@ -64,7 +64,7 @@ function parseDistillReply(raw) {
   }
 }
 
-/** Enumerate skills on disk: [{ slug, generated }] (dirs with a SKILL.md). */
+/** Enumerate skills on disk: [{ slug, generated, promoted }] (dirs with a SKILL.md). */
 async function listSkills(skillsDir) {
   let entries;
   try {
@@ -76,7 +76,11 @@ async function listSkills(skillsDir) {
   for (const slug of entries) {
     try {
       const raw = await readFile(join(skillsDir, slug, "SKILL.md"), "utf-8");
-      skills.push({ slug, generated: /generated:\s*true/.test(raw) });
+      skills.push({
+        slug,
+        generated: /generated:\s*true/.test(raw),
+        promoted: /promoted:\s*true/.test(raw),
+      });
     } catch {
       // entry without SKILL.md is not a skill
     }
@@ -216,9 +220,28 @@ export default {
       disposers.push(
         ctx.get("commands").register({
           name: "distill",
-          description: "Manage generated skills: /distill lists them, /distill rm <slug> removes one",
+          description: "Manage generated skills: /distill lists them, /distill promote <slug> curates one, /distill rm <slug> removes one",
           async run(args) {
             const arg = String(args ?? "").trim();
+
+            if (arg.startsWith("promote ")) {
+              const slug = slugify(arg.slice(8).trim());
+              if (!slug) return "usage: /distill promote <skill-slug>";
+              const existing = await listSkills(skillsDir);
+              const entry = existing.find((skill) => skill.slug === slug);
+              if (!entry) return `no skill named "${slug}"`;
+              if (!entry.generated) return `refusing: "${slug}" is not a generated skill`;
+              // Promotion is the human gate of the generated -> curated rung:
+              // the skill leaves the generation quota and rm-protection scope.
+              const skillFile = join(skillsDir, slug, "SKILL.md");
+              const raw = await readFile(skillFile, "utf-8");
+              const upgraded = raw.replace(
+                /^generated:\s*true\s*$/m,
+                `generated: false\npromoted: true\npromotedAt: ${new Date().toISOString()}`,
+              );
+              await writeFile(skillFile, upgraded, "utf-8");
+              return `promoted "${slug}" to curated (no longer counted against the generated cap, protected from /distill rm)`;
+            }
 
             if (arg.startsWith("rm ")) {
               const slug = slugify(arg.slice(3).trim());
@@ -236,7 +259,7 @@ export default {
             const generated = existing.filter((skill) => skill.generated);
             return [
               `generated skills: ${generated.length}/${maxGenerated}`,
-              ...existing.map((skill) => `- ${skill.slug}${skill.generated ? " (generated)" : ""}`),
+              ...existing.map((skill) => `- ${skill.slug}${skill.generated ? " (generated)" : skill.promoted ? " (promoted)" : ""}`),
             ].join("\n");
           },
         }),

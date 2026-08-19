@@ -1,0 +1,12 @@
+{
+  "name": "knowledge-promoter",
+  "version": "0.1.0",
+  "entry": "index.js",
+  "description": "promotion ladder: proposes memory->skill and skill->plugin promotions (/ladder)",
+  "provides": ["knowledgePromoter"],
+  "config": {
+    "memoryTopicThreshold": 3,
+    "skillUsageThreshold": 3,
+    "maxProposals": 8
+  }
+}

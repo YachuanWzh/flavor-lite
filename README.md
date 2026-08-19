@@ -98,7 +98,14 @@ A bounded, human-gated improvement loop lives entirely in disk plugins on the
 standard seams: repeated tool failures become fix suggestions, recurring
 success sequences are proposed as new tools, fixes can be distilled into
 permanent prompt rules (`rules.md`), successful sessions are distilled into
-reusable `SKILL.md` SOPs, and finished task plans are archived for reuse. See
+reusable `SKILL.md` SOPs, and finished task plans are archived for reuse.
+Beyond reacting to failures, a **knowledge promotion ladder**
+(`knowledge-promoter` plugin) proposes and converts upgrades between knowledge
+forms — repeated memory topics become `SKILL.md` drafts, heavily used skills
+become plugin scaffolds (`/ladder to-skill`, `/ladder to-plugin`) — while
+`/evolve export` writes clean SFT trajectories, `/evolve learn` writes
+confirmed router-recall tokens back into plugin manifests, and `/evolve
+suggest` merges analyzed error-monitor records into its proposals. See
 `docs/self-evolve.md` and the specs in `docs/specs/`.
 
 ### Extension points
@@ -170,9 +177,9 @@ Configuration merges from (low → high): `~/.flavorlite/config.json`,
 ## Development
 
 ```bash
-npm test          # 304 tests: kernel (42), loop, permission, session, compaction,
+npm test          # 320 tests: kernel (42), loop, permission, session, compaction,
                   # plus disk plugins, router, memory, error-monitor, subagent,
-                  # skill-distiller, task-planner, evolve, ...
+                  # skill-distiller, task-planner, evolve, knowledge-promoter, ...
 npm run typecheck # strict + noUncheckedIndexedAccess
 npm run build     # tsup → dist/ (index + cli)
 ```

@@ -34,8 +34,9 @@
 // the manifest `config` object is passed straight through as apply()'s
 // second argument.
 
-import { writeFile } from "node:fs/promises";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { spawn } from "node:child_process";
+import { join } from "node:path";
 import { EvolveStore } from "./store.js";
 
 const DEFAULT_PROMPT_TOP = 3;
@@ -43,6 +44,11 @@ const MIN_REPEATS = 2;
 const PATTERN_THRESHOLD = 3;
 const DEFAULT_PATTERN_TOP = 2;
 const TEST_TIMEOUT_MS = 120000;
+const DEFAULT_EXPORT_LIMIT = 20;
+const MAX_CONTENT_CHARS = 20000;
+const MIN_EXPORT_MESSAGES = 4;
+const DEFAULT_EM_CONFIDENCE = 0.7;
+const MAX_TRIGGER_KEYWORDS = 16;
 
 const SUGGEST_SECTION = `# self-improvement suggestions (evolve plugin)
 
@@ -66,6 +72,31 @@ Rules below were distilled from past fixes and always apply:
 function sanitizePluginName(tool) {
   const base = String(tool ?? "fix").replace(/[^a-z0-9_-]/gi, "-").toLowerCase();
   return base.startsWith("fix-") ? base : `fix-${base}`;
+}
+
+/**
+ * Read error-monitor records carrying a high-confidence LLM analysis. This is
+ * the signal link between the two plugins: error-monitor does the deep
+ * analysis, evolve turns confirmed insights into actionable suggestions.
+ * Tolerant read — a missing/corrupt log simply means no analyzed errors.
+ */
+async function readAnalyzedErrors(cwd, minConfidence) {
+  try {
+    const parsed = JSON.parse(await readFile(join(cwd, ".flavorlite", "error-monitor", "records.json"), "utf-8"));
+    const records = Array.isArray(parsed?.records) ? parsed.records : [];
+    return records
+      .filter((record) => typeof record?.analysis === "string" && record.analysis.trim() !== "")
+      .filter((record) => (typeof record.confidence === "number" ? record.confidence : 1) >= minConfidence)
+      .map((record) => ({
+        id: `em:${record.id}`,
+        tool: record.tool,
+        kind: record.kind ?? "unknown",
+        count: record.count ?? 1,
+        error: record.analysis,
+      }));
+  } catch {
+    return [];
+  }
 }
 
 /** Run one command with output capture; never throws. */
@@ -115,6 +146,8 @@ export default {
         ? config.testCommand
         : "npm test";
       const testTimeoutMs = Number.isFinite(config.testTimeoutMs) ? config.testTimeoutMs : TEST_TIMEOUT_MS;
+      const exportLimit = Number.isFinite(config.exportLimit) ? config.exportLimit : DEFAULT_EXPORT_LIMIT;
+      const emConfidence = Number.isFinite(config.emConfidence) ? config.emConfidence : DEFAULT_EM_CONFIDENCE;
 
       const store = new EvolveStore({ cwd: ctx.cwd });
       const disposers = [];
@@ -260,9 +293,12 @@ export default {
             const suggestionId = String(args?.suggestionId ?? "");
             const implementation = String(args?.implementation ?? "");
             const kind = args?.kind === "prompt_rule" ? "prompt_rule" : "plugin";
+            const doneIds = new Set(await store.readDoneIds());
+            const analyzed = (await readAnalyzedErrors(ctx.cwd, emConfidence)).filter((entry) => !doneIds.has(entry.id));
             const suggestions = [
               ...(await store.openSuggestions({ threshold: minRepeats, limit: 100 })),
               ...(await store.openPatternSuggestions({ threshold: patternThreshold, limit: 100 })),
+              ...analyzed,
             ];
             const suggestion = suggestions.find((s) => s.id === suggestionId);
             if (!suggestion) {
@@ -363,14 +399,116 @@ export default {
             if (arg === "suggest") {
               const suggestions = await store.openSuggestions({ threshold: minRepeats, limit: 100 });
               const proposals = await store.openPatternSuggestions({ threshold: patternThreshold, limit: 100 });
-              if (suggestions.length === 0 && proposals.length === 0) {
+              const doneIds = new Set(await store.readDoneIds());
+              const analyzed = (await readAnalyzedErrors(ctx.cwd, emConfidence)).filter((entry) => !doneIds.has(entry.id));
+              if (suggestions.length === 0 && proposals.length === 0 && analyzed.length === 0) {
                 return "no open suggestions (need >= 2 repeats of the same failure, or a recurring success trigram)";
               }
               const lines = suggestions.map((s) => `[${s.id}] ${s.tool} x${s.count}: ${s.error}\n  fix idea: ${s.hint}`);
               for (const p of proposals) {
                 lines.push(`[${p.id}] (tool proposal) ${p.sequence.join("->")} x${p.count}\n  fix idea: ${p.hint}`);
               }
+              for (const entry of analyzed) {
+                lines.push(`[${entry.id}] (analyzed error) ${entry.tool} x${entry.count}: ${entry.error}`);
+              }
               return lines.join("\n");
+            }
+
+            if (arg === "export" || arg.startsWith("export ")) {
+              const session = ctx.tryGet("session");
+              if (!session) return "no session service available (session plugin not loaded)";
+              const requested = arg.startsWith("export ") ? Number.parseInt(arg.slice(7).trim(), 10) : Number.NaN;
+              const limit = Number.isFinite(requested) && requested > 0 ? requested : exportLimit;
+              let infos = [];
+              try {
+                infos = await session.list();
+              } catch {
+                infos = [];
+              }
+              // Clean SFT trajectories: user/assistant only, no steering or
+              // system meta, bounded content. Sessions shorter than
+              // MIN_EXPORT_MESSAGES after filtering are incomplete runs.
+              const exported = [];
+              for (const info of infos.slice(0, limit)) {
+                try {
+                  const handle = await session.open(info.id);
+                  const messages = (handle.messages() ?? [])
+                    .filter((message) => message?.role === "user" || message?.role === "assistant")
+                    .filter((message) => typeof message.content === "string")
+                    .filter((message) => !(message.role === "user" && (message.content.startsWith("[steering]") || message.content.startsWith("[system]"))))
+                    .map((message) => ({ role: message.role, content: message.content.slice(0, MAX_CONTENT_CHARS) }));
+                  if (messages.length < MIN_EXPORT_MESSAGES) continue;
+                  exported.push({ sessionId: info.id, exportedAt: new Date().toISOString(), messages });
+                } catch {
+                  // unreadable session: skip it
+                }
+              }
+              const sftFile = join(store.dir, "sft.jsonl");
+              await mkdir(store.dir, { recursive: true });
+              const body = exported.map((record) => JSON.stringify(record)).join("\n");
+              await writeFile(sftFile, body ? `${body}\n` : "", "utf-8");
+              return exported.length === 0
+                ? `exported 0 sessions -> ${sftFile} (no session had >= ${MIN_EXPORT_MESSAGES} clean messages)`
+                : `exported ${exported.length} session(s) -> ${sftFile}`;
+            }
+
+            if (arg === "learn") {
+              // triggers write-back: router-memory.json already records which
+              // fingerprints recalled which plugin and whether the recall was
+              // actually used. Confirmed tokens (net score >= 1) become L0
+              // manifest keywords so the plugin recalls deterministically.
+              const memoryFile = join(ctx.cwd, ".flavorlite", "router-memory.json");
+              let memory;
+              try {
+                memory = JSON.parse(await readFile(memoryFile, "utf-8"));
+              } catch {
+                memory = undefined;
+              }
+              if (!Array.isArray(memory) || memory.length === 0) {
+                return "no router feedback memory found (.flavorlite/router-memory.json)";
+              }
+              const scores = new Map(); // plugin name -> Map<token, net score>
+              for (const entry of memory) {
+                if (!entry || typeof entry.plugin !== "string" || !Array.isArray(entry.fp)) continue;
+                let tokens = scores.get(entry.plugin);
+                if (!tokens) {
+                  tokens = new Map();
+                  scores.set(entry.plugin, tokens);
+                }
+                for (const token of new Set(entry.fp)) {
+                  if (typeof token !== "string" || token.length < 2) continue;
+                  tokens.set(token, (tokens.get(token) ?? 0) + (entry.used === true ? 1 : -1));
+                }
+              }
+              const lines = [];
+              for (const status of loader.list()) {
+                const tokens = scores.get(status.name);
+                if (!tokens) continue;
+                const candidates = [...tokens.entries()]
+                  .filter(([, score]) => score >= 1)
+                  .map(([token]) => token)
+                  .sort();
+                if (candidates.length === 0) continue;
+                const manifestFile = join(status.dir, "flavor-plugin.json");
+                try {
+                  const manifest = JSON.parse(await readFile(manifestFile, "utf-8"));
+                  const existing = Array.isArray(manifest.triggers?.keywords) ? manifest.triggers.keywords : [];
+                  const seen = new Set(existing.map((keyword) => String(keyword).toLowerCase()));
+                  const additions = candidates.filter((token) => !seen.has(token.toLowerCase()));
+                  if (additions.length === 0) continue;
+                  manifest.triggers = {
+                    ...(manifest.triggers ?? {}),
+                    keywords: [...existing, ...additions].slice(0, MAX_TRIGGER_KEYWORDS),
+                  };
+                  await writeFile(manifestFile, `${JSON.stringify(manifest, null, 2)}\n`, "utf-8");
+                  lines.push(`learned triggers: ${status.name} +[${additions.join(", ")}]`);
+                } catch {
+                  // manifest missing or unwritable: skip this plugin (fail-safe)
+                }
+              }
+              return lines.length > 0
+                ? lines.join("\n")
+                : "no new triggers learned (nothing scored >= 1, or all candidates already present)";
             }
 
             if (arg === "test") {
@@ -438,14 +576,16 @@ export default {
             }
 
             return [
-              "usage: /evolve <signals|suggest|improve <id>|verify <plugin>|revert <plugin>|test|clear|done <id>>",
+              "usage: /evolve <signals|suggest|improve <id>|verify <plugin>|revert <plugin>|test|clear|done <id>|export [limit]|learn>",
               "  signals   list recent failing tool results",
-              "  suggest   aggregate repeated failures and recurring success trigrams into suggestions",
+              "  suggest   aggregate repeated failures, recurring success trigrams and analyzed error-monitor records into suggestions",
               "  improve   scaffold a plugin dir for one suggestion",
               "  verify    sandbox dry-run a plugin before activating it",
               "  revert    restore the last good snapshot of a plugin",
               "  test      run the test suite (npm test)",
               "  clear     reset signals, patterns and done markers",
+              "  export    write clean session trajectories to .flavorlite/evolve/sft.jsonl",
+              "  learn     write confirmed router-recall tokens back into plugin manifests",
             ].join("\n");
           },
         }),
