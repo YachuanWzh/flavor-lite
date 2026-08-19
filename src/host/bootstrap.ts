@@ -20,6 +20,7 @@ import { commandsPlugin } from "../plugins/commands";
 import { initPlugin } from "../plugins/init";
 import { pluginsLoaderPlugin } from "../plugins/plugins";
 import { routerPlugin } from "../plugins/router";
+import { telemetryPlugin } from "../plugins/telemetry";
 import { loadConfig, type FlavorConfig } from "./config";
 
 export interface BootstrapOptions {
@@ -84,7 +85,10 @@ export function createAgent(options: BootstrapOptions = {}): AgentHandle {
     .use(pluginsLoaderPlugin, { runtime })
     // On-demand recall + idle ejection for dynamic plugins. Mounted after
     // the loader so its hooks wrap every request and tool call.
-    .use(routerPlugin);
+    .use(routerPlugin)
+    // Unified signal feed (JSONL). Mounted last so its prepended tool hook
+    // stays outermost and sees the final policy decision of every call.
+    .use(telemetryPlugin);
   for (const extra of options.plugins ?? []) runtime.use(extra.plugin, extra.config);
   runtime.start();
 

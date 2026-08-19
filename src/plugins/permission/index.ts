@@ -16,6 +16,7 @@
 import { definePlugin } from "../../kernel";
 import type { PluginContext } from "../../kernel/types";
 import type { HookBusService } from "../hooks";
+import type { PluginCapability, PluginOrigin } from "../plugins";
 import type { PromptAssemble } from "../prompt";
 import { isWithinWorkspace, resolveToolPath } from "../tools/builtin/paths";
 import type { BeforeToolCall, ToolCategory } from "../tools/registry";
@@ -27,6 +28,16 @@ export type PermissionMode = (typeof PERMISSION_MODES)[number];
 export interface InteractionService {
   ask(question: string): Promise<string | undefined>;
   confirm(question: string): Promise<boolean>;
+}
+
+/**
+ * The subset of the plugins loader governance needs. Typed structurally so
+ * tests (and alternative loaders) can stand in without the full service.
+ */
+export interface PluginGovernanceSource {
+  ownerOfTool(toolName: string):
+    | { name: string; origin: PluginOrigin; capabilities?: PluginCapability[] }
+    | undefined;
 }
 
 export interface PermissionService {
@@ -146,6 +157,22 @@ function blockedInPlan(category: ToolCategory): boolean {
   return category === "write" || category === "shell";
 }
 
+/**
+ * Capability tiering for generated plugins (3.8): each risky tool category
+ * maps to a manifest capability; read/control stay ungated. "network" and
+ * "host" are declared-and-displayed only — no per-call seam observes them.
+ */
+function capabilityForCategory(category: ToolCategory): PluginCapability | undefined {
+  switch (category) {
+    case "shell":
+      return "shell";
+    case "write":
+      return "files";
+    default:
+      return undefined;
+  }
+}
+
 export const permissionPlugin = definePlugin<PermissionPluginConfig>({
   name: "permission",
   inject: ["hooks", "tools"],
@@ -174,6 +201,46 @@ export const permissionPlugin = definePlugin<PermissionPluginConfig>({
           event.block = true;
           event.reason = "Permission mode is plan (read-only). Switch with /permissions to make changes.";
           return event;
+        }
+
+        // Capability tiering: tools owned by a generated plugin follow the
+        // manifest contract. Undeclared capabilities are refused in every
+        // mode (bypass included — it is a provenance contract, not a mode);
+        // declared ones always ask first, once per plugin+capability+scope.
+        const capability = capabilityForCategory(category);
+        if (capability) {
+          const governance = ctx.tryGet("pluginsLoader") as PluginGovernanceSource | undefined;
+          const owner = governance?.ownerOfTool(event.toolCall.name);
+          if (owner?.origin === "generated") {
+            if (!(owner.capabilities ?? []).includes(capability)) {
+              event.block = true;
+              event.reason =
+                `Generated plugin "${owner.name}" does not declare capability "${capability}". ` +
+                `Add it to the manifest "capabilities" to allow ${category} actions.`;
+              return event;
+            }
+            if (mode !== "bypass") {
+              const approvalKey = `generated:${owner.name}:${capability}:${toolPathScope(ctx, event.args)}`;
+              if (!service.isApproved(approvalKey)) {
+                const interaction = ctx.tryGet("interaction") as InteractionService | undefined;
+                if (!interaction) {
+                  event.block = true;
+                  event.reason = `${category} action by generated plugin "${owner.name}" requires approval and no interaction service is available.`;
+                  return event;
+                }
+                const approved = await interaction.confirm(
+                  `Allow ${event.toolCall.name} (${category}) from generated plugin "${owner.name}"?`,
+                );
+                if (!approved) {
+                  event.block = true;
+                  event.reason = "Denied by user.";
+                  return event;
+                }
+                service.approve(approvalKey);
+              }
+              return next(event); // governed approval supersedes the mode gate
+            }
+          }
         }
 
         if (!autoApprovedInMode(mode, category)) {

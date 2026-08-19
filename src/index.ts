@@ -91,6 +91,8 @@ export type {
 } from "./plugins/plugins";
 export { routerPlugin, tokenize, fingerprint } from "./plugins/router";
 export type { RouterPluginConfig, RouterService } from "./plugins/router";
+export { telemetryPlugin } from "./plugins/telemetry";
+export type { TelemetryEvent, TelemetryPluginConfig, TelemetryQuery, TelemetryService } from "./plugins/telemetry";
 
 // host composition
 export { createAgent } from "./host/bootstrap";

@@ -52,9 +52,31 @@ Directories without a `flavor-plugin.json` are ignored.
 | `entry` | no | Entry file relative to the plugin dir; default `index.js` |
 | `description` | no | Human-readable summary |
 | `config` | no | JSON object passed as the `config` argument of every plugin's `apply(ctx, config)` |
+| `origin` | no | `"user"` (default, human-written) or `"generated"` (scaffolded by the agent). The permission engine holds generated plugins to tighter defaults |
+| `generatedFrom` | no | Provenance of a generated plugin: session id or ISO timestamp |
+| `capabilities` | no | Array of `"shell"` / `"network"` / `"files"` / `"host"` a generated plugin may exercise (see capability tiering below) |
 
 Invalid JSON or a missing `name` marks the plugin `error` in `/plugin list`;
 the rest of the host keeps running.
+
+### Capability tiering for generated plugins
+
+The loader tracks which plugin registered each tool (`ownerOfTool`). The
+permission engine then applies a manifest contract to tools owned by
+`origin: "generated"` plugins, in every mode:
+
+- **Undeclared capability → blocked.** Tool category `shell` requires the
+  `"shell"` capability; category `write` requires `"files"`. A generated
+  plugin without `capabilities` is read-only by default.
+- **Declared capability → forced approval.** The first call per
+  plugin+capability+path-scope asks the user, even in `acceptEdits`.
+  Only `bypass` skips the prompt (never the undeclared-capability block).
+- `"network"` and `"host"` are declared-and-displayed only — no per-call
+  seam observes them today; `/plugin list` shows them next to the plugin.
+
+`read` and `control` category tools are ungated. The scaffolds written by
+`/evolve improve` and `/ladder to-plugin` already stamp `origin` /
+`generatedFrom`; add `capabilities` yourself when the plugin needs them.
 
 ## Entry module contract
 
@@ -129,6 +151,7 @@ plugin loads):
 | `skills` | `discover()` | Skill discovery |
 | `interaction` | terminal ask/confirm (when mounted) | Interactive prompts |
 | `pluginsLoader` | `init/reload/list/scaffold` | Meta: manage plugins |
+| `telemetry` | `record(event)` / `events(query?)` | Unified signal feed (.flavorlite/telemetry.jsonl); fire-and-forget, never throws |
 | `repl` | `registerCompleter(provider)` → disposer | Add `/`-completion candidates in the REPL |
 
 `repl` exists only while the interactive REPL is running (not in one-shot

@@ -24,6 +24,7 @@ import type { Message } from "../../shared/messages";
 import type { HookBusService } from "../hooks";
 import type { BeforeLoopRequest, LoopAfterRun } from "../loop";
 import type { PluginsLoaderService, PluginStatus } from "../plugins";
+import type { TelemetryService } from "../telemetry";
 import type { ToolRegistry, BeforeToolCall, AfterToolCall } from "../tools";
 
 export interface RouterPluginConfig {
@@ -278,6 +279,11 @@ class Router implements RouterService {
     for (const entry of mounted) {
       if (!this.recalledRun.has(entry.name)) this.recalledRun.set(entry.name, { fp, level: entry.level });
     }
+    this.telemetry()?.record({
+      type: "router.recall",
+      plugins: mounted.map((entry) => entry.name),
+      levels: mounted.map((entry) => entry.level),
+    });
     const summary = mounted
       .map(({ name }) => {
         const status = this.loader.list().find((entry) => entry.name === name);
@@ -376,16 +382,26 @@ class Router implements RouterService {
 
   private async recordFeedback(): Promise<void> {
     await this.ensureMemory();
+    const recorded: Array<{ plugin: string; used: boolean; level: RecallLevel }> = [];
     for (const [name, record] of this.recalledRun) {
       const used = this.l2UsedRun.has(name) || this.pluginUsedByTools(name);
       // An author-declared trigger (L0) is a precise recall: the model simply
       // not calling the tool is no evidence against it, so never demote L0.
       if (!used && record.level === "L0") continue;
       this.memory.push({ fp: record.fp, plugin: name, used });
+      recorded.push({ plugin: name, used, level: record.level });
+    }
+    if (recorded.length > 0) {
+      this.telemetry()?.record({ type: "router.feedback", entries: recorded });
     }
     this.memory = this.memory.slice(-MEMORY_LIMIT);
     await mkdir(dirname(this.memoryPath), { recursive: true });
     await writeFile(this.memoryPath, JSON.stringify(this.memory), "utf-8");
+  }
+
+  /** Shared signal feed; optional — routing works without it. */
+  private telemetry(): TelemetryService | undefined {
+    return this.ctx.tryGet("telemetry") as TelemetryService | undefined;
   }
 
   private pluginUsedByTools(name: string): boolean {

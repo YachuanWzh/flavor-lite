@@ -25,6 +25,7 @@ import { definePlugin, errorMessage } from "../../kernel";
 import type { Plugin, PluginContext } from "../../kernel/types";
 import { Runtime } from "../../kernel/runtime";
 import type { CommandsService } from "../commands";
+import type { ToolRegistry } from "../tools";
 import { PLUGIN_TEMPLATE_FILES } from "./template";
 
 const MANIFEST_FILE = "flavor-plugin.json";
@@ -46,6 +47,19 @@ const triggersSchema = z.object({
 
 export type PluginTriggers = z.infer<typeof triggersSchema>;
 
+/** Capabilities a generated plugin may exercise (manifest contract). */
+export const PLUGIN_CAPABILITIES = ["shell", "network", "files", "host"] as const;
+export type PluginCapability = (typeof PLUGIN_CAPABILITIES)[number];
+export type PluginOrigin = "user" | "generated";
+
+/** Governance view of the plugin that registered a tool (see ownerOfTool). */
+export interface ToolOwnerInfo {
+  name: string;
+  origin: PluginOrigin;
+  capabilities?: PluginCapability[];
+  generatedFrom?: string;
+}
+
 const manifestSchema = z.object({
   name: z.string().min(1),
   version: z.string().optional(),
@@ -65,6 +79,22 @@ const manifestSchema = z.object({
   provides: z.array(z.string()).optional(),
   /** Passed as the `config` argument of every plugin's apply(). */
   config: z.record(z.string(), z.unknown()).optional(),
+  /**
+   * Provenance: "user" plugins are written by a human; "generated" ones were
+   * scaffolded by the agent (evolve_improve / /ladder to-plugin). The
+   * permission plugin holds generated plugins to tighter defaults, so the
+   * marker is the hook governance hangs off.
+   */
+  origin: z.enum(["user", "generated"]).default("user"),
+  /** Where a generated plugin came from: session id or ISO timestamp. */
+  generatedFrom: z.string().optional(),
+  /**
+   * Capabilities a generated plugin may exercise: "shell" (run commands),
+   * "network" (reach the internet), "files" (write files), "host" (control
+   * the machine). The permission plugin refuses undeclared ones, so a
+   * generated plugin without this field is read-only by default.
+   */
+  capabilities: z.array(z.enum(PLUGIN_CAPABILITIES)).optional(),
 });
 
 export type PluginManifest = z.infer<typeof manifestSchema>;
@@ -101,6 +131,12 @@ export interface PluginStatus {
   provides: string[];
   /** Service keys declared by the loaded plugins' `inject`. */
   inject: string[];
+  /** Provenance marker from the manifest; permission governs "generated" tighter. */
+  origin: PluginOrigin;
+  /** Provenance of generated plugins (session id or timestamp). */
+  generatedFrom?: string;
+  /** Declared capabilities of generated plugins (shell/network/files/host). */
+  capabilities?: PluginCapability[];
 }
 
 export interface PluginsLoaderConfig {
@@ -140,6 +176,12 @@ export interface PluginsLoaderService {
    * reload. Snapshots are taken on every successful activation.
    */
   revert(name: string): Promise<string>;
+  /**
+   * Governance lookup: the manifest info of the plugin that registered a
+   * tool, so permission can hold generated plugins to tighter defaults.
+   * Undefined for tools registered outside the disk loader (builtins).
+   */
+  ownerOfTool(toolName: string): ToolOwnerInfo | undefined;
 }
 
 interface DiscoveredPlugin {
@@ -174,6 +216,8 @@ class PluginsLoader implements PluginsLoaderService {
   private initialized = false;
   /** Catalog of the last scan; ensure() resolves deps against it. */
   private discoveredCache: DiscoveredPlugin[] = [];
+  /** Tool name -> manifest name of the plugin that registered it. */
+  private toolOwners = new Map<string, string>();
   private readonly watchEnabled: boolean;
   private readonly watchDebounceMs: number;
   private readonly watchedRoots = new Set<string>();
@@ -406,6 +450,7 @@ class PluginsLoader implements PluginsLoaderService {
             error: `invalid ${MANIFEST_FILE}: ${errorMessage(error)}`,
             provides: [],
             inject: [],
+            origin: "user",
           });
           continue;
         }
@@ -558,11 +603,15 @@ class PluginsLoader implements PluginsLoaderService {
     try {
       for (const plugin of plugins) {
         // Runtime is started at this point, so use() activates immediately.
+        const toolsBefore = this.registeredToolNames();
         this.runtime.use(plugin, target.manifest.config as never);
+        // Plugins with async apply() fail via ready, not via use().
+        await this.runtime.ready;
+        // Attribute tools registered during activation to this manifest, so
+        // permission can govern them by origin/capabilities (3.8).
+        this.attributeNewTools(toolsBefore, target.manifest.name);
         mounted.push(plugin.name);
       }
-      // Plugins with async apply() fail via ready, not via use().
-      await this.runtime.ready;
     } catch (error) {
       for (const mountedName of mounted.reverse()) await this.runtime.unmount(mountedName);
       this.failImport(target, `activation failed: ${errorMessage(error)}`);
@@ -583,6 +632,37 @@ class PluginsLoader implements PluginsLoaderService {
 
   private versionsRoot(): string {
     return join(this.ctx.cwd, ".flavorlite", "plugins", ".versions");
+  }
+
+  private toolRegistry(): ToolRegistry | undefined {
+    return this.ctx.tryGet("tools") as ToolRegistry | undefined;
+  }
+
+  private registeredToolNames(): Set<string> {
+    const registry = this.toolRegistry();
+    return new Set(registry ? registry.list().map((tool) => tool.name) : []);
+  }
+
+  /** Map every tool added since `before` to the owning manifest name. */
+  private attributeNewTools(before: Set<string>, owner: string): void {
+    const registry = this.toolRegistry();
+    if (!registry) return;
+    for (const tool of registry.list()) {
+      if (!before.has(tool.name)) this.toolOwners.set(tool.name, owner);
+    }
+  }
+
+  ownerOfTool(toolName: string): ToolOwnerInfo | undefined {
+    const owner = this.toolOwners.get(toolName);
+    if (!owner) return undefined;
+    const status = this.records.get(owner)?.status;
+    if (!status || status.status !== "loaded") return undefined;
+    return {
+      name: owner,
+      origin: status.origin,
+      ...(status.capabilities ? { capabilities: status.capabilities } : {}),
+      ...(status.generatedFrom ? { generatedFrom: status.generatedFrom } : {}),
+    };
   }
 
   /** Copy the plugin dir into .versions/<name>/<iso-stamp>, newest last. */
@@ -654,6 +734,9 @@ class PluginsLoader implements PluginsLoaderService {
       ...(manifest.triggers ? { triggers: manifest.triggers } : {}),
       provides: plugins ? plugins.flatMap((plugin) => plugin.provides ?? []) : [],
       inject: plugins ? [...new Set(plugins.flatMap((plugin) => plugin.inject ?? []))] : [],
+      origin: manifest.origin,
+      ...(manifest.generatedFrom ? { generatedFrom: manifest.generatedFrom } : {}),
+      ...(manifest.capabilities ? { capabilities: manifest.capabilities } : {}),
     };
   }
 
@@ -686,7 +769,11 @@ class PluginsLoader implements PluginsLoaderService {
       });
       return;
     }
-    // Back to the catalog as unloaded: eject/reload can pick it up again.
+    // Fully unloaded: drop tool ownership so a reincarnation never inherits
+    // stale governance, and back to the catalog the record goes.
+    for (const [toolName, owner] of [...this.toolOwners]) {
+      if (owner === name) this.toolOwners.delete(toolName);
+    }
     this.records.set(name, {
       status: { ...record.status, status: "unloaded", provides: [], inject: [] },
       pluginNames: [],
@@ -856,6 +943,7 @@ function buildStub(key: string, sink: { tools: string[]; commands: string[] }): 
         revert: async (): Promise<string> => {
           throw new Error("verify sandbox: disk writes are disabled");
         },
+        ownerOfTool: () => undefined,
       };
     default:
       return permissiveStub();
@@ -939,14 +1027,16 @@ function registerPluginCommand(ctx: PluginContext, loader: PluginsLoader): () =>
           if (statuses.length === 0) return "no plugins found (.flavorlite/plugins/ is empty)";
           return statuses
             .map((status) => {
-              const flags = `[${status.scope}]${status.activation === "dynamic" ? " [dynamic]" : ""}`;
+              const flags =
+                `[${status.scope}]` +
+                `${status.activation === "dynamic" ? " [dynamic]" : ""}` +
+                `${status.origin === "generated" ? " [generated]" : ""}`;
               const head = `  ${status.name.padEnd(16)} ${status.version.padEnd(8)} ${status.status.padEnd(8)} ${flags}`;
+              const caps = status.capabilities && status.capabilities.length > 0 ? `\n    capabilities: ${status.capabilities.join(", ")}` : "";
               const detail =
                 status.status === "error"
                   ? `\n    error: ${status.error}`
-                  : status.provides.length > 0
-                    ? `\n    provides: ${status.provides.join(", ")}`
-                    : "";
+                  : (status.provides.length > 0 ? `\n    provides: ${status.provides.join(", ")}` : "") + caps;
               return head + detail;
             })
             .join("\n");

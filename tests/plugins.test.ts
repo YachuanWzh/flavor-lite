@@ -547,4 +547,58 @@ export default {
       expect(result.content).toBe("demo v1"); // hot swap still requires /plugin reload
     });
   });
+
+  describe("provenance and tool ownership", () => {
+    it("exposes origin/capabilities from the manifest in list()", async () => {
+      await writePlugin(
+        "demo",
+        { name: "demo", origin: "generated", generatedFrom: "sess-42", capabilities: ["files", "shell"] },
+        demoEntry("v1"),
+      );
+      createStack();
+      await loader.init();
+      const status = loader.list().find((entry) => entry.name === "demo");
+      expect(status?.origin).toBe("generated");
+      expect(status?.generatedFrom).toBe("sess-42");
+      expect(status?.capabilities).toEqual(["files", "shell"]);
+    });
+
+    it("defaults origin to user", async () => {
+      await writePlugin("demo", { name: "demo" }, demoEntry("v1"));
+      createStack();
+      await loader.init();
+      const status = loader.list().find((entry) => entry.name === "demo");
+      expect(status?.origin).toBe("user");
+      expect(status?.capabilities).toBeUndefined();
+    });
+
+    it("attributes registered tools to their owning plugin via ownerOfTool", async () => {
+      await writePlugin(
+        "demo",
+        { name: "demo", origin: "generated", capabilities: ["files"] },
+        demoEntry("v1"),
+      );
+      createStack();
+      await loader.init();
+
+      const owner = loader.ownerOfTool("demo_tool");
+      expect(owner).toEqual({ name: "demo", origin: "generated", capabilities: ["files"] });
+      // Tools nobody registered through the loader have no owner.
+      expect(loader.ownerOfTool("no_such_tool")).toBeUndefined();
+    });
+
+    it("drops tool ownership when the plugin is ejected", async () => {
+      await writePlugin("demo", { name: "demo", origin: "generated" }, demoEntry("v1"));
+      createStack();
+      await loader.init();
+      expect(loader.ownerOfTool("demo_tool")?.name).toBe("demo");
+
+      await loader.eject("demo");
+      expect(loader.ownerOfTool("demo_tool")).toBeUndefined();
+
+      // A reincarnation gets fresh attribution, never stale governance.
+      await loader.ensure("demo");
+      expect(loader.ownerOfTool("demo_tool")?.origin).toBe("generated");
+    });
+  });
 });

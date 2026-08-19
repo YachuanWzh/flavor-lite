@@ -330,6 +330,19 @@ export default {
               } catch (error) {
                 return `failed to scaffold plugin "${slug}": ${error instanceof Error ? error.message : String(error)}`;
               }
+              // Provenance: the promotion ladder is agent-driven, so mark the
+              // scaffold as generated (manifest schema supports origin).
+              try {
+                const manifestFile = join(dir, "flavor-plugin.json");
+                const manifest = await readJson(manifestFile, null);
+                if (manifest && typeof manifest === "object") {
+                  manifest.origin = "generated";
+                  manifest.generatedFrom = new Date().toISOString();
+                  await writeJson(manifestFile, manifest);
+                }
+              } catch {
+                // manifest missing: leave provenance to the caller
+              }
               const usage = await readJson(usageFile, {});
               const count = Number.isFinite(usage[slug]) ? usage[slug] : 0;
               try {
@@ -347,10 +360,11 @@ export default {
                     "## Implementation",
                     "",
                     "1. implement index.js per the create-flavor-plugin skill contract — automate the procedure above as a tool or command",
-                    `2. /evolve verify ${slug} (sandbox dry-run must pass before activation)`,
-                    `3. /plugin reload ${slug}`,
-                    "4. /evolve test",
-                    `5. on failure: /evolve revert ${slug} restores the last good version`,
+                    "2. declare capabilities in flavor-plugin.json if any tool needs them: \"files\" for tools that write files, \"shell\" for tools that run commands — undeclared capabilities are blocked by the permission engine for generated plugins",
+                    `3. /evolve verify ${slug} (sandbox dry-run must pass before activation)`,
+                    `4. /plugin reload ${slug}`,
+                    "5. /evolve test",
+                    `6. on failure: /evolve revert ${slug} restores the last good version`,
                     "",
                   ].join("\n"),
                   "utf-8",
@@ -364,9 +378,10 @@ export default {
                 ``,
                 `Now implement it yourself:`,
                 `1. Write the plugin entry (index.js) per PLAN.md — the skill body describes the procedure to automate.`,
-                `2. Run /evolve verify ${slug} — the sandbox dry-run must pass before activation.`,
-                `3. Run /plugin reload ${slug} to hot-load it.`,
-                `4. Run /evolve test to verify the suite still passes.`,
+                `2. If any tool writes files or runs commands, add "capabilities": ["files"] or ["shell"] to flavor-plugin.json (generated plugins are read-only until they declare capabilities).`,
+                `3. Run /evolve verify ${slug} — the sandbox dry-run must pass before activation.`,
+                `4. Run /plugin reload ${slug} to hot-load it.`,
+                `5. Run /evolve test to verify the suite still passes.`,
               ].join("\n");
             }
 

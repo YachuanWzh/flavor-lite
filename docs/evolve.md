@@ -99,6 +99,14 @@ router 目前只记录"召回后工具是否被调用"。更强的信号：
 evolve 插件共享消费——避免每个插件各自维护一份记忆文件
 （当前已有 router-memory.json、error-monitor/records.json、memory/MEMORY.md 三份割裂信号源）。
 
+**已落地统一 telemetry**（`src/plugins/telemetry/index.ts`）：内置插件提供
+`telemetry` 服务，所有信号汇入单一 JSONL 流（`.flavorlite/telemetry.jsonl`）：
+`tool.call` / `tool.blocked`（挂 tools/after-call 与 prepend 的 tools/before-call）、
+`run.end`（loop/after-run 全量载荷）、router 的 `router.recall` / `router.feedback`。
+`record()` 同步 fire-and-forget 永不抛错；滚动上限 5000 条；`/telemetry stats|show|clear`
+提供 24h 聚合视图。router-memory.json 等专职状态文件继续存在，但反思/治理插件
+从此有一个共享的只读信号面（`events(query)`）。
+
 **已落地的信号联动**（批次二）：evolve 直接读 error-monitor/records.json，
 将高置信度（≥ emConfidence，默认 0.7）LLM 分析记录并入 `/evolve suggest` 与
 `evolve_improve` 建议池（id 前缀 `em:`，复用 done.json 关闭），error-monitor 插件零改动。
@@ -140,12 +148,20 @@ docs/specs/knowledge-promoter.md）：
 
 ### 第三梯队：治理与安全
 
-#### 3.8 自产插件的能力分级
+#### 3.8 自产插件的能力分级（✅ 已落地）
 
 manifest 声明 `capabilities`（shell / 网络 / 写宿主文件等），permission 引擎对
 `origin: "generated"` 的插件默认收紧（如生成的 shell 工具强制 ask）。
 现有四模式权限引擎挂 `tools/before-call` 即可实现，无需动内核。
 更重的选项是 worker_threads 沙箱隔离，非必要不引入。
+
+**落地形态**：loader 在挂载时按工具注册 diff 追踪归属（`ownerOfTool`），
+`PluginStatus` 暴露 `origin/generatedFrom/capabilities`（`/plugin list` 显示
+`[generated]` 徽标与 capabilities）；permission 在 `tools/before-call` 执行
+manifest 契约——shell/write 类工具未声明对应 capability 在任何模式（含 bypass）
+直接拒绝，已声明则每 plugin+capability+路径作用域强制 ask 一次；
+read/control 不设卡，network/host 仅声明展示。脚手架（`/evolve improve`、
+`/ladder to-plugin`）输出中已带 capabilities 声明指引。
 
 #### 3.9 进化预算与熔断
 
@@ -186,8 +202,8 @@ manifest 声明 `capabilities`（shell / 网络 / 写宿主文件等），permis
 3. **triggers 回写**：`/evolve learn`（见 3.7）；
 4. **信号联动**：evolve 消费 error-monitor 高置信度分析（见 3.5）。
 
-待办：manifest provenance（origin/generatedFrom）、统一 telemetry 服务、
-自产插件能力分级（3.8）、进化预算熔断（3.9）。
+待办：进化预算熔断（3.9）。manifest provenance（origin/generatedFrom）、
+统一 telemetry 服务、自产插件能力分级（3.8）均已落地。
 
 ## 7. 批次三：晋升阶梯全通（✅ 已落地，spec 见 docs/specs/knowledge-promoter.md）
 
@@ -200,6 +216,15 @@ memory 积累 → /ladder to-skill → SKILL.md 草稿 → /distill promote → 
 技能反复使用 → /ladder to-plugin → 脚手架+PLAN.md → verify/reload/test → 新能力
 ```
 
+## 8. 批次四：信号合一与能力分级（✅ 已落地）
+
+1. **统一 telemetry 服务**（见 3.5）：单一 JSONL 信号流 + `/telemetry` 聚合命令，
+   router 的召回/反馈同步写入；
+2. **自产插件能力分级**（见 3.8）：origin 字段消费落地——loader 工具归属追踪 +
+   permission manifest 契约门禁（未声明即拒、已声明强 ask）。
+
+待办仅剩：进化预算与熔断（3.9）。
+
 ## 附：相关现有资产索引
 
 | 资产 | 位置 | 在自进化中的角色 |
@@ -208,6 +233,7 @@ memory 积累 → /ladder to-skill → SKILL.md 草稿 → /distill promote → 
 | router | `src/plugins/router/index.ts` | 选择层：三级召回 + 反馈降权封顶 + 空闲 eject |
 | hooks 总线 | `src/plugins/hooks/index.ts` | 全部进化行为的接缝载体 |
 | permission | `src/plugins/permission/index.ts` | 治理层：自产插件能力收紧的执行点 |
+| telemetry | `src/plugins/telemetry/index.ts` | 信号层：统一 JSONL 信号流（工具/运行/路由） |
 | create-flavor-plugin | `.flavorlite/skills/create-flavor-plugin/SKILL.md` | 生成层的知识基础（教模型写插件） |
 | memory 插件 | `.flavorlite/plugins/memory/` | 声明式知识沉淀 + 会话后 LLM 提取 |
 | error-monitor | `.flavorlite/plugins/error-monitor/` | 失败信号积累与分析 |

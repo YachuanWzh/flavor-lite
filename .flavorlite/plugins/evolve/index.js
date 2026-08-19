@@ -329,6 +329,20 @@ export default {
               };
             }
 
+            // Mark the scaffold as agent-generated (provenance): the manifest
+            // schema accepts origin/generatedFrom, so governance policies can
+            // distinguish human-written from self-produced plugins (3.4/3.8).
+            // Tolerant: a missing/unwritable manifest is not fatal.
+            try {
+              const manifestFile = join(dir, "flavor-plugin.json");
+              const manifest = JSON.parse(await readFile(manifestFile, "utf-8"));
+              manifest.origin = "generated";
+              manifest.generatedFrom = new Date().toISOString();
+              await writeFile(manifestFile, `${JSON.stringify(manifest, null, 2)}\n`, "utf-8");
+            } catch {
+              // manifest missing: leave provenance to the caller
+            }
+
             // Record the implementation plan next to the scaffold so the
             // running agent (and the human) can see what was intended.
             const subject = suggestion.tool ?? suggestion.sequence?.join("->") ?? "pattern";
@@ -566,12 +580,22 @@ export default {
               } catch (error) {
                 return `Failed to scaffold plugin: ${error instanceof Error ? error.message : String(error)}`;
               }
+              try {
+                const manifestFile = join(dir, "flavor-plugin.json");
+                const manifest = JSON.parse(await readFile(manifestFile, "utf-8"));
+                manifest.origin = "generated";
+                manifest.generatedFrom = new Date().toISOString();
+                await writeFile(manifestFile, `${JSON.stringify(manifest, null, 2)}\n`, "utf-8");
+              } catch {
+                // manifest missing: leave provenance to the caller
+              }
               const pluginName = sanitizePluginName(suggestion.tool);
               await store.markSuggestionDone(suggestion.id);
               return [
                 `suggestion ${suggestion.id}: ${suggestion.tool} x${suggestion.count} — ${suggestion.error}`,
                 `scaffolded plugin at ${dir}`,
                 `edit index.js to implement the fix, then run /evolve verify ${pluginName}, /plugin reload ${pluginName} and /evolve test`,
+                `note: generated plugins are read-only by default — if the fix needs file writes or shell commands, add "capabilities": ["files"] or ["shell"] to flavor-plugin.json`,
               ].join("\n");
             }
 

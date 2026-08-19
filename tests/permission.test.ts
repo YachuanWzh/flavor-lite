@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 import { Runtime, definePlugin } from "../src/kernel";
 import { hooksPlugin } from "../src/plugins/hooks";
 import { toolsPlugin, type Tool, type ToolRegistry } from "../src/plugins/tools";
-import { permissionPlugin, type InteractionService, type PermissionService } from "../src/plugins/permission";
+import { permissionPlugin, type InteractionService, type PermissionService, type PluginGovernanceSource } from "../src/plugins/permission";
 import type { PermissionMode } from "../src/plugins/permission";
 
 const writeTool: Tool = {
@@ -130,6 +130,92 @@ describe("permission plugin", () => {
     const result = await call(runtime, "FakeWrite", { path: "a.txt" });
     expect(result.isError).toBe(true);
     expect(result.content).toMatch(/denied/i);
+    await runtime.dispose();
+  });
+});
+
+/** Stand-in for the plugins loader: only the governance subset matters. */
+function governanceFor(
+  owner: { name: string; origin: "user" | "generated"; capabilities?: string[] } | undefined,
+): PluginGovernanceSource {
+  return {
+    ownerOfTool: () => (owner as ReturnType<PluginGovernanceSource["ownerOfTool"]>),
+  };
+}
+
+describe("permission capability tiering for generated plugins", () => {
+  it("blocks shell tools of generated plugins that never declared the capability, even in bypass", async () => {
+    const runtime = mount("bypass");
+    runtime.ctx.provide("pluginsLoader", governanceFor({ name: "auto-fix", origin: "generated" }));
+    const result = await call(runtime, "FakeShell", { command: "npm test" });
+    expect(result.isError).toBe(true);
+    expect(result.content).toMatch(/capability "shell"/);
+    expect(result.content).toMatch(/auto-fix/);
+    await runtime.dispose();
+  });
+
+  it("blocks write tools of generated plugins without the files capability", async () => {
+    const runtime = mount("acceptEdits"); // acceptEdits normally auto-approves writes
+    runtime.ctx.provide("pluginsLoader", governanceFor({ name: "auto-fix", origin: "generated", capabilities: ["shell"] }));
+    const result = await call(runtime, "FakeWrite", { path: "a.txt" });
+    expect(result.isError).toBe(true);
+    expect(result.content).toMatch(/capability "files"/);
+    await runtime.dispose();
+  });
+
+  it("forces approval for declared capabilities even in acceptEdits, and remembers it", async () => {
+    let questions = 0;
+    const interaction: InteractionService = {
+      async ask() {
+        return undefined;
+      },
+      async confirm() {
+        questions += 1;
+        return true;
+      },
+    };
+    const runtime = mount("acceptEdits", interaction);
+    runtime.ctx.provide(
+      "pluginsLoader",
+      governanceFor({ name: "auto-fix", origin: "generated", capabilities: ["files"] }),
+    );
+    const first = await call(runtime, "FakeWrite", { path: "a.txt" });
+    expect(first.isError).toBeUndefined();
+    const second = await call(runtime, "FakeWrite", { path: "a.txt" });
+    expect(second.isError).toBeUndefined();
+    expect(questions).toBe(1); // per-plugin approval remembered for the session
+    await runtime.dispose();
+  });
+
+  it("fails closed for declared capabilities without an interaction service", async () => {
+    const runtime = mount("acceptEdits");
+    runtime.ctx.provide(
+      "pluginsLoader",
+      governanceFor({ name: "auto-fix", origin: "generated", capabilities: ["files"] }),
+    );
+    const result = await call(runtime, "FakeWrite", { path: "a.txt" });
+    expect(result.isError).toBe(true);
+    expect(result.content).toMatch(/approval/i);
+    await runtime.dispose();
+  });
+
+  it("lets declared shell capability run in bypass without asking", async () => {
+    const runtime = mount("bypass");
+    runtime.ctx.provide(
+      "pluginsLoader",
+      governanceFor({ name: "auto-fix", origin: "generated", capabilities: ["shell"] }),
+    );
+    const result = await call(runtime, "FakeShell", { command: "npm test" });
+    expect(result.isError).toBeUndefined();
+    expect(result.content).toBe("ran: npm test");
+    await runtime.dispose();
+  });
+
+  it("leaves user-owned plugins on the normal mode gate", async () => {
+    const runtime = mount("bypass");
+    runtime.ctx.provide("pluginsLoader", governanceFor({ name: "hand-made", origin: "user" }));
+    const result = await call(runtime, "FakeShell", { command: "npm test" });
+    expect(result.isError).toBeUndefined();
     await runtime.dispose();
   });
 });
