@@ -1,0 +1,15 @@
+{
+  "name": "hallucination-detector",
+  "version": "0.1.0",
+  "entry": "index.js",
+  "description": "Full-lifecycle hallucination audit: after every finished run, replays the session transcript, attributes findings to perceive/plan/act/reflect stages (repeat-window tool loops, flip-flop edits, misread results, contradictions, compaction decay, redundant exploration, ungrounded claims) and optionally LLM-judges intent alignment.",
+  "provides": ["hallucination"],
+  "config": {
+    "enabled": true,
+    "autoAudit": true,
+    "minToolCalls": 1,
+    "repeat": { "windowSize": 20, "threshold": 10 },
+    "judge": { "enabled": true, "maxTokens": 800, "timeoutMs": 30000 },
+    "maxReports": 200
+  }
+}
