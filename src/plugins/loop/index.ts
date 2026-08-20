@@ -13,6 +13,7 @@
 
 import { definePlugin } from "../../kernel";
 import type { PluginContext } from "../../kernel/types";
+import { randomUUID } from "node:crypto";
 import { sanitizeHistory, type Message, type ToolCall } from "../../shared/messages";
 import { ProviderError, normalizeProviderError } from "../llm/types";
 import type { ModelToolSchema } from "../llm/types";
@@ -23,7 +24,7 @@ import type { PromptService } from "../prompt";
 import type { HookBusService } from "../hooks";
 
 export type AgentEvent =
-  | { type: "agent_start"; sessionId?: string; model?: string }
+  | { type: "agent_start"; runId: string; sessionId?: string; model?: string }
   | { type: "turn_start"; iteration: number }
   | { type: "text_delta"; text: string }
   | { type: "message_end"; message: Extract<Message, { role: "assistant" }> }
@@ -65,8 +66,16 @@ export interface LoopCompact {
 
 /** Waterfall payload right before every agent_end, on every exit path. */
 export interface LoopAfterRun {
+  /** Stable identity for this invocation. Optional for compatibility with third-party emitters. */
+  runId?: string;
+  /** Exact session used by this invocation; consumers must prefer it over session.latest(). */
+  sessionId?: string;
   iterations: number;
   reason: "finished" | "max_iterations" | "aborted";
+  /** Outcome separates a clean finish from provider failure and budget/abort exits. */
+  outcome?: "success" | "provider_error" | "max_iterations" | "aborted";
+  /** Conservative quality signal used by learning plugins. */
+  successful?: boolean;
   /** Tool calls executed this run (aborted placeholders excluded). */
   toolCalls: number;
   /** Tool calls whose result carried isError. */
@@ -109,10 +118,11 @@ class AgentServiceImpl implements AgentService {
 
     const maxIterations = options.maxIterations ?? DEFAULT_MAX_ITERATIONS;
     const session = options.session ?? (sessionService ? await sessionService.create() : undefined);
+    const runId = randomUUID();
     const messages: Message[] = session ? [...session.messages()] : [];
     const systemPrompt = await prompt.assemble();
 
-    yield { type: "agent_start", sessionId: session?.id, model: llm.defaultRef() };
+    yield { type: "agent_start", runId, sessionId: session?.id, model: llm.defaultRef() };
 
     // Log the user turn first: model-visible ⇔ logged.
     await this.record(session, messages, { role: "user", content: options.input });
@@ -125,7 +135,7 @@ class AgentServiceImpl implements AgentService {
 
     while (iteration < maxIterations) {
       if (options.signal?.aborted) {
-        await this.afterRun(hooks, iteration, "aborted", stats);
+        await this.afterRun(hooks, runId, session?.id, iteration, "aborted", "aborted", stats);
         yield { type: "agent_end", iterations: iteration, reason: "aborted" };
         return;
       }
@@ -185,7 +195,7 @@ class AgentServiceImpl implements AgentService {
           }
         }
         yield { type: "warning", message: `Model request failed (${error.code}): ${error.message}` };
-        await this.afterRun(hooks, iteration, "finished", stats);
+        await this.afterRun(hooks, runId, session?.id, iteration, "finished", "provider_error", stats);
         yield { type: "agent_end", iterations: iteration, reason: "finished" };
         return;
       }
@@ -198,7 +208,7 @@ class AgentServiceImpl implements AgentService {
       yield { type: "message_end", message: assistantMessage };
 
       if (turn.toolCalls.length === 0) {
-        await this.afterRun(hooks, iteration, "finished", stats);
+        await this.afterRun(hooks, runId, session?.id, iteration, "finished", "success", stats);
         yield { type: "agent_end", iterations: iteration, reason: "finished" };
         return;
       }
@@ -222,6 +232,8 @@ class AgentServiceImpl implements AgentService {
         yield { type: "tool_start", toolCall };
         const result = await tools.execute(toolCall, {
           cwd: this.ctx.cwd,
+          runId,
+          ...(session?.id ? { sessionId: session.id } : {}),
           ...(options.signal ? { signal: options.signal } : {}),
         });
         stats.toolCalls += 1;
@@ -237,7 +249,7 @@ class AgentServiceImpl implements AgentService {
       }
     }
 
-    await this.afterRun(hooks, iteration, "max_iterations", stats);
+    await this.afterRun(hooks, runId, session?.id, iteration, "max_iterations", "max_iterations", stats);
     yield { type: "agent_end", iterations: iteration, reason: "max_iterations" };
   }
 
@@ -247,12 +259,23 @@ class AgentServiceImpl implements AgentService {
    */
   private async afterRun(
     hooks: HookBusService,
+    runId: string,
+    sessionId: string | undefined,
     iterations: number,
     reason: LoopAfterRun["reason"],
+    outcome: NonNullable<LoopAfterRun["outcome"]>,
     stats: RunStats,
   ): Promise<void> {
     try {
-      await hooks.waterfall<LoopAfterRun>("loop/after-run", { iterations, reason, ...stats });
+      await hooks.waterfall<LoopAfterRun>("loop/after-run", {
+        runId,
+        ...(sessionId ? { sessionId } : {}),
+        iterations,
+        reason,
+        outcome,
+        successful: outcome === "success" && stats.toolErrors === 0,
+        ...stats,
+      });
     } catch (error) {
       this.ctx.logger.warn(`loop/after-run hook failed: ${error instanceof Error ? error.message : String(error)}`);
     }

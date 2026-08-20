@@ -7,25 +7,32 @@ import { Runtime } from "../src/kernel";
 import { commandsPlugin, type CommandsService } from "../src/plugins/commands";
 import { hooksPlugin, type HookBusService } from "../src/plugins/hooks";
 import { promptPlugin } from "../src/plugins/prompt";
+// @ts-expect-error disk plugins are runtime-loaded JavaScript fixtures
 import { MemoryStore, normalizeMemoryContent } from "../.flavorlite/plugins/memory/store.js";
 import {
   buildBm25Index,
   classifyMemoryHeat,
   rankMemoryReferences,
   tokenize,
+// @ts-expect-error disk plugins are runtime-loaded JavaScript fixtures
 } from "../.flavorlite/plugins/memory/retrieval.js";
 import {
   embedTexts,
   isEmbeddingConfigured,
   loadEmbeddingConfig,
   validateEmbeddingConfig,
+// @ts-expect-error disk plugins are runtime-loaded JavaScript fixtures
 } from "../.flavorlite/plugins/memory/embedding.js";
+// @ts-expect-error disk plugins are runtime-loaded JavaScript fixtures
 import { VectorStore } from "../.flavorlite/plugins/memory/vector-store.js";
+// @ts-expect-error disk plugins are runtime-loaded JavaScript fixtures
 import { memorySimilarity } from "../.flavorlite/plugins/memory/similarity.js";
 import {
   buildMemoryExtractionPrompt,
   parseScoredMemoryCandidates,
+// @ts-expect-error disk plugins are runtime-loaded JavaScript fixtures
 } from "../.flavorlite/plugins/memory/extractor.js";
+// @ts-expect-error disk plugins are runtime-loaded JavaScript fixtures
 import memoryPlugin from "../.flavorlite/plugins/memory/index.js";
 
 const workspaces: string[] = [];
@@ -333,6 +340,7 @@ describe("embedding client", () => {
     const vectors = await embedTexts(config, ["a", "b"], undefined);
     expect(vectors).toEqual([[1, 0], [0, 1]]);
     const [call] = mock.mock.calls;
+    if (!call) throw new Error("expected one embedding request");
     expect(call[0]).toBe("https://emb.example/v1/embeddings");
     expect(JSON.parse((call[1] as RequestInit).body as string)).toEqual({
       model: "text-embedding-3-small",
@@ -441,7 +449,7 @@ describe("vector store", () => {
     expect(store.remove("a")).toBe(true);
     expect(store.remove("a")).toBe(false);
     const top = store.search([1, 0], 10, 0);
-    expect(top.map((r) => r.id)).toEqual(["b"]);
+    expect(top.map((r: { id: string }) => r.id)).toEqual(["b"]);
     expect(store.search([1, 0], 10, 0.999)).toEqual([]);
   });
 });

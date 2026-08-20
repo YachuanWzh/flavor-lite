@@ -1,0 +1,13 @@
+{
+  "name": "project-instructions",
+  "version": "0.1.0",
+  "entry": "index.js",
+  "description": "Discover and apply root and nested AGENTS.md, CLAUDE.md and .cursorrules files.",
+  "activation": "eager",
+  "provides": ["projectInstructions"],
+  "triggers": {
+    "keywords": ["AGENTS.md", "CLAUDE.md", "instructions", "项目规则", "编码规范"],
+    "tools": ["project_instructions"]
+  },
+  "config": { "maxFiles": 50, "maxChars": 30000 }
+}

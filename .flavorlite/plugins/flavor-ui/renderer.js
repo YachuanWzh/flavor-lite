@@ -1,498 +1,229 @@
-/**
- * flavor-ui renderer — a timeline UI for the flavor-lite terminal.
- *
- * Pure ESM, zero dependencies. The host delegates event rendering to the
- * "ui" service (see src/host/render.ts); this module implements that
- * surface with an injectable output so tests can capture the stream.
- *
- * Design: every turn is a timeline. The user's input opens the turn, model
- * text streams raw (never buffered), and tool calls are rendered as live
- * status lines — a spinner rewrites the same line in place until the tool
- * finishes, then the line becomes a ✓/✗ result with a duration and an
- * optional preview. The turn closes with a dim stat line. All styling
- * degrades gracefully: no animation and no color when stdout is not a TTY
- * or NO_COLOR is set.
- */
+/** flavor-ui v2 — a compact flight-recorder timeline for the terminal. */
 
-const SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
-
+const SPINNER_FRAMES = ["◐", "◓", "◑", "◒"];
 const SGR = /\x1b\[[0-9;]*m/g;
 const ANSI_SGR = /\x1b\[[0-9;]*m/;
-
-/** Styles. "full" animates tool cards; "plain" keeps static one-liners. */
 const STYLE_FULL = "full";
 const STYLE_PLAIN = "plain";
+
+const DEFAULT_PRESENTATIONS = [
+  { matcher: /^(Read|Write|Edit|ApplyPatch|apply_patch_transaction|Glob|Grep)$/i, spec: { badge: "FILE", accent: "ion" } },
+  { matcher: /^verify(?:_|$)/i, spec: { badge: "VERIFY", accent: "ultraviolet", previewOnSuccess: true } },
+  { matcher: /^git_/i, spec: { badge: "GIT", accent: "amber" } },
+  { matcher: /^lsp_/i, spec: { badge: "LSP", accent: "ultraviolet", previewOnSuccess: true } },
+  { matcher: /^process_/i, spec: { badge: "PROCESS", accent: "ion", previewOnSuccess: true } },
+  { matcher: /^(subagent_|Task$)/i, spec: { badge: "AGENT", accent: "ember", previewOnSuccess: true } },
+  { matcher: /^(plan_|TodoWrite$)/i, spec: { badge: "PLAN", accent: "amber" } },
+  { matcher: /^(memory_|remember|recall|forget)/i, spec: { badge: "MEMORY", accent: "mint" } },
+  { matcher: /^(web_|WebSearch|WebFetch)/i, spec: { badge: "WEB", accent: "ion" } },
+  { matcher: /^(ast_|symbol_|repo_)/i, spec: { badge: "CODE", accent: "ultraviolet" } },
+];
 
 export function createRenderer(options = {}) {
   const output = options.output ?? process.stdout;
   const colorEnabled = options.color ?? (output.isTTY === true && process.env.NO_COLOR === undefined);
   const tty = options.tty ?? output.isTTY === true;
   let style = options.style === STYLE_PLAIN ? STYLE_PLAIN : STYLE_FULL;
-  const spinnerMs = options.spinnerMs ?? 80;
-
+  const spinnerMs = options.spinnerMs ?? 90;
   const paint = makePaint(colorEnabled);
-
-  // ---- turn state ----
   let turnStartedAt = 0;
   let iterations = 0;
-  let usage = undefined;
+  let usage;
   let sawText = false;
   let atLineStart = true;
-  let spinner = undefined; // { timer, frame, line, startedAt }
-  let activeTool = undefined; // { name, summary, startedAt }
-  let animated = false; // the active tool card is being rewritten in place
+  let activeTool;
+  let spinner;
+  let animated = false;
+  let inlineTool = false;
+  let nextPresentationId = 1;
+  const presentations = [];
 
-  function write(text) {
-    output.write(text);
-    atLineStart = text.endsWith("\n");
+  function write(text) { output.write(text); atLineStart = text.endsWith("\n"); }
+  function line(text = "") {
+    write(text + (colorEnabled && text.includes("\x1b[") && !text.endsWith("\x1b[0m") ? "\x1b[0m" : "") + "\n");
   }
-
-  function line(text) {
-    write(text + "\n");
-  }
-
-  function ensureLineStart() {
-    if (!atLineStart) line("");
-  }
-
+  function ensureLineStart() { if (!atLineStart) line(); }
   function startTurn() {
-    stopSpinner();
-    turnStartedAt = Date.now();
-    iterations = 0;
-    usage = undefined;
-    sawText = false;
-    activeTool = undefined;
-    animated = false;
+    stopSpinner(); turnStartedAt = Date.now(); iterations = 0; usage = undefined;
+    sawText = false; activeTool = undefined; animated = false; inlineTool = false;
   }
-
-  function stopSpinner() {
-    if (!spinner) return;
-    clearInterval(spinner.timer);
-    spinner = undefined;
-  }
-
-  /** Rewrite the animated tool card in place, or print a fresh line. */
-  function drawCard(body, rewrite = animated) {
-    if (rewrite) {
-      write("\r\x1b[2K");
-      write(clipCard(body) + "\n");
-      return;
-    }
-    write(body + "\n");
-  }
-
-  /**
-   * Rewrites (\r + erase) only work while a card fits on one physical
-   * line: once a card wraps, the stale wrapped content sits on a line the
-   * next rewrite cannot reach and stays visible as a ghost copy. Clip the
-   * card to the terminal width instead (columns - 1: filling the very last
-   * column puts some terminals in a deferred-wrap state that breaks the
-   * rewrite just the same).
-   */
-  function clipCard(body) {
-    const cols = output.columns;
-    const max = Number.isFinite(cols) && cols > 20 ? cols - 1 : Number.POSITIVE_INFINITY;
+  function stopSpinner() { if (spinner) { clearInterval(spinner.timer); spinner = undefined; } }
+  function clipRow(body) {
+    const columns = output.columns;
+    const max = Number.isFinite(columns) && columns > 20 ? columns - 1 : Number.POSITIVE_INFINITY;
     if (stringWidth(body) <= max) return body;
     const clipped = truncateToWidth(body, max);
-    // Truncation may cut inside a styled span; re-close the styling.
-    return colorEnabled ? `${clipped}\u001b[0m` : clipped;
+    return colorEnabled ? `${clipped}\x1b[0m` : clipped;
   }
-
-  function toolCardBody(symbol, tool, summary) {
-    const head = `${symbol} ${tool}`;
-    return summary ? `${head}  ${paint.dim(summary)}` : head;
+  function toolBody(symbol, name, summary, presentation, tail = "") {
+    const head = `${paint.graphite("├─")} ${symbol} ${name}`;
+    const badge = accent(presentation.accent)(`‹${presentation.badge}›`);
+    return `${head}${summary ? `  ${paint.graphite(summary)}` : ""}  ${badge}${tail}`;
   }
-
-  function startToolCard(toolCall) {
-    const summary = summarize(toolCall.args ?? {});
-    activeTool = { name: toolCall.name, summary, startedAt: Date.now() };
-    if (style === STYLE_PLAIN || !tty) {
-      line(toolCardBody(paint.dim("○"), activeTool.name, summary));
+  function resolvePresentation(toolCall) {
+    const custom = [...presentations].reverse().find((entry) => matches(entry.matcher, toolCall.name, toolCall.args ?? {}));
+    if (custom) return custom.spec;
+    const builtIn = DEFAULT_PRESENTATIONS.find((entry) => matches(entry.matcher, toolCall.name, toolCall.args ?? {}));
+    if (builtIn) return builtIn.spec;
+    const category = options.resolveTool?.(toolCall.name)?.category;
+    if (category === "read") return { badge: "READ", accent: "ion" };
+    if (category === "write") return { badge: "WRITE", accent: "amber" };
+    if (category === "shell") return { badge: "SHELL", accent: "ember", previewOnSuccess: true };
+    if (category === "control") return { badge: "CONTROL", accent: "ultraviolet" };
+    return { badge: "TOOL", accent: "graphite" };
+  }
+  function accent(name) {
+    return typeof paint[name] === "function" ? paint[name] : paint.graphite;
+  }
+  function startTool(toolCall) {
+    ensureLineStart();
+    activeTool = { name: toolCall.name, summary: summarize(toolCall.args ?? {}), presentation: resolvePresentation(toolCall), startedAt: Date.now() };
+    if (!tty) {
+      line(clipRow(toolBody(accent(activeTool.presentation.accent)("○"), activeTool.name, activeTool.summary, activeTool.presentation)));
+      return;
+    }
+    inlineTool = true;
+    if (style === STYLE_PLAIN) {
+      write(clipRow(toolBody(accent(activeTool.presentation.accent)("○"), activeTool.name, activeTool.summary, activeTool.presentation)));
       return;
     }
     animated = true;
-    startSpinner();
-  }
-
-  /** Animate the active card in place: every frame rewrites the same line. */
-  function startSpinner() {
     let frame = 0;
-    const draw = () => {
-      const body = toolCardBody(
-        paint.cyan(SPINNER_FRAMES[frame % SPINNER_FRAMES.length]),
-        paint.bold(activeTool.name),
-        activeTool.summary,
-      );
-      // No trailing newline: frames overwrite the current line instead of
-      // stacking one ghost copy per tick.
-      write(`\r\x1b[2K${clipCard(body)}`);
-    };
+    const draw = () => write(`\r\x1b[2K${clipRow(toolBody(accent(activeTool.presentation.accent)(SPINNER_FRAMES[frame % SPINNER_FRAMES.length]), paint.bold(activeTool.name), activeTool.summary, activeTool.presentation))}`);
     draw();
-    const timer = setInterval(() => {
-      frame += 1;
-      draw();
-    }, spinnerMs);
+    const timer = setInterval(() => { frame += 1; draw(); }, spinnerMs);
     timer.unref?.();
-    spinner = { timer, frame, startedAt: activeTool.startedAt };
+    spinner = { timer };
   }
-
-  /**
-   * Freeze the animation while the host owns the terminal (permission
-   * prompts). The card degrades to a static pending line for the rest of
-   * this tool; the final ✓/✗ line is still printed on completion.
-   */
+  function finishTool(toolCall, content, isError) {
+    const tool = activeTool ?? { name: toolCall.name, summary: summarize(toolCall.args ?? {}), presentation: resolvePresentation(toolCall), startedAt: Date.now() };
+    const rewrite = inlineTool;
+    stopSpinner(); activeTool = undefined; animated = false; inlineTool = false;
+    const tail = paint.graphite(`  (${formatDuration(Date.now() - tool.startedAt)})`);
+    const body = clipRow(toolBody(isError ? paint.red("✗") : paint.mint("✓"), paint.bold(tool.name), tool.summary, tool.presentation, tail));
+    if (rewrite) { write("\r\x1b[2K"); write(`${body}\n`); } else line(body);
+    const preview = firstLine(content, 90);
+    if (isError && preview) line(`${paint.graphite("│")}  ${paint.amber(`error: ${preview}`)}`);
+    else if ((style === STYLE_FULL || tool.presentation.previewOnSuccess) && preview) line(`${paint.graphite("│")}  ${paint.graphite(preview)}`);
+  }
   function pauseAnimation() {
-    if (!spinner || !activeTool) return;
-    stopSpinner();
-    animated = false;
-    write(`\r\x1b[2K${clipCard(toolCardBody(paint.dim("○"), activeTool.name, activeTool.summary))}\n`);
+    if (!activeTool || !inlineTool) return;
+    stopSpinner(); animated = false; inlineTool = false;
+    write(`\r\x1b[2K${clipRow(toolBody(accent(activeTool.presentation.accent)("○"), activeTool.name, activeTool.summary, activeTool.presentation))}\n`);
   }
-
-  function finishToolCard(toolCall, content, isError) {
-    const tool = activeTool ?? { name: toolCall.name, summary: summarize(toolCall.args ?? {}), startedAt: Date.now() };
-    const rewrite = animated; // the pending card is being rewritten in place
-    stopSpinner();
-    activeTool = undefined;
-    animated = false;
-    const duration = formatDuration(Date.now() - tool.startedAt);
-    const tail = paint.dim(`  (${duration})`);
-    if (isError) {
-      drawCard(`${paint.red("✗")} ${paint.bold(tool.name)}${tool.summary ? `  ${paint.dim(tool.summary)}` : ""}${tail}`, rewrite);
-      const first = firstLine(content, 100);
-      if (first) line(paint.yellow(`  error: ${first}`));
-    } else {
-      drawCard(`${paint.green("✓")} ${paint.bold(tool.name)}${tool.summary ? `  ${paint.dim(tool.summary)}` : ""}${tail}`, rewrite);
-      if (style === STYLE_FULL) {
-        const preview = firstLine(content, 72);
-        if (preview) line(paint.dim(`  ${preview}`));
-      }
-    }
-  }
-
   function turnStats() {
     const turns = `${iterations} ${iterations === 1 ? "turn" : "turns"}`;
-    let stats = turns;
-    if (usage) {
-      stats += ` · ${formatTokens(usage.inputTokens)} → ${formatTokens(usage.outputTokens)} tokens`;
-    }
-    if (turnStartedAt > 0) stats += ` · ${formatDuration(Date.now() - turnStartedAt)}`;
-    return stats;
+    let value = turns;
+    if (usage) value += ` · ${formatTokens(usage.inputTokens)} → ${formatTokens(usage.outputTokens)} tokens`;
+    if (turnStartedAt > 0) value += ` · ${formatDuration(Date.now() - turnStartedAt)}`;
+    return value;
   }
-
-  /** Render one agent event (the host "ui" service surface). */
   function render(event) {
     switch (event.type) {
-      case "agent_start":
-        startTurn();
-        break;
-      case "turn_start":
-        iterations = event.iteration;
-        break;
+      case "agent_start": startTurn(); break;
+      case "turn_start": iterations = event.iteration; sawText = false; break;
       case "text_delta":
-        sawText = true;
-        write(event.text);
-        break;
-      case "message_end":
-        if (sawText) write("\n");
-        break;
-      case "tool_start":
-        ensureLineStart();
-        startToolCard(event.toolCall);
-        break;
-      case "tool_end":
-        finishToolCard(event.toolCall, event.content, event.isError);
-        break;
-      case "usage":
-        usage = { inputTokens: event.inputTokens, outputTokens: event.outputTokens };
-        break;
-      case "warning":
-        ensureLineStart();
-        line(paint.yellow(`⚠ ${event.message}`));
-        break;
+        if (!sawText) { ensureLineStart(); write(`${paint.graphite("│")}  `); }
+        sawText = true; write(event.text); break;
+      case "message_end": if (sawText) write("\n"); break;
+      case "tool_start": startTool(event.toolCall); break;
+      case "tool_end": finishTool(event.toolCall, event.content, event.isError); break;
+      case "usage": usage = { inputTokens: event.inputTokens, outputTokens: event.outputTokens }; break;
+      case "warning": ensureLineStart(); line(`${paint.graphite("│")}  ${paint.amber(`⚠ ${event.message}`)}`); break;
       case "agent_end":
-        stopSpinner();
-        if (event.reason === "max_iterations") {
-          ensureLineStart();
-          line(paint.yellow(`⛔ reached the iteration limit (${event.iterations} turns)`));
-        } else if (event.reason === "aborted") {
-          ensureLineStart();
-          line(paint.dim(`⏹ aborted (${event.iterations} turns)`));
-        } else {
-          ensureLineStart();
-          line(`${paint.cyan("⚡")} ${paint.dim(turnStats())}`);
-        }
+        pauseAnimation(); stopSpinner(); ensureLineStart();
+        if (event.reason === "max_iterations") line(`${paint.ember("╰─")} ${paint.amber(`⛔ reached the iteration limit (${event.iterations} turns)`)}`);
+        else if (event.reason === "aborted") line(`${paint.graphite("╰─")} ${paint.graphite(`⏹ aborted (${event.iterations} turns)`)}`);
+        else line(`${paint.ultraviolet("╰─")} ${paint.ion("⚡")} ${paint.graphite(turnStats())}`);
         break;
     }
   }
-
-  /**
-   * Render the startup banner: brand line, a ruled table of model/mode/
-   * session/plugins, and failed-plugin details. Layout adapts to the
-   * terminal width (box rule width follows the widest row).
-   */
-  function renderBanner(info) {
-    const plugins = info.plugins ?? { loaded: 0, total: 0, errors: [] };
-    const errors = plugins.errors ?? [];
-    const mode = info.mode ?? "default";
-    const columns = output.columns && output.columns > 20 ? output.columns : 80;
-
-    const pluginSummary =
-      errors.length === 0
-        ? paint.green(`${plugins.loaded}/${plugins.total} loaded`)
-        : paint.yellow(`${plugins.loaded}/${plugins.total} loaded · ${errors.length} failed`);
-
-    const rows = [
-      ["model", paint.bold(info.model ?? "unset")],
-      ["mode", mode === "default" ? mode : paint.yellow(mode)],
-      ["session", info.sessionId ?? "-"],
-      ["plugins", pluginSummary + (plugins.total > 0 ? paint.dim("  (/plugin list)") : "")],
-    ];
-
-    // Rule width: content + margins, capped to the terminal width.
-    const labelWidth = Math.max(...rows.map(([label]) => stringWidth(label))) + 2;
-    const valueWidth = Math.max(...rows.map(([, value]) => stringWidth(value)));
-    const ruleWidth = Math.min(Math.max(2 + labelWidth + 1 + valueWidth + 2, 30), columns - 2);
-
-    const rule = paint.dim("─".repeat(ruleWidth));
-    line("");
-    line(`  ${paint.cyan("✦")} ${paint.bold("flavor-lite")}  ${paint.dim("everything is a plugin")}`);
-    line(`  ${rule}`);
-    for (const [label, value] of rows) {
-      line(`  ${paint.dim(label.padEnd(labelWidth - 1))} ${truncateToWidth(value, ruleWidth - labelWidth - 3)}`);
-    }
-    line(`  ${rule}`);
-    for (const error of errors.slice(0, 3)) {
-      line(`  ${paint.red("✖")} ${paint.red(error.name)}: ${truncateToWidth(error.error, ruleWidth - 8)}`);
-    }
-    if (errors.length > 3) line(`  ${paint.red(`… and ${errors.length - 3} more failed plugins`)}`);
-    line(`  ${paint.dim("type /help for commands · input while running becomes steering")}`);
-    line("");
-  }
-
-  /** Echo the user input that starts a turn. */
   function renderUserInput(input) {
-    const [first, ...rest] = input.split("\n");
-    // Bright magenta (95) matches the brand color used in the banner.
-    line(`${paint.bold(paint.brightMagenta("❯"))} ${first}`);
+    const [first, ...rest] = String(input).split("\n");
+    line(`${paint.ultraviolet("╭─")} ${paint.bold(paint.ion("❯"))} ${first}`);
     for (const part of rest) line(`  ${part}`);
   }
-
-  /** Render a caught turn-level error (model failure, aborted stream). */
-  function renderError(error) {
-    ensureLineStart();
-    line(paint.yellow(`✖ ${error instanceof Error ? error.message : String(error)}`));
-  }
-
-  /** Render a non-fatal notice. */
-  function renderNotice(message) {
-    ensureLineStart();
-    line(paint.dim(`· ${message}`));
-  }
-
-  /** Render the startup banner: brand, status panel, and hint line. */
+  function renderError(error) { ensureLineStart(); line(`${paint.ember("╰─")} ${paint.red("✖")} ${error instanceof Error ? error.message : String(error)}`); }
+  function renderNotice(message) { ensureLineStart(); line(`${paint.graphite("│")}  ${paint.graphite(`· ${message}`)}`); }
   function renderBanner(info = {}) {
     const plugins = info.plugins ?? { loaded: 0, total: 0, errors: [] };
+    const errors = plugins.errors ?? [];
     const columns = output.columns ?? 80;
-    const ruleWidth = Math.max(20, Math.min(72, columns - 2));
-    const rule = paint.dim("─".repeat(ruleWidth));
+    const width = Math.max(38, Math.min(88, columns - 2));
     const narrow = columns < 68;
-
-    // Brand line: bold magenta name + dim slogan, version right-aligned.
-    const brand = `${paint.bold(paint.magenta("flavor-lite"))}${paint.dim(" · everything is a plugin")}`;
-    const versionText = info.version ? paint.dim(`v${info.version}`) : "";
-    if (versionText) {
-      const pad = Math.max(2, ruleWidth - stringWidth(brand) - stringWidth(versionText));
-      line(brand + " ".repeat(pad) + versionText);
-    } else {
-      line(brand);
-    }
-    line(rule);
-
-    const model = info.model || paint.dim("unset");
-    const mode = paintMode(info.mode);
-    const session = info.sessionId || paint.dim("-");
+    const version = info.version ? `v${info.version}` : "dev";
+    const beacon = `${paint.bold(paint.ultraviolet("FLAVOR//LITE"))}  ${paint.graphite("flavor-lite · everything is a plugin")}`;
+    const versionText = paint.graphite(version);
+    const pad = Math.max(2, width - stringWidth(beacon) - stringWidth(versionText));
+    line(`${paint.ultraviolet("╭─")} ${beacon}${" ".repeat(Math.max(0, pad - 2))}${versionText}`);
+    line(paint.graphite("├" + "─".repeat(Math.max(1, width - 1))));
+    const model = info.model || paint.graphite("unset");
+    const mode = paintMode(info.mode, paint);
+    const session = info.sessionId || paint.graphite("-");
     const loaded = plugins.loaded ?? 0;
     const total = plugins.total ?? 0;
-    const pluginText = loaded === total ? paint.green(`${loaded}/${total} loaded`) : paint.yellow(`${loaded}/${total} loaded`);
-
+    const health = loaded === total ? paint.mint(`${loaded}/${total} loaded`) : paint.amber(`${loaded}/${total} loaded`);
     if (narrow) {
-      line(`${paint.dim("model")}   ${model}`);
-      line(`${paint.dim("mode")}    ${mode}`);
-      line(`${paint.dim("session")} ${session}`);
-      line(`${paint.dim("plugins")} ${pluginText}`);
+      line(`model   ${model}`); line(`mode    ${mode}`); line(`session ${session}`); line(`plugins ${health}`);
     } else {
-      const target = Math.max(30, Math.min(38, Math.floor(columns / 2) - 6));
-      line(twoCol(`${paint.dim("model")}   ${model}`, `${paint.dim("mode")}    ${mode}`, target));
-      line(twoCol(`${paint.dim("session")} ${session}`, `${paint.dim("plugins")} ${pluginText}`, target));
+      const target = Math.max(31, Math.min(44, Math.floor(columns / 2)));
+      line(twoCol(`${paint.graphite("model")}   ${model}`, `${paint.graphite("mode")}    ${mode}`, target));
+      line(twoCol(`${paint.graphite("session")} ${session}`, `${paint.graphite("plugins")} ${health}`, target));
     }
-
-    if (plugins.errors.length > 0) {
-      const names = plugins.errors
-        .slice(0, 3)
-        .map((entry) => entry.name)
-        .join(", ");
-      const more = plugins.errors.length > 3 ? `, +${plugins.errors.length - 3} more` : "";
-      line(
-        paint.red(
-          `✗ ${plugins.errors.length} plugin${plugins.errors.length === 1 ? "" : "s"} failed: ${names}${more} (/plugin list)`,
-        ),
-      );
+    if (errors.length) {
+      const names = errors.slice(0, 3).map((error) => error.name).join(", ");
+      const more = errors.length > 3 ? `, +${errors.length - 3} more` : "";
+      line(paint.red(`✗ ${errors.length} plugin${errors.length === 1 ? "" : "s"} failed: ${names}${more} (/plugin list)`));
     }
-
-    line(rule);
-    line(paint.dim("type /help for commands · input while running becomes steering"));
+    line(`${paint.ultraviolet("╰─")} ${paint.graphite("type /help for commands · input while running becomes steering")}`);
   }
-
-  /** Mode rendered with a semantic color: default=green, plan=yellow, etc. */
-  function paintMode(mode) {
-    const text = mode || "default";
-    if (mode === "plan") return paint.yellow(text);
-    if (mode === "acceptEdits") return paint.cyan(text);
-    if (mode === "bypass") return paint.red(text);
-    return paint.green(text);
-  }
-
-  /** Lay out two label/value pairs side by side with a fixed left column. */
-  function twoCol(left, right, target) {
-    return left + " ".repeat(Math.max(2, target - stringWidth(left))) + right;
-  }
-
   return {
-    render,
-    renderUserInput,
-    renderBanner,
-    renderError,
-    renderNotice,
-    pauseAnimation,
-    setStyle(next) {
-      if (next === STYLE_PLAIN) {
-        stopSpinner();
-        style = STYLE_PLAIN;
-      } else {
-        style = STYLE_FULL;
-      }
+    render, renderUserInput, renderBanner, renderError, renderNotice, pauseAnimation,
+    registerToolPresentation(matcher, spec) {
+      if (!(typeof matcher === "string" || matcher instanceof RegExp || typeof matcher === "function")) throw new TypeError("tool presentation matcher must be a name, RegExp or function");
+      if (!spec || typeof spec.badge !== "string" || !spec.badge.trim()) throw new TypeError("tool presentation requires a badge");
+      const entry = { id: nextPresentationId++, matcher, spec: { badge: spec.badge.trim().toUpperCase().slice(0, 12), accent: spec.accent ?? "graphite", previewOnSuccess: spec.previewOnSuccess === true } };
+      presentations.push(entry);
+      return () => { const index = presentations.findIndex((value) => value.id === entry.id); if (index >= 0) presentations.splice(index, 1); };
     },
+    setStyle(next) { if (next === STYLE_PLAIN) { stopSpinner(); style = STYLE_PLAIN; } else style = STYLE_FULL; },
     styleName: () => style,
   };
 }
 
+function matches(matcher, name, args) {
+  if (typeof matcher === "string") return matcher === name;
+  if (matcher instanceof RegExp) { matcher.lastIndex = 0; return matcher.test(name); }
+  return matcher(name, args) === true;
+}
+
 function makePaint(enabled) {
-  const wrap = (code) => (text) => (enabled ? `\u001b[${code}m${text}\u001b[0m` : text);
+  const wrap = (code) => (text) => enabled ? `\x1b[${code}m${text}\x1b[0m` : text;
   return {
-    dim: wrap(2),
-    bold: wrap(1),
-    yellow: wrap(33),
-    red: wrap(31),
-    cyan: wrap(36),
-    green: wrap(32),
-    magenta: wrap(35),
-    brightMagenta: wrap(95),
+    bold: wrap(1), graphite: wrap("38;2;119;129;154"), ion: wrap("38;2;101;209;255"),
+    ultraviolet: wrap("38;2;167;139;250"), mint: wrap("38;2;94;230;168"), ember: wrap("38;2;251;113;133"),
+    amber: wrap(33), red: wrap(31), green: wrap(32), cyan: wrap(36), yellow: wrap(33),
   };
 }
-
-/** First line of text, truncated to a display width. */
-function firstLine(text, max) {
-  const lineText = text.split("\n", 1)[0] ?? text;
-  return truncateToWidth(lineText.trim(), max);
-}
-
-/** Pick the primary argument to show beside a tool name. */
-function summarize(args) {
-  const preferred = [
-    "path",
-    "file_path",
-    "command",
-    "pattern",
-    "query",
-    "url",
-    "text",
-    "prompt",
-    "input",
-    "message",
-    "target",
-    "id",
-  ];
-  for (const key of preferred) {
-    const value = args[key];
-    if (typeof value === "string" && value) return truncateToWidth(value, 72);
-  }
-  const first = Object.values(args).find((value) => typeof value === "string" && value);
-  return typeof first === "string" ? truncateToWidth(first, 72) : "";
-}
-
-function formatDuration(ms) {
-  if (ms < 1000) return `${Math.max(1, Math.round(ms))}ms`;
-  return `${(ms / 1000).toFixed(ms < 10000 ? 2 : 1)}s`;
-}
-
-function formatTokens(count) {
-  return count >= 1000 ? `${(count / 1000).toFixed(1)}k` : String(count);
-}
-
-/** Display width of a string, ignoring ANSI SGR codes and combining marks. */
-function stringWidth(text) {
-  let width = 0;
-  for (const char of text.replace(SGR, "")) width += charWidth(char);
-  return width;
-}
-
-function charWidth(char) {
-  const code = char.codePointAt(0) ?? 0;
-  if (code === 0 || isCombining(code)) return 0;
-  return isWide(code) ? 2 : 1;
-}
-
-function isCombining(code) {
-  return (
-    (code >= 0x0300 && code <= 0x036f) ||
-    (code >= 0x1ab0 && code <= 0x1aff) ||
-    (code >= 0x1dc0 && code <= 0x1dff) ||
-    (code >= 0x20d0 && code <= 0x20ff) ||
-    (code >= 0xfe20 && code <= 0xfe2f)
-  );
-}
-
-function isWide(code) {
-  return (
-    (code >= 0x1100 && code <= 0x115f) ||
-    (code >= 0x2e80 && code <= 0x303e) ||
-    (code >= 0x3041 && code <= 0x33ff) ||
-    (code >= 0x3400 && code <= 0x4dbf) ||
-    (code >= 0x4e00 && code <= 0x9fff) ||
-    (code >= 0xa000 && code <= 0xa4cf) ||
-    (code >= 0xac00 && code <= 0xd7a3) ||
-    (code >= 0xf900 && code <= 0xfaff) ||
-    (code >= 0xfe30 && code <= 0xfe4f) ||
-    (code >= 0xff00 && code <= 0xff60) ||
-    (code >= 0xffe0 && code <= 0xffe6) ||
-    (code >= 0x20000 && code <= 0x2fffd) ||
-    (code >= 0x30000 && code <= 0x3fffd)
-  );
-}
-
-/** Truncate to a display width, preserving ANSI sequences and wide chars. */
+function paintMode(mode, paint) { const value = mode || "default"; if (value === "plan") return paint.yellow(value); if (value === "acceptEdits") return paint.cyan(value); if (value === "bypass") return paint.red(value); return paint.green(value); }
+function twoCol(left, right, target) { return left + " ".repeat(Math.max(2, target - stringWidth(left))) + right; }
+function firstLine(text, max) { return truncateToWidth(String(text).split("\n", 1)[0].trim(), max); }
+function summarize(args) { for (const key of ["path", "file_path", "command", "pattern", "query", "url", "text", "prompt", "input", "message", "target", "id"]) if (typeof args[key] === "string" && args[key]) return truncateToWidth(args[key], 72); const value = Object.values(args).find((entry) => typeof entry === "string" && entry); return typeof value === "string" ? truncateToWidth(value, 72) : ""; }
+function formatDuration(ms) { return ms < 1000 ? `${Math.max(1, Math.round(ms))}ms` : `${(ms / 1000).toFixed(ms < 10_000 ? 2 : 1)}s`; }
+function formatTokens(count) { return count >= 1000 ? `${(count / 1000).toFixed(1)}k` : String(count); }
+function stringWidth(text) { let width = 0; for (const char of String(text).replace(SGR, "")) width += charWidth(char); return width; }
+function charWidth(char) { const code = char.codePointAt(0) ?? 0; if (code === 0 || isCombining(code)) return 0; return isWide(code) ? 2 : 1; }
+function isCombining(code) { return (code >= 0x0300 && code <= 0x036f) || (code >= 0x1ab0 && code <= 0x1aff) || (code >= 0x1dc0 && code <= 0x1dff) || (code >= 0x20d0 && code <= 0x20ff) || (code >= 0xfe20 && code <= 0xfe2f); }
+function isWide(code) { return (code >= 0x1100 && code <= 0x115f) || (code >= 0x2e80 && code <= 0x303e) || (code >= 0x3041 && code <= 0x33ff) || (code >= 0x3400 && code <= 0x4dbf) || (code >= 0x4e00 && code <= 0x9fff) || (code >= 0xa000 && code <= 0xa4cf) || (code >= 0xac00 && code <= 0xd7a3) || (code >= 0xf900 && code <= 0xfaff) || (code >= 0xfe30 && code <= 0xfe4f) || (code >= 0xff00 && code <= 0xff60) || (code >= 0xffe0 && code <= 0xffe6) || (code >= 0x20000 && code <= 0x3fffd); }
 function truncateToWidth(text, maxWidth) {
   if (maxWidth <= 0 || !text) return "";
   if (stringWidth(text) <= maxWidth) return text;
-  let out = "";
-  let width = 0;
-  let index = 0;
-  // Reserve one column for the ellipsis so the result never exceeds maxWidth.
+  let output = ""; let width = 0; let index = 0;
   while (index < text.length) {
-    if (text[index] === "\x1b") {
-      const match = ANSI_SGR.exec(text.slice(index));
-      if (match && match.index === 0) {
-        out += match[0];
-        index += match[0].length;
-        continue;
-      }
-    }
-    const char = text[index] ?? "";
-    const charW = charWidth(char);
-    if (width + charW > maxWidth - 1) break;
-    out += char;
-    width += charW;
-    index += 1;
+    if (text[index] === "\x1b") { const match = ANSI_SGR.exec(text.slice(index)); if (match?.index === 0) { output += match[0]; index += match[0].length; continue; } }
+    const code = text.codePointAt(index); const char = String.fromCodePoint(code); const charWidthValue = charWidth(char);
+    if (width + charWidthValue > maxWidth - 1) break;
+    output += char; width += charWidthValue; index += char.length;
   }
-  return `${out}…`;
+  return `${output}…`;
 }

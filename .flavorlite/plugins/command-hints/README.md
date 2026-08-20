@@ -1,11 +1,16 @@
 # command-hints
 
-Slash-command completion for the flavor-lite interactive REPL.
+Interactive below-line completion is disabled by default because the current
+host cursor-restoration implementation can leave the input cursor at the end
+of a suggestion row. Use `/hints [prefix]` for safe discovery. Set manifest
+config `interactive: true` only with a host that resets to column one before
+restoring the input cursor.
 
-While you type, the moment the input line starts with `/`, matching
-candidates are rendered below the line with the typed prefix highlighted.
-Press **Tab** to complete the line to the next insertable candidate
-(press Tab repeatedly to cycle), then Enter to run it.
+Command, plugin and skill discovery for the flavor-lite interactive REPL.
+
+Run `/hints [prefix]` to print matching candidates as ordinary command output.
+Interactive suggestions and Tab completion remain available behind
+`config.interactive: true` for corrected/custom hosts.
 
 ## Candidates
 
@@ -15,28 +20,26 @@ Press **Tab** to complete the line to the next insertable candidate
 | Discovered plugins | `name` + `plugin — …` | `/plugin reload <name>` |
 | Discovered skills | `name` + `skill — …` | nothing (informational) |
 
-Example — typing `/re`:
+Example:
 
 ```
-› /re
+› /hints re
   /remember  Manually store a durable fact: /remember <type> <text>
   /resume    Resume a session by id (/resume <id>)
 ```
-
-The `re` letters of each match are highlighted (bold/cyan) on a TTY.
 
 ## How it works
 
 The terminal UI is owned by the host, not by this plugin. The host exposes a
 `repl` service (`src/host/completions.ts`) while the REPL is running; this
-plugin registers a `CompletionProvider` that gathers candidates from the
-`commands`, `pluginsLoader` and `skills` services. Under one-shot mode
-(`flavor-lite -p "…"`) there is no REPL, so the plugin no-ops gracefully.
+plugin gathers candidates from the `commands`, `pluginsLoader` and `skills`
+services. In safe mode it registers only `/hints`; interactive mode also
+registers a `CompletionProvider` through the host's `repl` service.
 
 ## Configuration
 
-None. Limit the visible list with the host's `ReplCompletions` option
-`maxSuggestions` (default 8).
+`interactive` defaults to `false`. Set it to `true` only when the host resets
+horizontal cursor origin before restoring the readline input position.
 
 ## Development
 

@@ -2,6 +2,7 @@
   "name": "subagent",
   "version": "0.1.0",
   "description": "Delegate tasks to child agents (isolated session, depth-limited).",
+  "provides": ["subagentRunner"],
   "activation": "dynamic",
   "triggers": {
     "keywords": ["subagent", "子任务", "委派", "并行任务"],

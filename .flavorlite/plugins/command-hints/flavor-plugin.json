@@ -1,6 +1,7 @@
 {
   "name": "command-hints",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "entry": "index.js",
-  "description": "While typing /, show matching commands, plugins and skills with the typed prefix highlighted; Tab completes."
+  "description": "Safe command discovery through /hints; optional interactive completion for hosts with correct cursor restoration.",
+  "config": { "interactive": false }
 }

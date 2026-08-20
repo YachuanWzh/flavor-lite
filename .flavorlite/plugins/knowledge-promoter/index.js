@@ -90,7 +90,7 @@ function proposalLine(proposal) {
 
 export default {
   name: "knowledge-promoter",
-  version: "0.1.0",
+  version: "0.2.0",
   description: "promotion ladder: proposes memory->skill and skill->plugin promotions (/ladder)",
   provides: ["knowledgePromoter"],
   inject: ["hooks", "commands", "pluginsLoader"],
@@ -108,6 +108,7 @@ export default {
       const storeDir = join(ctx.cwd, ".flavorlite", "knowledge-promoter");
       const usageFile = join(storeDir, "skill-usage.json");
       const doneFile = join(storeDir, "done.json");
+      const stateFile = join(storeDir, "states.json");
       const skillsDir = join(ctx.cwd, ".flavorlite", "skills");
       const disposers = [];
 
@@ -125,6 +126,18 @@ export default {
         }
       }
 
+      async function readStates() {
+        const states = await readJson(stateFile, {});
+        return states && typeof states === "object" && !Array.isArray(states) ? states : {};
+      }
+
+      async function setState(id, status, detail = {}) {
+        const states = await readStates();
+        states[id] = { ...(states[id] ?? {}), ...detail, status, updatedAt: new Date().toISOString() };
+        await writeJson(stateFile, states);
+        return states[id];
+      }
+
       /** Group memory references by topicKey: topic -> summaries. */
       async function memoryTopicGroups() {
         const memory = ctx.tryGet("memory");
@@ -140,7 +153,8 @@ export default {
           const topic = typeof ref?.topicKey === "string" ? ref.topicKey.trim() : "";
           if (!topic) continue;
           if (!groups.has(topic)) groups.set(topic, []);
-          groups.get(topic).push(typeof ref.summary === "string" ? ref.summary : "");
+          const summary = typeof ref.summary === "string" ? ref.summary.trim() : "";
+          if (summary) groups.get(topic).push(summary);
         }
         return groups;
       }
@@ -149,7 +163,8 @@ export default {
       async function skillProposals(done) {
         const proposals = [];
         for (const [topic, summaries] of await memoryTopicGroups()) {
-          if (summaries.length < memoryTopicThreshold) continue;
+          const unique = [...new Map(summaries.map((summary) => [summary.toLocaleLowerCase().replace(/\s+/g, " "), summary])).values()];
+          if (unique.length < memoryTopicThreshold) continue;
           if (done.has(`skill:${topic}`)) continue;
           const slug = slugify(topic);
           if (!slug) continue;
@@ -159,7 +174,12 @@ export default {
           } catch {
             // no covering skill: keep the proposal
           }
-          proposals.push({ rung: "memory->skill", topic, slug, count: summaries.length, summaries });
+          const joined = unique.join("\n").toLocaleLowerCase();
+          const warnings = [];
+          if (/cmd\.exe|powershell|windows/.test(joined) && /bash|unix|linux|\/bin\/sh/.test(joined)) {
+            warnings.push("mixed platform guidance; resolve conflicts before promotion");
+          }
+          proposals.push({ rung: "memory->skill", topic, slug, count: unique.length, summaries: unique, warnings });
         }
         return proposals.sort((a, b) => b.count - a.count);
       }
@@ -167,10 +187,13 @@ export default {
       /** skill -> plugin candidates: heavily used skills without a plugin yet. */
       async function pluginProposals(done, pluginNames) {
         const usage = await readJson(usageFile, {});
+        const states = await readStates();
         const proposals = [];
-        for (const [slug, count] of Object.entries(usage)) {
+        for (const [slug, raw] of Object.entries(usage)) {
+          const count = Number.isFinite(raw) ? raw : Number(raw?.count ?? 0);
           if (!Number.isFinite(count) || count < skillUsageThreshold) continue;
           if (done.has(`plugin:${slug}`)) continue;
+          if (states[`plugin:${slug}`]?.status === "implemented") continue;
           if (pluginNames.has(slug)) continue;
           proposals.push({ rung: "skill->plugin", slug, count });
         }
@@ -194,41 +217,28 @@ export default {
       disposers.push(
         ctx.get("hooks").hook("loop/after-run", async (event, next) => {
           try {
-            if (event.reason === "finished") {
+            const successful = event.successful ?? (event.reason === "finished" && (event.toolErrors ?? 0) === 0);
+            if (successful) {
               const skills = ctx.tryGet("skills");
-              const session = ctx.tryGet("session");
-              if (skills?.discover && session) {
-                let discovered = [];
+              if (skills?.usedInRun && event.runId) {
+                let used = [];
                 try {
-                  discovered = await skills.discover();
+                  used = await skills.usedInRun(event.runId);
                 } catch {
-                  discovered = [];
+                  used = [];
                 }
-                let messages = [];
-                try {
-                  const latestId = await session.latest();
-                  if (latestId) messages = (await session.open(latestId)).messages() ?? [];
-                } catch {
-                  messages = [];
-                }
-                const haystack = messages
-                  .filter((message) => message?.role === "user" || message?.role === "assistant")
-                  .map((message) => (typeof message.content === "string" ? message.content : ""))
-                  .join("\n")
-                  .toLowerCase();
-                if (haystack && discovered.length > 0) {
+                if (used.length > 0) {
                   const usage = await readJson(usageFile, {});
                   let changed = false;
-                  for (const skill of discovered) {
+                  for (const skill of used) {
                     const slug = typeof skill?.path === "string"
                       ? skillSlugFromPath(skill.path)
                       : slugify(skill?.name ?? "");
                     if (!slug) continue;
-                    const needles = [slug, slug.replace(/-/g, " "), String(skill?.name ?? "").toLowerCase()];
-                    if (needles.some((needle) => needle && haystack.includes(needle))) {
-                      usage[slug] = (usage[slug] ?? 0) + 1;
-                      changed = true;
-                    }
+                    const current = Number.isFinite(usage[slug]) ? { count: usage[slug], runIds: [] } : (usage[slug] ?? { count: 0, runIds: [] });
+                    if ((current.runIds ?? []).includes(event.runId)) continue;
+                    usage[slug] = { count: (current.count ?? 0) + 1, runIds: [...(current.runIds ?? []), event.runId].slice(-100), lastAt: new Date().toISOString() };
+                    changed = true;
                   }
                   if (changed) await writeJson(usageFile, usage);
                 }
@@ -302,6 +312,10 @@ export default {
                   `Lessons accumulated in long-term memory (topic: ${topic}):`,
                   "",
                   ...summaries.map((summary) => `- ${summary}`),
+                  ...(summaries.some((summary) => /cmd\.exe|powershell|windows/i.test(summary))
+                    && summaries.some((summary) => /bash|unix|linux|\/bin\/sh/i.test(summary))
+                    ? ["", "> Warning: memories contain mixed platform guidance. Resolve contradictions and verify commands before promotion."]
+                    : []),
                   "",
                   "Refine this draft into a reusable step-by-step procedure. When it proves",
                   `useful, run /distill promote ${slug} to curate it.`,
@@ -309,7 +323,6 @@ export default {
                 ].join("\n"),
                 "utf-8",
               );
-              await markDone(`skill:${topic}`);
               return `drafted skill "${slug}" at ${skillFile} (from ${summaries.length} memories) — refine it, then /distill promote ${slug} to curate`;
             }
 
@@ -344,7 +357,7 @@ export default {
                 // manifest missing: leave provenance to the caller
               }
               const usage = await readJson(usageFile, {});
-              const count = Number.isFinite(usage[slug]) ? usage[slug] : 0;
+              const count = Number.isFinite(usage[slug]) ? usage[slug] : Number(usage[slug]?.count ?? 0);
               try {
                 await writeFile(
                   join(dir, "PLAN.md"),
@@ -372,7 +385,7 @@ export default {
               } catch {
                 // PLAN.md is best-effort; the scaffold itself already exists.
               }
-              await markDone(`plugin:${slug}`);
+              await setState(`plugin:${slug}`, "implemented", { pluginName: slug });
               return [
                 `scaffolded plugin at ${dir} from skill "${slug}".`,
                 ``,
@@ -383,6 +396,18 @@ export default {
                 `4. Run /plugin reload ${slug} to hot-load it.`,
                 `5. Run /evolve test to verify the suite still passes.`,
               ].join("\n");
+            }
+
+            if (arg.startsWith("accept ")) {
+              const slug = slugify(arg.slice(7).trim());
+              if (!slug) return "usage: /ladder accept <plugin-slug>";
+              const state = (await readStates())[`plugin:${slug}`];
+              if (state?.status !== "implemented") return `refusing: no implemented promotion for "${slug}"`;
+              const report = await ctx.get("pluginsLoader").verify(slug);
+              if (!report.ok) return `refusing: verify failed for "${slug}": ${report.error ?? "unknown error"}`;
+              await setState(`plugin:${slug}`, "accepted", { verifiedAt: new Date().toISOString() });
+              await markDone(`plugin:${slug}`);
+              return `accepted plugin promotion "${slug}" after sandbox verification`;
             }
 
             const proposals = await collectProposals();

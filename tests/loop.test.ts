@@ -231,9 +231,12 @@ describe("agent loop plugin", () => {
       for await (const _ of agent.run({ input: "hi" })) {
         /* drain */
       }
-      expect(seen).toEqual([
-        { iterations: 1, reason: "finished", toolCalls: 0, toolErrors: 0, steers: 0, inputTokens: 0, outputTokens: 0 },
-      ]);
+      expect(seen).toHaveLength(1);
+      expect(seen[0]).toMatchObject({
+        iterations: 1, reason: "finished", outcome: "success", successful: true,
+        toolCalls: 0, toolErrors: 0, steers: 0, inputTokens: 0, outputTokens: 0,
+      });
+      expect(seen[0]?.runId).toBeTruthy();
     });
 
     it("fires with reason aborted before agent_end when the signal is already aborted", async () => {
@@ -245,9 +248,11 @@ describe("agent loop plugin", () => {
       const agent = rt.ctx.get("agent") as AgentService;
       const events: AgentEvent[] = [];
       for await (const event of agent.run({ input: "hi", signal: aborter.signal })) events.push(event);
-      expect(seen).toEqual([
-        { iterations: 0, reason: "aborted", toolCalls: 0, toolErrors: 0, steers: 0, inputTokens: 0, outputTokens: 0 },
-      ]);
+      expect(seen).toHaveLength(1);
+      expect(seen[0]).toMatchObject({
+        iterations: 0, reason: "aborted", outcome: "aborted", successful: false,
+        toolCalls: 0, toolErrors: 0, steers: 0, inputTokens: 0, outputTokens: 0,
+      });
       expect(events.at(-1)).toMatchObject({ type: "agent_end", reason: "aborted" });
     });
 
@@ -269,9 +274,11 @@ describe("agent loop plugin", () => {
       for await (const _ of agent.run({ input: "spin", maxIterations: 2 })) {
         /* drain */
       }
-      expect(seen).toEqual([
-        { iterations: 2, reason: "max_iterations", toolCalls: 2, toolErrors: 0, steers: 0, inputTokens: 0, outputTokens: 0 },
-      ]);
+      expect(seen).toHaveLength(1);
+      expect(seen[0]).toMatchObject({
+        iterations: 2, reason: "max_iterations", outcome: "max_iterations", successful: false,
+        toolCalls: 2, toolErrors: 0, steers: 0, inputTokens: 0, outputTokens: 0,
+      });
     });
 
     it("survives a throwing after-run listener: the run still ends cleanly", async () => {

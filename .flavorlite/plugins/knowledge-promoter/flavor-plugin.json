@@ -1,6 +1,6 @@
 {
   "name": "knowledge-promoter",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "entry": "index.js",
   "description": "promotion ladder: proposes memory->skill and skill->plugin promotions (/ladder)",
   "provides": ["knowledgePromoter"],

@@ -6,6 +6,57 @@ follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-08-20
+
+### Added
+
+- **Trusted evolution episodes** — every proposed improvement now moves through
+  an explicit `implemented → verified → canary → accepted` lifecycle. Focused
+  regression commands must capture a failing baseline before verification, and
+  acceptance requires clean canary runs that exercise the affected capability.
+- **Run-level attribution** — agent runs, tool calls, reflections, skill usage,
+  and promotion evidence carry exact run/session identifiers, preventing
+  concurrent agents and overlapping sessions from contaminating one another's
+  learning data.
+- **Structured evolution rules** — prompt improvements are stored with stable
+  IDs, provenance, confidence, hit metadata, and active state while retaining a
+  readable Markdown mirror.
+- **Evolution operations** — `/evolve episodes`, `/evolve baseline`,
+  `/evolve test`, `/evolve done`, and `/evolve dismiss` expose the verification
+  and acceptance workflow to operators.
+- **Generated-plugin safeguards** — generated plugins receive source auditing
+  plus a time-bounded, permission-restricted child-process preflight that
+  executes activation and disposal before host loading.
+- **Trust-loop specification** — added `docs/specs/evolve-trust-loop.md`
+  describing attribution, signal handling, verification, canary acceptance,
+  skill evidence, router learning, and generated-code governance.
+
+### Changed
+
+- Failure suggestions now distinguish deliberate probes, transient failures,
+  policy failures, and actionable defects; recurrence thresholds use distinct
+  runs and rank by both frequency and recency.
+- Success-pattern mining excludes generic tool-only sequences and records
+  argument-shape signatures without retaining argument values.
+- Router trigger learning now requires minimum support and precision, preserves
+  authored keywords, removes degraded learned tokens, caps learned additions,
+  and records its decisions for audit.
+- Skill promotion is based on successful runs that actually read a `SKILL.md`;
+  knowledge promotion and skill distillation are run-scoped, provenance-aware,
+  and concurrency-safe.
+- Generated evolution plugins use collision-resistant names tied to their
+  source suggestion, and all generated artifacts retain provenance metadata.
+
+### Fixed
+
+- Verification failures and canary regressions now reject the episode, disable
+  its prompt rule or unload its generated plugin, and reopen the source
+  suggestion instead of recording an unverified improvement as complete.
+- Reflection metrics now measure failure-rate deltas correctly and deduplicate
+  failed tools within a run.
+- Cross-platform verification commands now use the native Windows or POSIX
+  command shell with guarded timeout settlement.
+
 ## [0.1.4] - 2026-08-19
 
 ### Added

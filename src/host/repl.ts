@@ -8,7 +8,7 @@ import * as readline from "node:readline";
 import type { AgentHandle } from "./bootstrap";
 import { bold, dim, renderEvent, yellow, type UiBannerInfo, type UiService } from "./render";
 import { version } from "../../package.json";
-import { terminalInteractionPlugin } from "./interaction";
+import { questionWithReadline, terminalInteractionPlugin } from "./interaction";
 import { ReplCompletions, stringWidth } from "./completions";
 import type { LlmService } from "../plugins/llm";
 import type { CommandsService } from "../plugins/commands";
@@ -31,6 +31,19 @@ export interface ReplOptions {
 export function resetMouseTracking(): void {
   if (process.stdin.isTTY !== true || process.stdout.isTTY !== true) return;
   process.stdout.write("\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?1015l");
+}
+
+/** Return ANSI that clears submitted rows and restores their first row. */
+export function submittedInputClearSequence(prompt: string, typed: string, columns: number): string {
+  const width = stringWidth(prompt) + stringWidth(typed);
+  const rows = Math.max(1, Math.ceil(width / Math.max(1, columns)));
+  let sequence = `\x1b[${rows}A\r`;
+  for (let row = 0; row < rows; row += 1) {
+    sequence += "\x1b[2K";
+    if (row < rows - 1) sequence += "\x1b[1B";
+  }
+  if (rows > 1) sequence += `\x1b[${rows - 1}A`;
+  return `${sequence}\r`;
 }
 
 export async function runRepl(handle: AgentHandle, options: ReplOptions = {}): Promise<void> {
@@ -82,11 +95,8 @@ export async function runRepl(handle: AgentHandle, options: ReplOptions = {}): P
   // start() activates it immediately. Prompts take over the terminal, so a
   // UI plugin's in-place animations are frozen for the duration of the ask.
   handle.runtime.use(terminalInteractionPlugin, {
-    onBeforeAsk: () => {
-      rl.pause();
-      resolveUi()?.pauseAnimation?.();
-    },
-    onAfterAsk: () => rl.resume(),
+    onBeforeAsk: () => resolveUi()?.pauseAnimation?.(),
+    question: (prompt) => questionWithReadline(rl, prompt),
   });
 
   printBanner(handle, session, permission.mode());
@@ -103,16 +113,11 @@ export async function runRepl(handle: AgentHandle, options: ReplOptions = {}): P
    * After Enter, readline leaves the typed `› ...` line on screen. When a
    * UI plugin echoes the input in its own style, that remnant becomes a
    * duplicate row — erase it so the turn starts with a single echo line.
-   * Wrapped input occupies one physical row per wrap; clear them all.
+   * Restore the first input row so the styled replacement does not jump.
    */
   const clearInputLine = (typed: string): void => {
     if (process.stdout.isTTY !== true) return;
-    const columns = process.stdout.columns ?? 80;
-    const width = stringWidth(rl.getPrompt()) + stringWidth(typed);
-    const rows = Math.max(1, Math.ceil(width / columns));
-    // Enter left the cursor one row below the input: step up onto the
-    // first input row, erase every wrapped row, end where Enter left off.
-    process.stdout.write(`\x1b[${rows}A\r${"\x1b[2K\x1b[1B".repeat(rows)}\r`);
+    process.stdout.write(submittedInputClearSequence(rl.getPrompt(), typed, process.stdout.columns ?? 80));
   };
 
   rl.on("SIGINT", () => {

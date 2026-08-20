@@ -63,8 +63,13 @@ function plainBoard(plan) {
   return lines.join("\n");
 }
 
-function show(plan) {
-  process.stdout.write(`\n${renderBoard(plan)}\n\n`);
+export function coordinatedTerminalWrite(ui, text, output = process.stdout) {
+  ui?.pauseAnimation?.();
+  output.write(text);
+}
+
+function show(plan, getUi) {
+  coordinatedTerminalWrite(getUi?.(), `\n${renderBoard(plan)}\n\n`);
 }
 
 /** One active plan per plugin instance; hot reload starts fresh. */
@@ -78,7 +83,7 @@ function createStore() {
   };
 }
 
-function createStartTool(store) {
+function createStartTool(store, getUi) {
   return {
     name: "plan_start",
     category: "control",
@@ -127,7 +132,7 @@ function createStartTool(store) {
       };
       const replaced = store.get() ? " (replaced the previous plan)" : "";
       store.set(plan);
-      show(plan);
+      show(plan, getUi);
       return {
         content: `Plan created${replaced}. First task is running — call plan_update after each task finishes (done) or fails (error):\n${plainBoard(plan)}`,
       };
@@ -135,7 +140,7 @@ function createStartTool(store) {
   };
 }
 
-function createUpdateTool(store) {
+function createUpdateTool(store, getUi) {
   return {
     name: "plan_update",
     category: "control",
@@ -175,13 +180,13 @@ function createUpdateTool(store) {
 
       const task = plan.tasks[index - 1];
       if (task.status === status) {
-        show(plan);
+        show(plan, getUi);
         return { content: `Task ${index} is already ${status}.` };
       }
       if (status === "running") {
         const running = plan.tasks.find((t) => t.status === "running");
         if (running && running !== task) {
-          show(plan);
+          show(plan, getUi);
           return {
             content: `Task ${plan.tasks.indexOf(running) + 1} (${running.content}) is still running. Mark it done or error first, then start this one.`,
             isError: true,
@@ -196,13 +201,13 @@ function createUpdateTool(store) {
         const next = plan.tasks.find((t) => t.status === "pending");
         if (next) next.status = "running";
       }
-      show(plan);
+      show(plan, getUi);
       return { content: `Task ${index} updated to ${status}:\n${plainBoard(plan)}` };
     },
   };
 }
 
-function createViewTool(store) {
+function createViewTool(store, getUi) {
   return {
     name: "plan_view",
     category: "read",
@@ -212,13 +217,13 @@ function createViewTool(store) {
     async execute() {
       const plan = store.get();
       if (!plan) return { content: "No active plan." };
-      show(plan);
+      show(plan, getUi);
       return { content: plainBoard(plan) };
     },
   };
 }
 
-function createEndTool(store, plansFile) {
+function createEndTool(store, plansFile, getUi) {
   return {
     name: "plan_end",
     category: "control",
@@ -267,7 +272,7 @@ function createEndTool(store, plansFile) {
 
       store.set(null);
       const done = record.tasks.filter((task) => task.status === "done").length;
-      process.stdout.write(`\n${bold("Task Plan archived")} (${outcome}, ${done}/${record.tasks.length} done)\n\n`);
+      coordinatedTerminalWrite(getUi?.(), `\n${bold("Task Plan archived")} (${outcome}, ${done}/${record.tasks.length} done)\n\n`);
       return {
         content: `Plan archived with outcome "${outcome}" (${done}/${record.tasks.length} tasks done). The board is cleared.`,
       };
@@ -309,11 +314,12 @@ export default {
       const disposers = [];
       const store = createStore();
       const plansFile = join(ctx.cwd, ".flavorlite", "task-planner", "plans.jsonl");
+      const getUi = () => ctx.tryGet("ui");
 
-      disposers.push(ctx.get("tools").register(createStartTool(store)));
-      disposers.push(ctx.get("tools").register(createUpdateTool(store)));
-      disposers.push(ctx.get("tools").register(createViewTool(store)));
-      disposers.push(ctx.get("tools").register(createEndTool(store, plansFile)));
+      disposers.push(ctx.get("tools").register(createStartTool(store, getUi)));
+      disposers.push(ctx.get("tools").register(createUpdateTool(store, getUi)));
+      disposers.push(ctx.get("tools").register(createViewTool(store, getUi)));
+      disposers.push(ctx.get("tools").register(createEndTool(store, plansFile, getUi)));
       disposers.push(
         ctx.get("hooks").hook("prompt/assemble", async (event, next) => {
           event.sections.push({ name: "task-planner", content: GUIDANCE });

@@ -1,0 +1,14 @@
+{
+  "name": "git-safety",
+  "version": "0.1.1",
+  "entry": "index.js",
+  "description": "Structured Git inspection plus content checkpoints that restore agent edits without reset, checkout, stash or commits.",
+  "activation": "eager",
+  "capabilities": ["shell", "files"],
+  "triggers": {
+    "keywords": ["git", "diff", "checkpoint", "回滚", "撤销", "blame"],
+    "tools": ["git_status", "git_diff", "git_blame", "git_checkpoint", "git_restore_checkpoint", "git_checkpoint_list"],
+    "commands": ["checkpoints"]
+  },
+  "config": { "maxFiles": 500, "maxBytes": 10485760 }
+}

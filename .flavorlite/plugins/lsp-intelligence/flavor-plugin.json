@@ -1,0 +1,13 @@
+{
+  "name": "lsp-intelligence",
+  "version": "0.1.0",
+  "entry": "index.js",
+  "description": "Language-server diagnostics, definitions, references, hover and guarded rename over the standard LSP protocol.",
+  "activation": "dynamic",
+  "capabilities": ["shell", "files"],
+  "triggers": {
+    "keywords": ["lsp", "diagnostic", "definition", "reference", "rename", "类型错误", "引用", "定义"],
+    "tools": ["lsp_diagnostics", "lsp_definition", "lsp_references", "lsp_hover", "lsp_rename"]
+  },
+  "config": { "requestTimeoutMs": 10000, "diagnosticWaitMs": 500 }
+}

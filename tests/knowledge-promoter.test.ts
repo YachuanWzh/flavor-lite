@@ -43,6 +43,8 @@ interface DiscoveredSkill {
 let memoryRefs: MemoryRef[] = [];
 let discoveredSkills: DiscoveredSkill[] = [];
 let transcriptMessages: Array<{ role: string; content: string }> = [];
+let usedSkills: DiscoveredSkill[] = [];
+let runCounter = 0;
 
 function stubMemoryPlugin() {
   return definePlugin({
@@ -69,6 +71,7 @@ function stubSkillsPlugin() {
         () =>
           ctx.provide("skills", {
             discover: async () => discoveredSkills,
+            usedInRun: async () => usedSkills,
           }),
         "stub-skills.install",
       );
@@ -121,6 +124,8 @@ describe("knowledge-promoter plugin", () => {
     memoryRefs = [];
     discoveredSkills = [];
     transcriptMessages = [];
+    usedSkills = [];
+    runCounter = 0;
     const pluginsRoot = join(dir, ".flavorlite", "plugins");
     await mkdir(pluginsRoot, { recursive: true });
     await copyDir(PLUGIN_SOURCE, pluginsRoot);
@@ -157,7 +162,12 @@ describe("knowledge-promoter plugin", () => {
   }
 
   async function endRun(stats: LoopAfterRun = finishedRun): Promise<void> {
-    await hooks().waterfall<LoopAfterRun>("loop/after-run", stats);
+    runCounter += 1;
+    await hooks().waterfall<LoopAfterRun>("loop/after-run", {
+      ...stats,
+      runId: `run-${runCounter}`,
+      successful: stats.successful ?? (stats.reason === "finished" && stats.toolErrors === 0),
+    });
   }
 
   async function assembleSections(): Promise<PromptAssemble["sections"]> {
@@ -209,7 +219,7 @@ describe("knowledge-promoter plugin", () => {
     expect(await commands().execute("/ladder")).toContain("no open proposals");
   });
 
-  it("counts skill usage once per finished run from transcript mentions", async () => {
+  it("counts skill usage once per successful run from actual SKILL.md reads", async () => {
     const skillDir = join(dir, ".flavorlite", "skills", "deploy-to-staging");
     await mkdir(skillDir, { recursive: true });
     await writeFile(
@@ -220,17 +230,13 @@ describe("knowledge-promoter plugin", () => {
     discoveredSkills = [
       { name: "Deploy to staging", description: "deploy workflow", path: join(skillDir, "SKILL.md") },
     ];
-    // Mentioned twice in one transcript — still counts once for this run.
-    transcriptMessages = [
-      { role: "user", content: "follow deploy-to-staging please" },
-      { role: "assistant", content: "using Deploy to staging now" },
-    ];
+    usedSkills = discoveredSkills;
 
     await endRun();
     const usage = JSON.parse(
       await readFile(join(dir, ".flavorlite", "knowledge-promoter", "skill-usage.json"), "utf-8"),
     );
-    expect(usage["deploy-to-staging"]).toBe(1);
+    expect(usage["deploy-to-staging"].count).toBe(1);
     expect(await commands().execute("/ladder")).toContain("no open proposals");
 
     await endRun();
@@ -247,7 +253,7 @@ describe("knowledge-promoter plugin", () => {
     discoveredSkills = [
       { name: "Deploy to staging", description: "d", path: join(skillDir, "SKILL.md") },
     ];
-    transcriptMessages = [{ role: "user", content: "deploy-to-staging" }];
+    usedSkills = discoveredSkills;
 
     await endRun({ ...finishedRun, reason: "max_iterations" });
     await endRun({ ...finishedRun, reason: "max_iterations" });
@@ -266,7 +272,7 @@ describe("knowledge-promoter plugin", () => {
     discoveredSkills = [
       { name: "Deploy to staging", description: "deploy workflow", path: join(skillDir, "SKILL.md") },
     ];
-    transcriptMessages = [{ role: "user", content: "deploy-to-staging" }];
+    usedSkills = discoveredSkills;
     await endRun();
     await endRun();
     await endRun();
@@ -280,6 +286,33 @@ describe("knowledge-promoter plugin", () => {
 
     // Proposal closed after conversion.
     expect(await commands().execute("/ladder")).not.toContain("to-plugin deploy-to-staging");
+
+    const accepted = (await commands().execute("/ladder accept deploy-to-staging")) ?? "";
+    expect(accepted).toContain("accepted plugin promotion");
+  });
+
+  it("warns when a promoted memory topic mixes conflicting platform guidance", async () => {
+    memoryRefs = [
+      { id: "1", topicKey: "tooling.shell", summary: "Use cmd.exe syntax on Windows." },
+      { id: "2", topicKey: "tooling.shell", summary: "Use Bash pipelines on Linux." },
+      { id: "3", topicKey: "tooling.shell", summary: "Verify the shell before choosing commands." },
+    ];
+    await commands().execute("/ladder to-skill tooling.shell");
+    const content = await readFile(join(dir, ".flavorlite", "skills", "tooling-shell", "SKILL.md"), "utf-8");
+    expect(content).toContain("mixed platform guidance");
+    expect(content).toContain("Resolve contradictions");
+  });
+
+  it("does not count transcript mentions without an actual skill read", async () => {
+    const skillDir = join(dir, ".flavorlite", "skills", "deploy-to-staging");
+    await mkdir(skillDir, { recursive: true });
+    await writeFile(join(skillDir, "SKILL.md"), "---\nname: Deploy\ndescription: deploy\n---\nbody");
+    discoveredSkills = [{ name: "Deploy", description: "deploy", path: join(skillDir, "SKILL.md") }];
+    transcriptMessages = [{ role: "user", content: "deploy-to-staging" }];
+    usedSkills = [];
+
+    await endRun();
+    expect(await commands().execute("/ladder")).toContain("no open proposals");
   });
 
   it("refuses to-skill and to-plugin for unknown subjects", async () => {

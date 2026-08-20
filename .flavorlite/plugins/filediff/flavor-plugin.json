@@ -1,8 +1,8 @@
 {
   "name": "filediff",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "entry": "index.js",
-  "description": "Print a colored +/- diff after file-modifying tools (Write/Edit/Shell rm/mv): new files in green, deletions in red, edits as separate -/+ blocks.",
+  "description": "Print coordinated colored diffs after file modifications without colliding with the shared terminal UI.",
   "config": {
     "color": "auto",
     "maxDiffLines": 500,

@@ -118,6 +118,10 @@ describe("evolve plugin", () => {
     const pluginsRoot = join(dir, ".flavorlite", "plugins");
     await mkdir(pluginsRoot, { recursive: true });
     await copyDir(PLUGIN_SOURCE, pluginsRoot);
+    const manifestPath = join(pluginsRoot, "evolve", "flavor-plugin.json");
+    const manifest = JSON.parse(await readFile(manifestPath, "utf-8"));
+    manifest.config = { ...(manifest.config ?? {}), verificationCommands: ["node --version"] };
+    await writeFile(manifestPath, JSON.stringify(manifest, null, 2), "utf-8");
 
     runtime = Runtime.create({ cwd: dir });
     runtime
@@ -248,6 +252,20 @@ describe("evolve plugin", () => {
     expect(suggest).toContain("x2");
   });
 
+  it("ranks stronger suggestions first and ignores intentional probes", async () => {
+    await fireError(shellCall("probe"), { content: "intentional probe process.exit(1)", isError: true });
+    await fireError(shellCall("probe"), { content: "intentional probe process.exit(1)", isError: true });
+    await fireError(shellCall("weak"), { content: "weak failure", isError: true });
+    await fireError(shellCall("weak"), { content: "weak failure", isError: true });
+    await fireError(shellCall("strong"), { content: "strong failure", isError: true });
+    await fireError(shellCall("strong"), { content: "strong failure", isError: true });
+    await fireError(shellCall("strong"), { content: "strong failure", isError: true });
+
+    const listing = (await commands().execute("/evolve suggest")) ?? "";
+    expect(listing).not.toContain("intentional probe");
+    expect(listing.indexOf("strong failure")).toBeLessThan(listing.indexOf("weak failure"));
+  });
+
   it("records run stats and a real signalDelta in reflections", async () => {
     await fireError(shellCall("frobnicate"), { content: "boom [exit code: 1]", isError: true });
     await fireError(shellCall("frobnicate"), { content: "boom [exit code: 1]", isError: true });
@@ -283,7 +301,11 @@ describe("evolve plugin", () => {
 
     reflections = await readReflections(dir);
     expect(reflections).toHaveLength(2);
-    expect(reflections[1]).toMatchObject({ totalFailures: 4, signalDelta: 2 });
+    expect(reflections[1]).toMatchObject({ totalFailures: 4, failureRate: 0.4, signalDelta: 0 });
+
+    await hooks().waterfall<LoopAfterRun>("loop/after-run", { ...stats, toolErrors: 0 });
+    reflections = await readReflections(dir);
+    expect(reflections[2]).toMatchObject({ failureRate: 0, signalDelta: -0.4 });
   });
 
   it("/evolve verify sandbox-dry-runs a scaffolded fix plugin", async () => {
@@ -321,6 +343,50 @@ describe("evolve plugin", () => {
     expect(pluginDirs.filter((entry) => entry.startsWith("fix-"))).toHaveLength(0);
   });
 
+  it("requires verification before an implemented episode can be accepted", async () => {
+    const id = await raiseSuggestion("episode-gate");
+    await writeFile(
+      join(dir, "verify-rule.cjs"),
+      "const fs=require('fs');process.exit(fs.existsSync('.flavorlite/evolve/rules.md')?0:1);",
+      "utf-8",
+    );
+    await callTool("evolve_improve", {
+      suggestionId: id,
+      implementation: "Use the focused safe path.",
+      kind: "prompt_rule",
+      verificationCommand: "node verify-rule.cjs",
+    });
+
+    expect(await commands().execute(`/evolve done ${id}`)).toContain("run /evolve test");
+    expect(await commands().execute(`/evolve test ${id}`)).toContain("verification passed");
+    expect(await commands().execute(`/evolve done ${id}`)).toContain("entered canary");
+    for (let index = 0; index < 3; index += 1) {
+      await fireOk("Shell", `canary-${index}`);
+      await hooks().waterfall<LoopAfterRun>("loop/after-run", runStats);
+    }
+    expect(await commands().execute("/evolve episodes")).toContain("accepted");
+  });
+
+  it("rejects a failed verification and disables its prompt rule", async () => {
+    const assemble = () =>
+      hooks().waterfall<PromptAssemble>("prompt/assemble", { cwd: dir, sections: [] });
+    const id = await raiseSuggestion("episode-reject");
+    await writeFile(join(dir, "always-fail.cjs"), "process.exit(1);", "utf-8");
+    await callTool("evolve_improve", {
+      suggestionId: id,
+      implementation: "Apply the experimental path only after verification.",
+      kind: "prompt_rule",
+      verificationCommand: "node always-fail.cjs",
+    });
+
+    expect((await assemble()).sections.find((section) => section.name === "evolve-rules")?.content)
+      .toContain("Apply the experimental path only after verification.");
+    expect(await commands().execute(`/evolve test ${id}`)).toContain("verification FAILED");
+    expect(await commands().execute("/evolve episodes")).toContain("rejected");
+    expect((await assemble()).sections.find((section) => section.name === "evolve-rules"))
+      .toBeUndefined();
+  });
+
   it("injects an evolve-rules section only once rules.md has content", async () => {
     const assemble = () =>
       hooks().waterfall<PromptAssemble>("prompt/assemble", { cwd: dir, sections: [] });
@@ -351,32 +417,40 @@ describe("evolve plugin", () => {
     expect(String(result.content)).toContain("Scaffolded fix plugin");
 
     const pluginDirs = await readdir(join(dir, ".flavorlite", "plugins"));
-    expect(pluginDirs).toContain("fix-shell");
+    expect(pluginDirs.some((entry) => entry.startsWith("fix-shell-"))).toBe(true);
   });
 
   it("proposes a new tool once a success trigram repeats across enough runs", async () => {
     expect(await commands().execute("/evolve suggest")).toContain("no open suggestions");
 
-    await runOnceWithSequence(["Read", "Grep", "Write"]);
-    await runOnceWithSequence(["Read", "Grep", "Write"]);
+    await runOnceWithSequence(["project_inspect", "deploy_validate", "artifact_publish"]);
+    await runOnceWithSequence(["project_inspect", "deploy_validate", "artifact_publish"]);
     let patterns = await readPatterns(dir);
-    expect(patterns.find((p) => p.sequence.join("->") === "Read->Grep->Write")?.count).toBe(2);
+    expect(patterns.find((p) => p.sequence.join("->") === "project_inspect->deploy_validate->artifact_publish")?.count).toBe(2);
     expect(await commands().execute("/evolve suggest")).not.toContain("tool proposal");
 
-    await runOnceWithSequence(["Read", "Grep", "Write"]);
+    await runOnceWithSequence(["project_inspect", "deploy_validate", "artifact_publish"]);
     patterns = await readPatterns(dir);
-    expect(patterns.find((p) => p.sequence.join("->") === "Read->Grep->Write")?.count).toBe(3);
+    expect(patterns.find((p) => p.sequence.join("->") === "project_inspect->deploy_validate->artifact_publish")?.count).toBe(3);
 
     const suggest = await commands().execute("/evolve suggest");
     expect(suggest).toContain("tool proposal");
-    expect(suggest).toContain("Read->Grep->Write");
+    expect(suggest).toContain("project_inspect->deploy_validate->artifact_publish");
   });
 
   it("counts a trigram once per run even if it repeats within the run", async () => {
-    await runOnceWithSequence(["Read", "Grep", "Write", "Read", "Grep", "Write"]);
+    await runOnceWithSequence(["project_inspect", "deploy_validate", "artifact_publish", "project_inspect", "deploy_validate", "artifact_publish"]);
 
     const patterns = await readPatterns(dir);
-    expect(patterns.find((p) => p.sequence.join("->") === "Read->Grep->Write")?.count).toBe(1);
+    expect(patterns.find((p) => p.sequence.join("->") === "project_inspect->deploy_validate->artifact_publish")?.count).toBe(1);
+  });
+
+  it("does not promote generic agent-mechanics trigrams", async () => {
+    await runOnceWithSequence(["Read", "Grep", "Write"]);
+    await runOnceWithSequence(["Read", "Grep", "Write"]);
+    await runOnceWithSequence(["Read", "Grep", "Write"]);
+    expect(await readPatterns(dir)).toHaveLength(0);
+    expect(await commands().execute("/evolve suggest")).not.toContain("tool proposal");
   });
 
   it("/evolve export writes clean SFT trajectories, dropping meta and short sessions", async () => {
@@ -426,7 +500,11 @@ describe("evolve plugin", () => {
   it("/evolve learn writes confirmed recall tokens back into manifest triggers", async () => {
     const memory = [
       { fp: ["hotreload", "plugin"], plugin: "evolve", used: true },
+      { fp: ["plugin"], plugin: "evolve", used: true },
+      { fp: ["plugin"], plugin: "evolve", used: true },
       { fp: ["hotreload", "noise"], plugin: "evolve", used: false },
+      { fp: ["hotreload", "noise"], plugin: "evolve", used: false },
+      { fp: ["noise"], plugin: "evolve", used: false },
     ];
     await writeFile(join(dir, ".flavorlite", "router-memory.json"), JSON.stringify(memory), "utf-8");
 
@@ -444,6 +522,21 @@ describe("evolve plugin", () => {
 
     // Idempotent: a second pass finds nothing new.
     expect(await commands().execute("/evolve learn")).toContain("no new triggers learned");
+
+    await writeFile(
+      join(dir, ".flavorlite", "router-memory.json"),
+      JSON.stringify([
+        { fp: ["plugin"], plugin: "evolve", used: false },
+        { fp: ["plugin"], plugin: "evolve", used: false },
+        { fp: ["plugin"], plugin: "evolve", used: false },
+      ]),
+      "utf-8",
+    );
+    expect(await commands().execute("/evolve learn")).toContain("-[plugin]");
+    const unlearned = JSON.parse(
+      await readFile(join(dir, ".flavorlite", "plugins", "evolve", "flavor-plugin.json"), "utf-8"),
+    );
+    expect(unlearned.triggers.keywords).not.toContain("plugin");
   });
 
   it("/evolve learn degrades gracefully without router feedback", async () => {
@@ -488,7 +581,7 @@ describe("evolve plugin", () => {
     expect(suggest).toContain("Quote Windows paths in shell commands.");
     expect(suggest).not.toContain("[em:lowconf");
 
-    await commands().execute(`/evolve done em:${recordId}`);
+    await commands().execute(`/evolve dismiss em:${recordId}`);
     expect(await commands().execute("/evolve suggest")).not.toContain(`[em:${recordId}]`);
   });
 

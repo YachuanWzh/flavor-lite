@@ -49,6 +49,10 @@ const MAX_CONTENT_CHARS = 20000;
 const MIN_EXPORT_MESSAGES = 4;
 const DEFAULT_EM_CONFIDENCE = 0.7;
 const MAX_TRIGGER_KEYWORDS = 16;
+const DEFAULT_LEARN_MIN_SUPPORT = 3;
+const DEFAULT_LEARN_MIN_PRECISION = 0.75;
+const DEFAULT_CANARY_RUNS = 3;
+const GENERIC_PATTERN_TOOLS = new Set(["read", "grep", "glob", "shell", "write", "edit", "todowrite"]);
 
 const SUGGEST_SECTION = `# self-improvement suggestions (evolve plugin)
 
@@ -102,15 +106,24 @@ async function readAnalyzedErrors(cwd, minConfidence) {
 /** Run one command with output capture; never throws. */
 function runCommand(command, cwd, timeoutMs) {
   return new Promise((resolve) => {
-    const child = spawn("cmd.exe", ["/d", "/s", "/c", command], {
+    const shell = process.platform === "win32"
+      ? { file: "cmd.exe", args: ["/d", "/s", "/c", command] }
+      : { file: "/bin/sh", args: ["-lc", command] };
+    const child = spawn(shell.file, shell.args, {
       cwd,
       windowsHide: true,
     });
     let stdout = "";
     let stderr = "";
+    let settled = false;
+    const finish = (result) => {
+      if (settled) return;
+      settled = true;
+      resolve(result);
+    };
     const timer = setTimeout(() => {
       child.kill();
-      resolve({ ok: false, stdout, stderr: `${stderr}\n[killed: exceeded ${timeoutMs}ms]`, code: "timeout" });
+      finish({ ok: false, stdout, stderr: `${stderr}\n[killed: exceeded ${timeoutMs}ms]`, code: "timeout" });
     }, timeoutMs);
     child.stdout.on("data", (chunk) => {
       stdout += String(chunk);
@@ -120,18 +133,18 @@ function runCommand(command, cwd, timeoutMs) {
     });
     child.on("error", (error) => {
       clearTimeout(timer);
-      resolve({ ok: false, stdout, stderr: `${stderr}\n${error.message}`, code: "spawn" });
+      finish({ ok: false, stdout, stderr: `${stderr}\n${error.message}`, code: "spawn" });
     });
     child.on("close", (code) => {
       clearTimeout(timer);
-      resolve({ ok: code === 0, stdout, stderr, code });
+      finish({ ok: code === 0, stdout, stderr, code });
     });
   });
 }
 
 export default {
   name: "evolve",
-  version: "0.1.0",
+  version: "0.2.0",
   description: "bounded recursive self-improvement: capture repeated failures, propose plugin-level fixes, verify with tests",
   provides: ["evolve"],
   inject: ["hooks", "tools", "commands", "pluginsLoader"],
@@ -148,12 +161,20 @@ export default {
       const testTimeoutMs = Number.isFinite(config.testTimeoutMs) ? config.testTimeoutMs : TEST_TIMEOUT_MS;
       const exportLimit = Number.isFinite(config.exportLimit) ? config.exportLimit : DEFAULT_EXPORT_LIMIT;
       const emConfidence = Number.isFinite(config.emConfidence) ? config.emConfidence : DEFAULT_EM_CONFIDENCE;
+      const learnMinSupport = Number.isFinite(config.learnMinSupport) ? config.learnMinSupport : DEFAULT_LEARN_MIN_SUPPORT;
+      const learnMinPrecision = Number.isFinite(config.learnMinPrecision) ? config.learnMinPrecision : DEFAULT_LEARN_MIN_PRECISION;
+      const canaryRuns = Number.isFinite(config.canaryRuns) ? Math.max(1, config.canaryRuns) : DEFAULT_CANARY_RUNS;
+      const verificationCommands = Array.isArray(config.verificationCommands)
+        ? config.verificationCommands.filter((command) => typeof command === "string" && command.trim())
+        : [testCommand, "npm run typecheck", "npm run build"];
 
       const store = new EvolveStore({ cwd: ctx.cwd });
       const disposers = [];
       // Success-call names of the current run (values never recorded);
       // flushed into trigram patterns on loop/after-run.
-      const recentCalls = [];
+      const recentCalls = new Map();
+      const failedCalls = new Map();
+      const legacyRunId = "legacy";
 
       // Service: exposes the store for other plugins and the tools below.
       disposers.push(
@@ -180,13 +201,23 @@ export default {
         ctx.get("hooks").hook("tools/after-call", async (event, next) => {
           try {
             if (event.result?.isError === true) {
-              await store.recordSignal({
+              const recorded = await store.recordSignal({
                 tool: event.toolCall.name,
                 args: event.args ?? event.toolCall.args,
                 error: event.result.content,
+                runId: event.context?.runId,
+                sessionId: event.context?.sessionId,
               });
+              const runId = event.context?.runId ?? legacyRunId;
+              const failures = failedCalls.get(runId) ?? [];
+              failures.push({ id: recorded.record.id, tool: event.toolCall.name, at: new Date().toISOString() });
+              failedCalls.set(runId, failures);
             } else {
-              recentCalls.push(event.toolCall.name);
+              const runId = event.context?.runId ?? legacyRunId;
+              const calls = recentCalls.get(runId) ?? [];
+              const keys = Object.keys(event.args ?? event.toolCall.args ?? {}).sort();
+              calls.push({ name: event.toolCall.name, signature: keys.length > 0 ? `${event.toolCall.name}(${keys.join(",")})` : event.toolCall.name });
+              recentCalls.set(runId, calls);
             }
           } catch (error) {
             ctx.logger.warn(`evolve: capture failed — ${error instanceof Error ? error.message : String(error)}`);
@@ -231,32 +262,83 @@ export default {
           try {
             // Mine this run's success sequence into trigrams. A trigram counts
             // once per run: only cross-run recurrence signals a real workflow.
+            const runId = event.runId ?? legacyRunId;
+            const calls = recentCalls.get(runId) ?? [];
+            const failures = failedCalls.get(runId) ?? [];
             const seen = new Set();
-            for (let i = 0; i + 3 <= recentCalls.length; i += 1) {
-              const trigram = recentCalls.slice(i, i + 3);
-              const key = trigram.join("->");
-              if (seen.has(key)) continue;
-              seen.add(key);
-              await store.recordPattern({ sequence: trigram });
+            if (event.successful !== false && event.outcome !== "provider_error") {
+              for (let i = 0; i + 3 <= calls.length; i += 1) {
+                const window = calls.slice(i, i + 3);
+                const names = window.map((call) => call.name);
+                // Generic file/search/shell trigrams describe normal agent mechanics,
+                // not a reusable domain workflow. Require at least one semantic tool.
+                if (names.every((name) => GENERIC_PATTERN_TOOLS.has(name.toLocaleLowerCase()))) continue;
+                const sequence = window.map((call) => call.signature);
+                const key = sequence.join("->");
+                if (seen.has(key)) continue;
+                seen.add(key);
+                await store.recordPattern({ sequence, runId: event.runId });
+              }
             }
-            recentCalls.length = 0;
+            recentCalls.delete(runId);
+            failedCalls.delete(runId);
 
             const current = await store.signals();
-            const failedTools = current
+            const failedTools = [...new Set(current
               .filter((signal) => (signal.count ?? 1) >= minRepeats)
-              .map((signal) => signal.tool);
+              .map((signal) => signal.tool))];
             const totalFailures = current.reduce((sum, signal) => sum + (signal.count ?? 1), 0);
             const [previous] = await store.reflections(1);
+            const failureRate = (event.toolCalls ?? 0) > 0 ? (event.toolErrors ?? 0) / event.toolCalls : 0;
             await store.appendReflection({
+              runId: event.runId,
+              sessionId: event.sessionId,
               iterations: event.iterations ?? 0,
               reason: event.reason ?? "finished",
+              outcome: event.outcome,
               toolCalls: event.toolCalls ?? 0,
               toolErrors: event.toolErrors ?? 0,
               steers: event.steers ?? 0,
               totalFailures,
-              signalDelta: previous ? totalFailures - (previous.totalFailures ?? 0) : 0,
+              failureRate,
+              signalDelta: previous ? failureRate - (previous.failureRate ?? 0) : 0,
               failedTools,
             });
+
+            // CANARY: only count runs that exercised the affected tool. A
+            // recurrence reopens the suggestion; clean exposures accumulate
+            // until the episode is accepted automatically.
+            for (const episode of await store.episodes(200)) {
+              if (episode.status !== "canary") continue;
+              const sourceTool = episode.source?.tool;
+              const sourceSequence = Array.isArray(episode.source?.sequence) ? episode.source.sequence : [];
+              const signatures = calls.map((call) => call.signature);
+              const sequenceExposed = sourceSequence.length > 0 && signatures.some((_, index) =>
+                sourceSequence.every((value, offset) => signatures[index + offset] === value));
+              const toolExposed = typeof sourceTool === "string"
+                && (calls.some((call) => call.name === sourceTool) || failures.some((call) => call.tool === sourceTool));
+              if (!toolExposed && !sequenceExposed) continue;
+              const regressed = typeof sourceTool === "string"
+                ? failures.some((call) => call.tool === sourceTool && String(call.at) >= String(episode.canaryStartedAt ?? ""))
+                : failures.some((call) => String(call.at) >= String(episode.canaryStartedAt ?? ""));
+              if (regressed) {
+                if (episode.ruleId) await store.updateRule(episode.ruleId, { active: false });
+                if (episode.pluginName) {
+                  await ctx.get("pluginsLoader").eject(episode.pluginName).catch(() => {});
+                }
+                await store.updateEpisode(episode.id, "rejected", {
+                  rejectedAt: new Date().toISOString(),
+                  reason: `failure recurred during canary run ${event.runId ?? legacyRunId}`,
+                });
+                continue;
+              }
+              const count = (episode.canaryCount ?? 0) + 1;
+              if (count >= canaryRuns) {
+                await store.updateEpisode(episode.id, "accepted", { canaryCount: count, acceptedAt: new Date().toISOString() });
+              } else {
+                await store.updateEpisode(episode.id, "canary", { canaryCount: count, lastCanaryRunId: event.runId });
+              }
+            }
           } catch (error) {
             ctx.logger.warn(`evolve: reflection failed — ${error instanceof Error ? error.message : String(error)}`);
           }
@@ -275,12 +357,16 @@ export default {
             "instructions for implementing, hot-reloading, and verifying it. kind=prompt_rule: distills the " +
             "implementation text into a permanent behavior rule injected into the system prompt (no plugin). " +
             "Use when the model proposes a concrete fix for a suggestion in the system prompt.",
-          category: "write",
+          category: "shell",
           inputSchema: {
             type: "object",
             properties: {
               suggestionId: { type: "string", description: "Signal id from the evolve suggestions" },
               implementation: { type: "string", description: "Concise description of the fix to implement" },
+              verificationCommand: {
+                type: "string",
+                description: "Optional focused regression command. It must fail before the change and pass after implementation.",
+              },
               kind: {
                 type: "string",
                 enum: ["plugin", "prompt_rule"],
@@ -293,8 +379,10 @@ export default {
             const suggestionId = String(args?.suggestionId ?? "");
             const implementation = String(args?.implementation ?? "");
             const kind = args?.kind === "prompt_rule" ? "prompt_rule" : "plugin";
+            const verificationCommand = typeof args?.verificationCommand === "string" ? args.verificationCommand.trim() : "";
             const doneIds = new Set(await store.readDoneIds());
-            const analyzed = (await readAnalyzedErrors(ctx.cwd, emConfidence)).filter((entry) => !doneIds.has(entry.id));
+            const activeIds = new Set(await store.activeSuggestionIds());
+            const analyzed = (await readAnalyzedErrors(ctx.cwd, emConfidence)).filter((entry) => !doneIds.has(entry.id) && !activeIds.has(entry.id));
             const suggestions = [
               ...(await store.openSuggestions({ threshold: minRepeats, limit: 100 })),
               ...(await store.openPatternSuggestions({ threshold: patternThreshold, limit: 100 })),
@@ -305,20 +393,44 @@ export default {
               return { content: `No open suggestion with id "${suggestionId}".`, isError: true };
             }
 
+            let baseline;
+            if (verificationCommand) {
+              baseline = await runCommand(verificationCommand, ctx.cwd, testTimeoutMs);
+              if (baseline.ok) {
+                return {
+                  content: "Focused regression command already passes; refusing to claim a red-green improvement. Supply a reproducer that fails before the change.",
+                  isError: true,
+                };
+              }
+            }
+
             if (kind === "prompt_rule") {
-              await store.appendRule(implementation);
-              await store.markSuggestionDone(suggestion.id);
+              const rule = await store.appendRule(implementation, { sourceId: suggestion.id, confidence: 0.5 });
+              const episode = await store.beginEpisode({
+                suggestionId: suggestion.id,
+                kind,
+                implementation,
+                source: suggestion,
+              });
+              await store.updateEpisode(episode.id, "implemented", { ruleId: rule?.id });
+              if (verificationCommand) {
+                await store.updateEpisode(episode.id, "implemented", {
+                  verificationCommand,
+                  baseline: { ok: false, code: baseline?.code, stderr: baseline?.stderr?.slice(-2000) },
+                  ruleId: rule?.id,
+                });
+              }
               return {
                 content: [
-                  `Distilled suggestion [${suggestion.id}] into a prompt rule and marked it done.`,
+                  `Distilled suggestion [${suggestion.id}] into prompt rule ${rule?.id ?? "(legacy)"}.`,
                   `Rule: ${implementation}`,
-                  `It is injected into the system prompt from .flavorlite/evolve/rules.md on every run.`,
+                  `Episode ${episode.id} is implemented, not accepted. Run /evolve test ${suggestion.id}, then /evolve done ${suggestion.id}.`,
                 ].join("\n"),
               };
             }
 
             const loader = ctx.get("pluginsLoader");
-            const name = sanitizePluginName(suggestion.tool ?? suggestion.sequence?.join("-") ?? "fix");
+            const name = `${sanitizePluginName(suggestion.tool ?? suggestion.sequence?.join("-") ?? "fix")}-${suggestion.id.replace(/[^a-z0-9]/gi, "").slice(-6).toLowerCase()}`;
             let dir;
             try {
               dir = await loader.scaffold(name);
@@ -337,10 +449,24 @@ export default {
               const manifestFile = join(dir, "flavor-plugin.json");
               const manifest = JSON.parse(await readFile(manifestFile, "utf-8"));
               manifest.origin = "generated";
-              manifest.generatedFrom = new Date().toISOString();
+              manifest.generatedFrom = suggestion.id;
               await writeFile(manifestFile, `${JSON.stringify(manifest, null, 2)}\n`, "utf-8");
             } catch {
               // manifest missing: leave provenance to the caller
+            }
+
+            const episode = await store.beginEpisode({
+              suggestionId: suggestion.id,
+              kind,
+              implementation,
+              pluginName: name,
+              source: suggestion,
+            });
+            if (verificationCommand) {
+              await store.updateEpisode(episode.id, "implemented", {
+                verificationCommand,
+                baseline: { ok: false, code: baseline?.code, stderr: baseline?.stderr?.slice(-2000) },
+              });
             }
 
             // Record the implementation plan next to the scaffold so the
@@ -385,7 +511,7 @@ export default {
                 `2. Run /evolve verify ${name} — the sandbox dry-run must pass before activation.`,
                 `3. Run /plugin reload ${name} to hot-load it.`,
                 `4. Run /evolve test to verify the suite still passes.`,
-                `5. Run /evolve done ${suggestion.id} to close the suggestion. If anything breaks, /evolve revert ${name} restores the last good version.`,
+                `5. Run /evolve test ${suggestion.id}; only then can /evolve done ${suggestion.id} accept it. If anything breaks, /evolve revert ${name} restores the last good version.`,
               ].join("\n"),
             };
           },
@@ -414,7 +540,8 @@ export default {
               const suggestions = await store.openSuggestions({ threshold: minRepeats, limit: 100 });
               const proposals = await store.openPatternSuggestions({ threshold: patternThreshold, limit: 100 });
               const doneIds = new Set(await store.readDoneIds());
-              const analyzed = (await readAnalyzedErrors(ctx.cwd, emConfidence)).filter((entry) => !doneIds.has(entry.id));
+              const activeIds = new Set(await store.activeSuggestionIds());
+              const analyzed = (await readAnalyzedErrors(ctx.cwd, emConfidence)).filter((entry) => !doneIds.has(entry.id) && !activeIds.has(entry.id));
               if (suggestions.length === 0 && proposals.length === 0 && analyzed.length === 0) {
                 return "no open suggestions (need >= 2 repeats of the same failure, or a recurring success trigram)";
               }
@@ -481,7 +608,7 @@ export default {
               if (!Array.isArray(memory) || memory.length === 0) {
                 return "no router feedback memory found (.flavorlite/router-memory.json)";
               }
-              const scores = new Map(); // plugin name -> Map<token, net score>
+              const scores = new Map(); // plugin name -> Map<token, {used, unused}>
               for (const entry of memory) {
                 if (!entry || typeof entry.plugin !== "string" || !Array.isArray(entry.fp)) continue;
                 let tokens = scores.get(entry.plugin);
@@ -491,45 +618,123 @@ export default {
                 }
                 for (const token of new Set(entry.fp)) {
                   if (typeof token !== "string" || token.length < 2) continue;
-                  tokens.set(token, (tokens.get(token) ?? 0) + (entry.used === true ? 1 : -1));
+                  const score = tokens.get(token) ?? { used: 0, unused: 0 };
+                  if (entry.used === true) score.used += 1;
+                  else score.unused += 1;
+                  tokens.set(token, score);
                 }
+              }
+              const auditFile = join(store.dir, "learned-triggers.json");
+              let audit = {};
+              try {
+                audit = JSON.parse(await readFile(auditFile, "utf-8"));
+              } catch {
+                audit = {};
               }
               const lines = [];
               for (const status of loader.list()) {
                 const tokens = scores.get(status.name);
                 if (!tokens) continue;
                 const candidates = [...tokens.entries()]
-                  .filter(([, score]) => score >= 1)
-                  .map(([token]) => token)
-                  .sort();
-                if (candidates.length === 0) continue;
+                  .map(([token, counts]) => ({
+                    token,
+                    ...counts,
+                    support: counts.used + counts.unused,
+                    precision: counts.used / Math.max(1, counts.used + counts.unused),
+                  }))
+                  .filter((candidate) => candidate.support >= learnMinSupport && candidate.precision >= learnMinPrecision)
+                  .sort((a, b) => b.precision - a.precision || b.support - a.support || a.token.localeCompare(b.token));
                 const manifestFile = join(status.dir, "flavor-plugin.json");
                 try {
                   const manifest = JSON.parse(await readFile(manifestFile, "utf-8"));
                   const existing = Array.isArray(manifest.triggers?.keywords) ? manifest.triggers.keywords : [];
-                  const seen = new Set(existing.map((keyword) => String(keyword).toLowerCase()));
-                  const additions = candidates.filter((token) => !seen.has(token.toLowerCase()));
-                  if (additions.length === 0) continue;
+                  const previouslyLearned = new Set(Array.isArray(audit[status.name]) ? audit[status.name] : []);
+                  const desired = candidates.map((candidate) => candidate.token);
+                  const desiredLower = new Set(desired.map((token) => token.toLocaleLowerCase()));
+                  const authored = existing.filter((keyword) => !previouslyLearned.has(String(keyword)));
+                  const room = Math.max(0, MAX_TRIGGER_KEYWORDS - authored.length);
+                  const learned = desired
+                    .filter((token) => !authored.some((keyword) => String(keyword).toLocaleLowerCase() === token.toLocaleLowerCase()))
+                    .slice(0, room);
+                  const next = [...authored, ...learned];
+                  const additions = learned.filter((token) => !existing.some((keyword) => String(keyword).toLocaleLowerCase() === token.toLocaleLowerCase()));
+                  const removals = existing.filter((keyword) => previouslyLearned.has(String(keyword)) && !desiredLower.has(String(keyword).toLocaleLowerCase()));
+                  if (JSON.stringify(next) === JSON.stringify(existing)) continue;
                   manifest.triggers = {
                     ...(manifest.triggers ?? {}),
-                    keywords: [...existing, ...additions].slice(0, MAX_TRIGGER_KEYWORDS),
+                    keywords: next,
                   };
                   await writeFile(manifestFile, `${JSON.stringify(manifest, null, 2)}\n`, "utf-8");
-                  lines.push(`learned triggers: ${status.name} +[${additions.join(", ")}]`);
+                  audit[status.name] = learned;
+                  lines.push(`learned triggers: ${status.name} +[${additions.join(", ")}] -[${removals.join(", ")}]`);
                 } catch {
                   // manifest missing or unwritable: skip this plugin (fail-safe)
                 }
               }
+              await mkdir(store.dir, { recursive: true });
+              await writeFile(auditFile, `${JSON.stringify(audit, null, 2)}\n`, "utf-8");
               return lines.length > 0
                 ? lines.join("\n")
-                : "no new triggers learned (nothing scored >= 1, or all candidates already present)";
+                : `no new triggers learned (need support >= ${learnMinSupport} and precision >= ${learnMinPrecision})`;
             }
 
-            if (arg === "test") {
-              const result = await runCommand(testCommand, ctx.cwd, testTimeoutMs);
-              return result.ok
-                ? `tests passed (exit 0)${result.stdout ? `\n${result.stdout.slice(-4000)}` : ""}`
-                : `tests FAILED (exit ${result.code})${result.stderr ? `\n${result.stderr.slice(-4000)}` : ""}`;
+            if (arg === "test" || arg.startsWith("test ")) {
+              const suggestionId = arg.startsWith("test ") ? arg.slice(5).trim() : "";
+              const episode = suggestionId
+                ? (await store.episodes(200)).find((entry) => entry.suggestionId === suggestionId)
+                : undefined;
+              if (suggestionId && !episode) return `no evolution episode for suggestion "${suggestionId}"`;
+              if (episode && (!episode.verificationCommand || episode.baseline?.ok !== false)) {
+                return `refusing: episode ${episode.id} has no captured red baseline; run /evolve baseline ${suggestionId} <focused-command> before implementation`;
+              }
+              const commandsToRun = [
+                ...(episode?.verificationCommand ? [episode.verificationCommand] : []),
+                ...verificationCommands,
+              ].filter((command, index, all) => all.indexOf(command) === index);
+              const reports = [];
+              for (const command of commandsToRun) {
+                const result = await runCommand(command, ctx.cwd, testTimeoutMs);
+                reports.push({ command, ok: result.ok, code: result.code, stdout: result.stdout.slice(-2000), stderr: result.stderr.slice(-2000) });
+                if (!result.ok) {
+                  if (episode?.ruleId) await store.updateRule(episode.ruleId, { active: false });
+                  if (episode?.pluginName) await loader.eject(episode.pluginName).catch(() => {});
+                  if (episode) {
+                    await store.updateEpisode(episode.id, "rejected", {
+                      verification: reports,
+                      rejectedAt: new Date().toISOString(),
+                      reason: `verification failed: ${command}`,
+                    });
+                  }
+                  return `verification FAILED: ${command} (exit ${result.code})${result.stderr ? `\n${result.stderr.slice(-4000)}` : ""}`;
+                }
+              }
+              if (episode) await store.updateEpisode(episode.id, "verified", { verification: reports, verifiedAt: new Date().toISOString() });
+              return `verification passed (${commandsToRun.length} command(s))${episode ? `; episode ${episode.id} is verified and ready for /evolve done ${suggestionId}` : ""}`;
+            }
+
+            if (arg === "episodes") {
+              const episodes = await store.episodes(20);
+              return episodes.length === 0
+                ? "no evolution episodes yet"
+                : episodes.map((episode) => `[${episode.id}] ${episode.suggestionId} ${episode.status}${episode.pluginName ? ` plugin=${episode.pluginName}` : ""}`).join("\n");
+            }
+
+            if (arg.startsWith("baseline ")) {
+              const rest = arg.slice(9).trim();
+              const splitAt = rest.indexOf(" ");
+              if (splitAt <= 0) return "usage: /evolve baseline <suggestionId> <focused-command>";
+              const suggestionId = rest.slice(0, splitAt);
+              const command = rest.slice(splitAt + 1).trim();
+              const episode = (await store.episodes(200)).find((entry) => entry.suggestionId === suggestionId);
+              if (!episode) return `no implemented episode for suggestion "${suggestionId}"`;
+              if (episode.status !== "implemented") return `refusing: episode ${episode.id} is already ${episode.status}`;
+              const result = await runCommand(command, ctx.cwd, testTimeoutMs);
+              if (result.ok) return "refusing: focused command already passes; it does not reproduce the pre-change failure";
+              await store.updateEpisode(episode.id, "implemented", {
+                verificationCommand: command,
+                baseline: { ok: false, code: result.code, stderr: result.stderr.slice(-2000) },
+              });
+              return `captured red baseline for episode ${episode.id}; implement the change, then /evolve test ${suggestionId}`;
             }
 
             if (arg === "clear") {
@@ -542,6 +747,8 @@ export default {
               if (!name) return "usage: /evolve verify <plugin>";
               const report = await loader.verify(name);
               if (!report.ok) return `verify FAILED: ${name}\n  ${report.error ?? "unknown error"}`;
+              const episode = (await store.episodes(200)).find((entry) => entry.pluginName === name);
+              if (episode) await store.updateEpisode(episode.id, episode.status, { smokeVerified: true, smokeVerifiedAt: new Date().toISOString() });
               return [
                 `verify OK: ${name} (sandbox dry-run, host untouched)`,
                 `  provides: ${report.provided.join(", ") || "-"}`,
@@ -554,7 +761,10 @@ export default {
               const name = arg.slice(7).trim();
               if (!name) return "usage: /evolve revert <plugin>";
               try {
-                return await loader.revert(name);
+                const message = await loader.revert(name);
+                const episode = (await store.episodes(200)).find((entry) => entry.pluginName === name);
+                if (episode) await store.updateEpisode(episode.id, "rolled_back", { rolledBackAt: new Date().toISOString() });
+                return message;
               } catch (error) {
                 return `error: ${error instanceof Error ? error.message : String(error)}`;
               }
@@ -563,20 +773,47 @@ export default {
             if (arg.startsWith("done ")) {
               const id = arg.slice(5).trim();
               if (!id) return "usage: /evolve done <suggestionId>";
+              const episode = (await store.episodes(200)).find((entry) => entry.suggestionId === id);
+              if (!episode) return `refusing: no implemented episode for ${id}; use /evolve improve or evolve_improve first`;
+              if (episode.status !== "verified") return `refusing: episode ${episode.id} is ${episode.status}; run /evolve test ${id} first`;
+              await store.updateEpisode(episode.id, "canary", { canaryCount: 0, canaryStartedAt: new Date().toISOString() });
+              return `episode ${episode.id} entered canary; it will be accepted after ${canaryRuns} clean runs that exercise ${episode.source?.tool ?? "the affected capability"}`;
+            }
+
+            if (arg.startsWith("dismiss ")) {
+              const id = arg.slice(8).trim();
+              if (!id) return "usage: /evolve dismiss <suggestionId>";
+              const episode = (await store.episodes(200)).find((entry) => entry.suggestionId === id);
+              if (episode?.ruleId) await store.updateRule(episode.ruleId, { active: false });
+              if (episode?.pluginName) await loader.eject(episode.pluginName).catch(() => {});
+              if (episode) {
+                await store.updateEpisode(episode.id, "rejected", {
+                  rejectedAt: new Date().toISOString(),
+                  reason: "dismissed by operator",
+                });
+              }
               await store.markSuggestionDone(id);
-              return `marked ${id} done`;
+              return `dismissed ${id} without claiming an improvement`;
             }
 
             if (arg.startsWith("improve ")) {
               const suggestionId = arg.slice(8).trim();
-              const suggestions = await store.openSuggestions({ threshold: minRepeats, limit: 100 });
+              const doneIds = new Set(await store.readDoneIds());
+              const activeIds = new Set(await store.activeSuggestionIds());
+              const suggestions = [
+                ...(await store.openSuggestions({ threshold: minRepeats, limit: 100 })),
+                ...(await store.openPatternSuggestions({ threshold: patternThreshold, limit: 100 })),
+                ...(await readAnalyzedErrors(ctx.cwd, emConfidence)).filter((entry) => !doneIds.has(entry.id) && !activeIds.has(entry.id)),
+              ];
               const suggestion = suggestions.find((s) => s.id === suggestionId);
               if (!suggestion) {
                 return `No open suggestion with id "${suggestionId}". Use /evolve suggest to list them.`;
               }
               let dir;
               try {
-                dir = await loader.scaffold(sanitizePluginName(suggestion.tool));
+                const base = suggestion.tool ?? suggestion.sequence?.join("-") ?? "fix";
+                const pluginName = `${sanitizePluginName(base)}-${suggestion.id.replace(/[^a-z0-9]/gi, "").slice(-6).toLowerCase()}`;
+                dir = await loader.scaffold(pluginName);
               } catch (error) {
                 return `Failed to scaffold plugin: ${error instanceof Error ? error.message : String(error)}`;
               }
@@ -584,29 +821,29 @@ export default {
                 const manifestFile = join(dir, "flavor-plugin.json");
                 const manifest = JSON.parse(await readFile(manifestFile, "utf-8"));
                 manifest.origin = "generated";
-                manifest.generatedFrom = new Date().toISOString();
+                manifest.generatedFrom = suggestion.id;
                 await writeFile(manifestFile, `${JSON.stringify(manifest, null, 2)}\n`, "utf-8");
               } catch {
                 // manifest missing: leave provenance to the caller
               }
-              const pluginName = sanitizePluginName(suggestion.tool);
-              await store.markSuggestionDone(suggestion.id);
+              const pluginName = `${sanitizePluginName(suggestion.tool ?? suggestion.sequence?.join("-") ?? "fix")}-${suggestion.id.replace(/[^a-z0-9]/gi, "").slice(-6).toLowerCase()}`;
+              const episode = await store.beginEpisode({ suggestionId: suggestion.id, kind: "plugin", implementation: "operator scaffold", pluginName, source: suggestion });
               return [
                 `suggestion ${suggestion.id}: ${suggestion.tool} x${suggestion.count} — ${suggestion.error}`,
                 `scaffolded plugin at ${dir}`,
-                `edit index.js to implement the fix, then run /evolve verify ${pluginName}, /plugin reload ${pluginName} and /evolve test`,
+                `episode ${episode.id} is implemented, not done; edit index.js, then run /evolve verify ${pluginName}, /plugin reload ${pluginName}, /evolve test ${suggestion.id}, and /evolve done ${suggestion.id}`,
                 `note: generated plugins are read-only by default — if the fix needs file writes or shell commands, add "capabilities": ["files"] or ["shell"] to flavor-plugin.json`,
               ].join("\n");
             }
 
             return [
-              "usage: /evolve <signals|suggest|improve <id>|verify <plugin>|revert <plugin>|test|clear|done <id>|export [limit]|learn>",
+              "usage: /evolve <signals|suggest|episodes|improve <id>|baseline <id> <command>|verify <plugin>|revert <plugin>|test [id]|clear|done <id>|dismiss <id>|export [limit]|learn>",
               "  signals   list recent failing tool results",
               "  suggest   aggregate repeated failures, recurring success trigrams and analyzed error-monitor records into suggestions",
               "  improve   scaffold a plugin dir for one suggestion",
               "  verify    sandbox dry-run a plugin before activating it",
               "  revert    restore the last good snapshot of a plugin",
-              "  test      run the test suite (npm test)",
+              "  test      run focused regression plus test/typecheck/build; marks an episode verified",
               "  clear     reset signals, patterns and done markers",
               "  export    write clean session trajectories to .flavorlite/evolve/sft.jsonl",
               "  learn     write confirmed router-recall tokens back into plugin manifests",

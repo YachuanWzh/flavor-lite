@@ -81,12 +81,15 @@ export default {
       // with empty replies. One at a time, each with backoff retries, is
       // far more reliable — and never blocks the tool loop either way.
       let distillQueue = Promise.resolve();
+      let acceptingDistillations = true;
       const enqueueDistill = (record) => {
+        if (!acceptingDistillations) return false;
         const run = () => distillToMemory(ctx, store, record, cfg).catch((error) => {
           ctx.logger.warn(`error-monitor: distillation failed — ${error instanceof Error ? error.message : String(error)}`);
         });
         const next = distillQueue.then(run, run);
         distillQueue = next.then(() => undefined, () => undefined);
+        return true;
       };
 
       // 1) Capture erroneous tool results (the only trigger for recording).
@@ -173,8 +176,10 @@ export default {
         },
       }));
 
-      return () => {
-        for (const dispose of disposers.reverse()) dispose();
+      return async () => {
+        acceptingDistillations = false;
+        for (const dispose of disposers.reverse()) await dispose();
+        await distillQueue;
       };
     }, "error-monitor.install");
   },

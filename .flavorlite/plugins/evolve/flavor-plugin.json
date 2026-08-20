@@ -1,6 +1,6 @@
 {
   "name": "evolve",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "bounded recursive self-improvement: capture repeated failures, propose plugin-level fixes, verify with tests",
   "entry": "index.js",
   "activation": "eager",
@@ -8,6 +8,12 @@
     "promptTop": 3,
     "minRepeats": 2,
     "testCommand": "npm test",
-    "testTimeoutMs": 120000
+    "testTimeoutMs": 120000,
+    "patternThreshold": 3,
+    "patternTop": 2,
+    "learnMinSupport": 3,
+    "learnMinPrecision": 0.75,
+    "canaryRuns": 3,
+    "verificationCommands": ["npm test", "npm run typecheck", "npm run build"]
   }
 }

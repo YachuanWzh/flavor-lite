@@ -70,14 +70,13 @@ export async function collectSuggestions({ line, commands, skills, plugins }) {
 export default {
   name: "command-hints",
   inject: ["commands", "skills"],
-  apply(ctx) {
+  apply(ctx, config = {}) {
     return ctx.effect(() => {
       const repl = ctx.tryGet("repl");
-      if (!repl) return; // only meaningful inside the interactive REPL
-
       const commands = ctx.get("commands");
       const skills = ctx.get("skills");
       const plugins = ctx.tryGet("pluginsLoader");
+      const disposers = [];
 
       // Skills discovery touches the disk; cache it briefly per keystroke.
       let cache = { at: 0, list: [] };
@@ -88,16 +87,32 @@ export default {
         return cache.list;
       };
 
-      return repl.registerCompleter({
-        async complete(line) {
-          return collectSuggestions({
-            line,
-            commands,
-            skills: await loadSkills(),
-            plugins,
-          });
-        },
+      const suggestionsFor = async (line) => collectSuggestions({
+        line,
+        commands,
+        skills: await loadSkills(),
+        plugins,
       });
+
+      disposers.push(commands.register({
+        name: "hints",
+        description: "List commands, plugins and skills matching a prefix (/hints [prefix])",
+        async run(args) {
+          const prefix = args.trim().replace(/^\//, "");
+          const suggestions = await suggestionsFor(`/${prefix}`);
+          return suggestions.length
+            ? suggestions.map((entry) => `${entry.display}${entry.description ? `  ${entry.description}` : ""}`).join("\n")
+            : `no hints for /${prefix}`;
+        },
+      }));
+
+      // Opt-in until the host completion renderer resets horizontal cursor
+      // origin before restoring the input position.
+      if (config.interactive === true && repl) {
+        disposers.push(repl.registerCompleter({ complete: suggestionsFor }));
+      }
+
+      return () => { for (const dispose of disposers.reverse()) dispose(); };
     }, "command-hints.install");
   },
 };

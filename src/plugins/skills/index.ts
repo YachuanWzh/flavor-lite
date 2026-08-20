@@ -8,11 +8,12 @@
  */
 
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { readFile, readdir } from "node:fs/promises";
 import { definePlugin } from "../../kernel";
 import type { PluginContext } from "../../kernel/types";
 import type { PromptAssemble } from "../prompt";
+import type { AfterToolCall } from "../tools";
 
 export interface SkillInfo {
   name: string;
@@ -23,6 +24,8 @@ export interface SkillInfo {
 export interface SkillsService {
   /** Discover skills from project and user directories. */
   discover(): Promise<SkillInfo[]>;
+  /** Consume skills whose SKILL.md was actually read during a run. */
+  usedInRun(runId: string): Promise<SkillInfo[]>;
 }
 
 const FRONT_MATTER = /^---\r?\n([\s\S]*?)\r?\n---/;
@@ -39,6 +42,8 @@ function parseSkillMeta(raw: string, fallbackName: string): { name: string; desc
 }
 
 class SkillsServiceImpl implements SkillsService {
+  private readonly used = new Map<string, Set<string>>();
+
   constructor(private readonly ctx: PluginContext) {}
 
   async discover(): Promise<SkillInfo[]> {
@@ -68,6 +73,29 @@ class SkillsServiceImpl implements SkillsService {
     }
     return [...skills.values()];
   }
+
+  markUsed(runId: string, path: string): void {
+    if (!runId) return;
+    let paths = this.used.get(runId);
+    if (!paths) {
+      paths = new Set();
+      this.used.set(runId, paths);
+      while (this.used.size > 100) this.used.delete(this.used.keys().next().value as string);
+    }
+    paths.add(canonicalPath(path));
+  }
+
+  async usedInRun(runId: string): Promise<SkillInfo[]> {
+    const paths = this.used.get(runId) ?? new Set<string>();
+    this.used.delete(runId);
+    if (paths.size === 0) return [];
+    return (await this.discover()).filter((skill) => paths.has(canonicalPath(skill.path)));
+  }
+}
+
+function canonicalPath(path: string): string {
+  const absolute = resolve(path).replace(/\\/g, "/");
+  return process.platform === "win32" ? absolute.toLowerCase() : absolute;
 }
 
 export const skillsPlugin = definePlugin({
@@ -78,6 +106,18 @@ export const skillsPlugin = definePlugin({
     return ctx.effect(() => {
       const service = new SkillsServiceImpl(ctx);
       const disposeService = ctx.provide("skills", service);
+      const disposeUsageHook = ctx.get("hooks").hook<AfterToolCall>("tools/after-call", async (event, next) => {
+        const path = typeof event.args?.path === "string" ? event.args.path : undefined;
+        if (
+          event.result?.isError !== true
+          && event.context?.runId
+          && path
+          && /(?:^|[\\/])SKILL\.md$/i.test(path)
+        ) {
+          service.markUsed(event.context.runId, resolve(event.context.cwd, path));
+        }
+        return next(event);
+      });
       const disposeHook = ctx.get("hooks").hook<PromptAssemble>("prompt/assemble", async (event, next) => {
         const skills = await service.discover();
         if (skills.length > 0) {
@@ -92,6 +132,7 @@ export const skillsPlugin = definePlugin({
         return next(event);
       });
       return () => {
+        disposeUsageHook();
         disposeHook();
         disposeService();
       };

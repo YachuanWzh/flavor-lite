@@ -24,7 +24,7 @@
 import { readFile, readdir, stat } from "node:fs/promises";
 import { basename, isAbsolute, relative, resolve } from "node:path";
 
-const WRITE_TOOL_NAMES = new Set(["Write", "Edit", "ApplyPatch"]);
+const WRITE_TOOL_NAMES = new Set(["Write", "Edit", "ApplyPatch", "apply_patch_transaction"]);
 const DELETE_VERBS = new Set(["rm", "unlink", "del", "erase", "rmdir", "rd"]);
 const MOVE_VERBS = new Set(["mv", "move", "ren", "rename"]);
 
@@ -38,6 +38,11 @@ const DEFAULT_MAX_FILE_BYTES = 512 * 1024;
 const DEFAULT_MAX_TREE_FILES = 200;
 // Guard the LCS matrix; fall back to a naive all-removed/all-added diff.
 const MAX_LCS_CELLS = 2_000_000;
+
+export function coordinatedTerminalWrite(ui, text, output = process.stdout) {
+  ui?.pauseAnimation?.();
+  output.write(text);
+}
 
 export default {
   name: "filediff",
@@ -83,7 +88,7 @@ export default {
               if (block) blocks.push(block);
               snapshots.delete(abs);
             }
-            if (blocks.length > 0) process.stdout.write(blocks.join("") + "\n");
+            if (blocks.length > 0) coordinatedTerminalWrite(ctx.tryGet("ui"), blocks.join("") + "\n");
           }
           return next(event);
         }),

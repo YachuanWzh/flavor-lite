@@ -1,0 +1,18 @@
+{
+  "name": "verification-gate",
+  "version": "0.1.1",
+  "entry": "index.js",
+  "description": "Detect and run repository-native type, lint, test and build checks with structured results.",
+  "activation": "eager",
+  "capabilities": ["shell"],
+  "triggers": {
+    "keywords": ["verify", "验证", "测试", "typecheck", "lint", "build"],
+    "tools": ["verify_changes"],
+    "commands": ["verify"]
+  },
+  "config": {
+    "timeoutMs": 120000,
+    "maxOutputChars": 20000,
+    "stopOnFailure": true
+  }
+}

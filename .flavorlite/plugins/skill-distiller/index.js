@@ -33,6 +33,14 @@ function slugify(name) {
     .slice(0, 48);
 }
 
+function yamlLine(value, max = 240) {
+  return String(value ?? "").replace(/[\r\n]+/g, " ").replace(/\s+/g, " ").trim().slice(0, max);
+}
+
+function looksProcedural(body) {
+  return body.length >= 40 && (/(?:^|\n)\s*(?:\d+[.)]|[-*])\s+/m.test(body) || /(?:^|\n)#{1,4}\s+/m.test(body));
+}
+
 /**
  * Collect a full text response from an async-iterable LLM stream.
  * Returns undefined when the stream fails or yields no text.
@@ -90,7 +98,7 @@ async function listSkills(skillsDir) {
 
 export default {
   name: "skill-distiller",
-  version: "0.1.0",
+  version: "0.2.0",
   description: "distill successful multi-step sessions into reusable SKILL.md SOPs",
   provides: ["skillDistiller"],
   inject: ["hooks", "commands"],
@@ -103,6 +111,7 @@ export default {
       const disposers = [];
       // Pending distillations; the skillDistiller service can await them.
       const pending = new Set();
+      let distillQueue = Promise.resolve();
 
       function track(promise) {
         pending.add(promise);
@@ -118,16 +127,16 @@ export default {
         }),
       );
 
-      async function distill() {
+      async function distill(event) {
         const llm = ctx.tryGet("llm");
         const session = ctx.tryGet("session");
         if (!llm || !session) return;
 
         let messages;
         try {
-          const latestId = await session.latest();
-          if (!latestId) return;
-          const handle = await session.open(latestId);
+          const sessionId = event?.sessionId ?? await session.latest();
+          if (!sessionId) return;
+          const handle = await session.open(sessionId);
           messages = handle.messages();
         } catch {
           return;
@@ -160,11 +169,11 @@ export default {
         const reply = parseDistillReply(raw);
         if (!reply || reply.skip === true) return;
 
-        const name = typeof reply.name === "string" ? reply.name.trim() : "";
-        const description = typeof reply.description === "string" ? reply.description.trim() : "";
+        const name = typeof reply.name === "string" ? yamlLine(reply.name, 100) : "";
+        const description = typeof reply.description === "string" ? yamlLine(reply.description) : "";
         const body = typeof reply.body === "string" ? reply.body.trim() : "";
         const slug = slugify(name);
-        if (!slug || !description || !body) {
+        if (!slug || !description || !looksProcedural(body)) {
           ctx.logger.debug("skill-distiller: reply missing name/description/body");
           return;
         }
@@ -183,6 +192,8 @@ export default {
             `description: ${description}`,
             "generated: true",
             `distilledAt: ${new Date().toISOString()}`,
+            ...(event?.runId ? [`distilledFromRun: ${event.runId}`] : []),
+            ...(event?.sessionId ? [`distilledFromSession: ${event.sessionId}`] : []),
             "---",
             "",
             body.slice(0, MAX_BODY_CHARS),
@@ -198,9 +209,12 @@ export default {
       disposers.push(
         ctx.get("hooks").hook("loop/after-run", async (event, next) => {
           try {
-            if (event.reason === "finished" && (event.toolCalls ?? 0) >= minToolCalls) {
+            const successful = event.successful ?? (event.reason === "finished" && (event.toolErrors ?? 0) === 0);
+            if (successful && (event.toolCalls ?? 0) >= minToolCalls) {
+              const job = distillQueue.then(() => distill(event));
+              distillQueue = job.catch(() => undefined);
               track(
-                distill().catch((error) => {
+                job.catch((error) => {
                   ctx.logger.warn(
                     `skill-distiller: distillation failed — ${error instanceof Error ? error.message : String(error)}`,
                   );

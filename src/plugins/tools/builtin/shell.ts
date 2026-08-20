@@ -2,10 +2,13 @@
  * Shell tool: run a command in the workspace with a timeout and truncated
  * output. Non-interactive by design; interactive commands fail fast.
  *
- * Windows notes: the command is handed to cmd.exe verbatim (Node's automatic
- * argument quoting would escape embedded double quotes into `\"`, which cmd
+ * Windows notes: the command is handed to PowerShell 7 (pwsh) when installed,
+ * falling back to Windows PowerShell 5.1 (powershell.exe) and then cmd.exe.
+ * Both PowerShell variants accept CRT-style `\"` quoting, so Node's default
+ * argument quoting works for them; cmd.exe needs the command verbatim (Node's
+ * automatic quoting would escape embedded double quotes into `\"`, which cmd
  * does not understand, breaking e.g. `node -e "..."`). Timeouts and aborts
- * kill the whole process tree — killing only cmd.exe would leave orphaned
+ * kill the whole process tree — killing only the shell would leave orphaned
  * descendants holding the stdio pipes open, so 'close' would never fire.
  */
 
@@ -19,6 +22,49 @@ import type { Tool } from "../registry";
 
 const DEFAULT_TIMEOUT_MS = 120_000;
 const MAX_OUTPUT_CHARS = 30_000;
+const SHELL_PROBE_TIMEOUT_MS = 5_000;
+
+type WindowsShell = "pwsh" | "powershell" | "cmd";
+
+let cachedWindowsShell: WindowsShell | undefined;
+
+/** Probe pwsh, then powershell.exe; cache the best available for the process. */
+function resolveWindowsShell(): Promise<WindowsShell> {
+  if (cachedWindowsShell !== undefined) return Promise.resolve(cachedWindowsShell);
+  return new Promise((resolve) => {
+    let settled = false;
+    const settle = (shell: WindowsShell) => {
+      if (settled) return;
+      settled = true;
+      cachedWindowsShell = shell;
+      resolve(shell);
+    };
+    // where.exe should return instantly; each probe gets a hang guard.
+    const probe = (name: string, onResult: (found: boolean) => void) => {
+      const child = spawn("where.exe", [name], { stdio: "ignore", windowsHide: true });
+      let done = false;
+      const finish = (found: boolean) => {
+        if (done) return;
+        done = true;
+        onResult(found);
+      };
+      const guard = setTimeout(() => finish(false), SHELL_PROBE_TIMEOUT_MS);
+      guard.unref?.();
+      child.on("error", () => {
+        clearTimeout(guard);
+        finish(false);
+      });
+      child.on("close", (code) => {
+        clearTimeout(guard);
+        finish(code === 0);
+      });
+    };
+    probe("pwsh", (pwshFound) => {
+      if (pwshFound) return settle("pwsh");
+      probe("powershell", (psFound) => settle(psFound ? "powershell" : "cmd"));
+    });
+  });
+}
 
 export const shellTool: Tool = {
   name: "Shell",
@@ -33,20 +79,32 @@ export const shellTool: Tool = {
     },
     required: ["command"],
   },
-  execute(args, ctx) {
+  async execute(args, ctx) {
     const command = typeof args.command === "string" ? args.command : undefined;
-    if (!command) return Promise.resolve({ content: "Missing required argument: command", isError: true });
+    if (!command) return { content: "Missing required argument: command", isError: true };
     const timeout = typeof args.timeoutMs === "number" ? Math.min(args.timeoutMs, 600_000) : DEFAULT_TIMEOUT_MS;
 
     const isWindows = process.platform === "win32";
-    const shellArgs: [string, string[]] = isWindows
-      ? ["cmd.exe", ["/d", "/s", "/c", command]]
-      : [process.env.SHELL ?? "/bin/sh", ["-c", command]];
-    // Verbatim args on Windows (see module note); a detached process group on
-    // POSIX so the kill below reaches every descendant via kill(-pid).
-    const spawnOptions = isWindows
-      ? { windowsVerbatimArguments: true }
-      : { detached: true };
+    // Prefer PowerShell 7 (pwsh), then Windows PowerShell 5.1
+    // (powershell.exe), then cmd.exe. Detection is probed once and cached for
+    // the process.
+    const shell = isWindows ? await resolveWindowsShell() : null;
+    const shellArgs: [string, string[]] = !isWindows
+      ? [process.env.SHELL ?? "/bin/sh", ["-c", command]]
+      : shell === "pwsh"
+        ? ["pwsh", ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", command]]
+        : shell === "powershell"
+          ? ["powershell.exe", ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", command]]
+          : ["cmd.exe", ["/d", "/s", "/c", command]];
+    // Verbatim args only for cmd.exe (see module note); both PowerShell
+    // variants accept the `\"` quoting Node's default Windows argument quoting
+    // produces. A detached process group on POSIX so the kill below reaches
+    // every descendant via kill(-pid).
+    const spawnOptions = !isWindows
+      ? { detached: true }
+      : shell === "cmd"
+        ? { windowsVerbatimArguments: true }
+        : {};
 
     return new Promise((resolvePromise) => {
       let stdout = "";
@@ -144,7 +202,7 @@ export const shellTool: Tool = {
 /** Platform-aware shell note; only exists while the shell tool is mounted. */
 function shellSection(): string {
   return platform() === "win32"
-    ? "Shell commands run through cmd.exe on Windows. The user's interactive shell is PowerShell: it has no `&&` separator, use `;` instead. Prefer simple, portable commands."
+    ? "Shell commands run through PowerShell 7 (pwsh) on Windows when available, falling back to Windows PowerShell 5.1 (powershell.exe) then cmd.exe. Prefer simple, portable commands."
     : "Shell commands run through $SHELL (POSIX). The tool is non-interactive: commands that wait for input will fail.";
 }
 

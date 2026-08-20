@@ -17,6 +17,7 @@
 
 import { existsSync, watch, type FSWatcher } from "node:fs";
 import { cp, mkdir, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
+import { spawn } from "node:child_process";
 import { homedir, tmpdir } from "node:os";
 import { isAbsolute, join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
@@ -33,6 +34,42 @@ const MANIFEST_FILE = "flavor-plugin.json";
 const MAX_SNAPSHOTS = 5;
 /** Sandbox activation must settle fast or the plugin is suspect. */
 const VERIFY_TIMEOUT_MS = 5000;
+const GENERATED_SOURCE_LIMIT = 1_000_000;
+const GENERATED_FORBIDDEN = [
+  { pattern: /(?:from\s*|import\s*\(|require\s*\()\s*["'](?:node:)?(?:fs|fs\/promises|child_process|cluster|worker_threads|vm|net|tls|dgram|dns|http|https)["']/i, reason: "direct host module access" },
+  { pattern: /\b(?:eval\s*\(|new\s+Function\s*\()/i, reason: "dynamic code execution" },
+  { pattern: /\bprocess\s*\.\s*(?:env|exit|kill|chdir|binding|dlopen)\b/i, reason: "direct process control" },
+  { pattern: /\b(?:fetch|WebSocket)\s*\(/i, reason: "direct network access" },
+  { pattern: /\.get\s*\(\s*["'](?:tools|commands)["']\s*\)\s*\.\s*execute\s*\(/i, reason: "nested execution bypass" },
+] as const;
+const GENERATED_ALLOWED_INJECT = new Set(["hooks", "tools", "commands", "systemPrompt", "skills"]);
+const GENERATED_PREFLIGHT_SCRIPT = String.raw`
+const url = process.argv[1];
+const config = JSON.parse(process.argv[2] || "{}");
+const mod = await import(url);
+const exported = Array.isArray(mod.default) ? mod.default : [mod.default];
+const noop = () => {};
+const services = {
+  hooks: { hook: () => noop, waterfall: async (_name, value) => value },
+  tools: { register: () => noop, list: () => [], schemas: () => [], get: () => undefined },
+  commands: { register: () => noop, list: () => [], execute: async () => undefined },
+  systemPrompt: { add: () => noop, assemble: async () => "" },
+  skills: { discover: async () => [], usedInRun: async () => [] },
+};
+const ctx = {
+  cwd: process.cwd(),
+  logger: { debug: noop, info: noop, warn: noop, error: noop },
+  get(key) { if (!(key in services)) throw new Error("unsafe/missing preflight service: " + key); return services[key]; },
+  tryGet(key) { return services[key]; },
+  provide: () => noop,
+  effect: async (fn) => await fn(),
+};
+for (const plugin of exported) {
+  if (!plugin || typeof plugin.apply !== "function") throw new Error("invalid generated plugin export");
+  const dispose = await plugin.apply(ctx, config);
+  if (typeof dispose === "function") await dispose();
+}
+`;
 
 const triggersSchema = z.object({
   /** Case-insensitive substrings that recall the plugin (router L0). */
@@ -567,6 +604,10 @@ class PluginsLoader implements PluginsLoaderService {
     const { dir, manifest } = target;
     const entryPath = resolve(dir, manifest.entry ?? "index.js");
     if (!existsSync(entryPath)) throw new Error(`entry not found: ${manifest.entry ?? "index.js"}`);
+    if (manifest.origin === "generated") {
+      await auditGeneratedSource(dir);
+      await preflightGeneratedImport(entryPath, dir, manifest.config ?? {});
+    }
 
     let mod: unknown;
     try {
@@ -576,6 +617,15 @@ class PluginsLoader implements PluginsLoaderService {
       throw new Error(`import failed: ${errorMessage(error)}`);
     }
     const plugins = normalizeExport((mod as { default?: unknown }).default);
+    if (manifest.origin === "generated") {
+      const unsafeInject = plugins.flatMap((plugin) => plugin.inject ?? []).find((key) => !GENERATED_ALLOWED_INJECT.has(key));
+      if (unsafeInject) {
+        throw new Error(
+          `generated plugin safety audit failed: service "${unsafeInject}" is not available to generated code; ` +
+          "expose the behavior as a governed tool instead",
+        );
+      }
+    }
 
     // Trigger patterns must compile, or the plugin is unusable for routing.
     for (const source of manifest.triggers?.patterns ?? []) {
@@ -888,6 +938,80 @@ class PluginsLoader implements PluginsLoaderService {
       }
     }
   }
+}
+
+/**
+ * Generated code is untrusted. It may register tools/hooks against the host,
+ * but it cannot import host-effect modules or use ambient process/network
+ * escape hatches. Side effects must go through injected, governed services.
+ */
+async function auditGeneratedSource(root: string): Promise<void> {
+  const files: string[] = [];
+  const visit = async (dir: string): Promise<void> => {
+    for (const entry of await readdir(dir, { withFileTypes: true })) {
+      if (entry.name === "node_modules" || entry.name === ".versions") continue;
+      const path = join(dir, entry.name);
+      if (entry.isDirectory()) await visit(path);
+      else if (/\.(?:c|m)?js$/i.test(entry.name)) files.push(path);
+    }
+  };
+  await visit(root);
+  let total = 0;
+  for (const file of files) {
+    const source = await readFile(file, "utf-8");
+    total += source.length;
+    if (total > GENERATED_SOURCE_LIMIT) throw new Error("generated plugin safety audit failed: source exceeds 1 MB");
+    for (const rule of GENERATED_FORBIDDEN) {
+      if (rule.pattern.test(source)) {
+        throw new Error(
+          `generated plugin safety audit failed (${rule.reason}) in ${file}. ` +
+          "Use injected flavor-lite services so permission checks remain enforceable.",
+        );
+      }
+    }
+  }
+}
+
+/** Import generated code in a killable, filesystem-read-only subprocess first. */
+async function preflightGeneratedImport(entryPath: string, root: string, config: Record<string, unknown>): Promise<void> {
+  const url = pathToFileURL(entryPath).href;
+  await new Promise<void>((resolvePromise, rejectPromise) => {
+    const child = spawn(
+      process.execPath,
+      [
+        "--permission",
+        `--allow-fs-read=${root}`,
+        "--input-type=module",
+        "--eval",
+        GENERATED_PREFLIGHT_SCRIPT,
+        url,
+        JSON.stringify(config),
+      ],
+      { cwd: root, windowsHide: true, stdio: ["ignore", "pipe", "pipe"] },
+    );
+    let stderr = "";
+    let settled = false;
+    let timer: NodeJS.Timeout | undefined;
+    const finish = (error?: Error): void => {
+      if (settled) return;
+      settled = true;
+      if (timer) clearTimeout(timer);
+      if (error) rejectPromise(error);
+      else resolvePromise();
+    };
+    child.stderr.on("data", (chunk) => {
+      stderr = `${stderr}${String(chunk)}`.slice(-4000);
+    });
+    child.on("error", (error) => finish(new Error(`generated plugin preflight failed: ${error.message}`)));
+    child.on("close", (code) => {
+      if (code === 0) finish();
+      else finish(new Error(`generated plugin preflight failed (exit ${code}): ${stderr.trim() || "unknown error"}`));
+    });
+    timer = setTimeout(() => {
+      child.kill();
+      finish(new Error(`generated plugin preflight timed out after ${VERIFY_TIMEOUT_MS}ms`));
+    }, VERIFY_TIMEOUT_MS);
+  });
 }
 
 /** One shadow service standing in for a missing dependency during verify(). */

@@ -24,7 +24,10 @@ export default {
   apply(ctx, config = {}) {
     return ctx.effect(() => {
       const disposers = [];
-      const renderer = createRenderer({ style: config.style === "plain" ? "plain" : "full" });
+      const renderer = createRenderer({
+        style: config.style === "plain" ? "plain" : "full",
+        resolveTool: (name) => ctx.tryGet("tools")?.get(name),
+      });
 
       // Take over terminal rendering for as long as this plugin is mounted.
       disposers.push(ctx.provide("ui", renderer));

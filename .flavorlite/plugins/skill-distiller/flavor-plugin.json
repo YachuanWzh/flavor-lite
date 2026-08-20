@@ -1,6 +1,6 @@
 {
   "name": "skill-distiller",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "entry": "index.js",
   "description": "Distill successful multi-step sessions into reusable SKILL.md SOPs under .flavorlite/skills/ (generated skills are auto-discovered by the skills plugin).",
   "config": {

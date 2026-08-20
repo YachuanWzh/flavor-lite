@@ -216,7 +216,7 @@ describe("flavor-ui renderer", () => {
     expect(text).toContain("✓ Shell  npm test"); // final result still lands
   });
 
-  it("plain style never animates, even on a TTY", () => {
+  it("plain style uses one settlement rewrite without timer animation on a TTY", () => {
     const output = makeOutput();
     const renderer = createRenderer({ output, color: false, tty: true, style: "plain" });
 
@@ -227,7 +227,7 @@ describe("flavor-ui renderer", () => {
 
     const raw = output.chunks.join("");
     const text = plain(output);
-    expect(raw).not.toContain("\r\x1b[2K");
+    expect(raw.match(/\r\x1b\[2K/g)).toHaveLength(1);
     expect(text).toContain("○ Read  a.ts");
     expect(text).toContain("✓ Read  a.ts");
     expect(text).not.toContain("ok"); // no preview in plain style

@@ -1,0 +1,15 @@
+{
+  "name": "process-manager",
+  "version": "0.1.0",
+  "entry": "index.js",
+  "description": "Start, poll, list and stop bounded background development processes with cursor-based logs.",
+  "activation": "eager",
+  "capabilities": ["shell", "host"],
+  "provides": ["processManager"],
+  "triggers": {
+    "keywords": ["dev server", "后台进程", "启动服务", "logs", "端口", "process"],
+    "tools": ["process_start", "process_poll", "process_list", "process_stop"],
+    "commands": ["processes"]
+  },
+  "config": { "maxProcesses": 6, "maxOutputChars": 100000 }
+}

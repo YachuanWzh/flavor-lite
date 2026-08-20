@@ -1,0 +1,13 @@
+{
+  "name": "subagent-pool",
+  "version": "0.1.0",
+  "entry": "index.js",
+  "description": "Run independent subagent tasks concurrently with bounded scheduling and ordered reports.",
+  "activation": "dynamic",
+  "capabilities": ["host"],
+  "triggers": {
+    "keywords": ["parallel", "并行", "批量子任务", "subagent pool", "concurrent"],
+    "tools": ["subagent_batch"]
+  },
+  "config": { "maxTasks": 8, "maxConcurrency": 4 }
+}

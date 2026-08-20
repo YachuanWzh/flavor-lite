@@ -27,16 +27,28 @@ export interface FlavorUiRenderer {
   renderNotice(message: string): void;
   /** Freeze in-place animations while the host prompts the user. */
   pauseAnimation?(): void;
+  /** Register reversible visual semantics for a plugin's tools. */
+  registerToolPresentation(
+    matcher: string | RegExp | ((name: string, args: Record<string, unknown>) => boolean),
+    presentation: FlavorUiToolPresentation,
+  ): () => void;
   setStyle(style: FlavorUiStyle): void;
   styleName(): FlavorUiStyle;
 }
 
+export interface FlavorUiToolPresentation {
+  badge: string;
+  accent?: "graphite" | "ion" | "ultraviolet" | "mint" | "ember" | "amber";
+  previewOnSuccess?: boolean;
+}
+
 export interface CreateRendererOptions {
-  output?: { isTTY?: boolean; write(chunk: string): unknown };
+  output?: { isTTY?: boolean; columns?: number; write(chunk: string): unknown };
   color?: boolean;
   tty?: boolean;
   style?: FlavorUiStyle;
   spinnerMs?: number;
+  resolveTool?: (name: string) => { category?: "read" | "write" | "shell" | "control" } | undefined;
 }
 
 export function createRenderer(options?: CreateRendererOptions): FlavorUiRenderer;

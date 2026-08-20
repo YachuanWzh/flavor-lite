@@ -31,10 +31,13 @@ const WRAP_UP_MAX_ITERATIONS = 2;
 
 /** Nesting depth of the agent currently running (root = undefined → 0). */
 const depthStorage = new AsyncLocalStorage();
+/** Child prompt metadata scoped to one concurrent async execution. */
+const childContextStorage = new AsyncLocalStorage();
 
 export default {
   name: "subagent",
   inject: ["hooks", "tools", "systemPrompt", "agent"],
+  provides: ["subagentRunner"],
   apply(ctx, config = {}) {
     const maxDepth = Number.isInteger(config.maxDepth) ? config.maxDepth : DEFAULT_MAX_DEPTH;
     const defaultMaxIterations = Number.isInteger(config.defaultMaxIterations)
@@ -42,16 +45,32 @@ export default {
       : DEFAULT_MAX_ITERATIONS;
     return ctx.effect(() => {
       const disposers = [];
+      const runner = {
+        run(args, execCtx = {}) {
+          return spawnTool(ctx, { maxDepth, defaultMaxIterations }).execute(args, execCtx);
+        },
+      };
+      disposers.push(ctx.provide("subagentRunner", runner));
 
       // Guidance for every agent that sees the tool list: when to delegate.
       disposers.push(
         ctx.get("hooks").hook("prompt/assemble", async (event, next) => {
           event.sections.push({ name: "subagents", content: usageSection(maxDepth) });
+          const child = childContextStorage.getStore();
+          if (child) {
+            event.sections.push({
+              name: "subagent-context",
+              content: childSection(child.task, child.role, child.depth, child.maxDepth, child.maxIterations),
+            });
+          }
           return next(event);
         }),
       );
 
-      disposers.push(ctx.get("tools").register(spawnTool(ctx, { maxDepth, defaultMaxIterations })));
+      disposers.push(ctx.get("tools").register({
+        ...spawnTool(ctx, { maxDepth, defaultMaxIterations }),
+        execute: (args, execCtx) => runner.run(args, execCtx),
+      }));
 
       // Unwind in reverse registration order on unmount/reload.
       return () => {
@@ -117,19 +136,12 @@ function spawnTool(ctx, { maxDepth, defaultMaxIterations }) {
         await session.setTitle(childTitle(task, depth)).catch(() => {});
       }
 
-      // Child-specific prompt section: registered only while the child runs.
-      // The child's loop assembles its system prompt once at startup, inside
-      // this window, so it sees its role, task, and depth.
-      const hooks = ctx.get("hooks");
-      const disposeSection = hooks.hook("prompt/assemble", async (event, next) => {
-        event.sections.push({ name: "subagent-context", content: childSection(task, role, depth, maxDepth, maxIterations) });
-        return next(event);
-      });
-
       try {
         // Driving the child inside depthStorage.run(depth) is what makes the
         // child's own subagent_spawn calls see depth + 1.
-        const result = await depthStorage.run(depth, async () => {
+        const result = await depthStorage.run(depth, () => childContextStorage.run(
+          { task, role, depth, maxDepth, maxIterations },
+          async () => {
           const signal = execCtx.signal;
           const first = await runChild(ctx, { input: task, session, maxIterations, signal });
           let { text, iterations, reason, warned } = first;
@@ -153,8 +165,9 @@ function spawnTool(ctx, { maxDepth, defaultMaxIterations }) {
           }
 
           const body = text.trim() || sessionDigest(session);
-          return report(body, { depth, maxDepth, iterations, reason, warned, sessionId: session?.id });
-        });
+            return report(body, { depth, maxDepth, iterations, reason, warned, sessionId: session?.id });
+          },
+        ));
         // The child loop titles its session with the task; restore the
         // subagent identity so /sessions listings stay meaningful.
         if (session) await session.setTitle(childTitle(task, depth)).catch(() => {});
@@ -164,8 +177,6 @@ function spawnTool(ctx, { maxDepth, defaultMaxIterations }) {
           content: `Subagent failed: ${error instanceof Error ? error.message : String(error)}`,
           isError: true,
         };
-      } finally {
-        disposeSection();
       }
     },
   };

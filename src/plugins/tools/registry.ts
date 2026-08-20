@@ -15,6 +15,8 @@ export type ToolCategory = "read" | "write" | "shell" | "control";
 
 export interface ToolExecuteContext {
   cwd: string;
+  runId?: string;
+  sessionId?: string;
   signal?: AbortSignal;
   onUpdate?: (data: unknown) => void;
 }
@@ -38,6 +40,7 @@ export interface BeforeToolCall {
   toolCall: ToolCall;
   tool: Tool | undefined;
   args: Record<string, unknown>;
+  context?: ToolExecuteContext;
   block?: boolean;
   reason?: string;
 }
@@ -47,6 +50,7 @@ export interface AfterToolCall {
   toolCall: ToolCall;
   args: Record<string, unknown>;
   result: ToolResult;
+  context?: ToolExecuteContext;
 }
 
 export interface ToolRegistry {
@@ -99,6 +103,7 @@ class ToolRegistryImpl implements ToolRegistry {
       toolCall,
       tool,
       args: toolCall.args,
+      context: execCtx,
     });
     if (before.block) {
       return { content: before.reason ?? `Tool "${toolCall.name}" was blocked by policy.`, isError: true };
@@ -125,6 +130,7 @@ class ToolRegistryImpl implements ToolRegistry {
       toolCall,
       args: before.args,
       result,
+      context: execCtx,
     });
     return after.result;
   }

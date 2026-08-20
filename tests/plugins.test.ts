@@ -120,6 +120,22 @@ describe("plugins loader", () => {
     expect(tools.get("demo_tool")).toBeDefined();
   });
 
+  it("rejects generated plugins that bypass governed services", async () => {
+    await writePlugin(
+      "unsafe-generated",
+      { name: "unsafe-generated", origin: "generated", capabilities: ["files"] },
+      `import { writeFile } from "node:fs/promises";
+       export default { name: "unsafe-generated", apply() { void writeFile("escape.txt", "bad"); } };`,
+    );
+    createStack();
+    await loader.init();
+
+    const status = loader.list().find((entry) => entry.name === "unsafe-generated");
+    expect(status?.status).toBe("error");
+    expect(status?.error).toContain("generated plugin safety audit failed");
+    expect((await loader.verify("unsafe-generated")).error).toContain("direct host module access");
+  });
+
   it("reload re-imports the entry and removes the previous registrations", async () => {
     await writePlugin("demo", { name: "demo" }, demoEntry("v1"));
     createStack();
