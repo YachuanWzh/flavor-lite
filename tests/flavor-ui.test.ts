@@ -138,6 +138,24 @@ describe("flavor-ui renderer", () => {
     expect(output.chunks.join("")).toContain("\x1b[");
   });
 
+  it("strips nested ANSI styling from tool-result previews", () => {
+    const output = makeOutput();
+    const renderer = createRenderer({ output, color: true, tty: false });
+
+    renderer.render(event.agentStart);
+    renderer.render(event.toolStart("Shell", { command: "npm test" }));
+    renderer.render(event.toolEnd(
+      "Shell",
+      "\x1b[32m✓\x1b[39m tests/example.test.ts \x1b[2m(19 tests)\x1b[22m \x1b[33m5910ms\x1b[39m",
+      false,
+    ));
+
+    const raw = output.chunks.join("");
+    expect(plain(output)).toContain("✓ tests/example.test.ts (19 tests) 5910ms");
+    expect(raw).not.toContain("\x1b[39m");
+    expect(raw).not.toContain("\x1b[22m");
+  });
+
   it("rewrites the tool card in place on a TTY (spinner mode)", () => {
     const output = makeOutput();
     const renderer = createRenderer({ output, color: false, tty: true });

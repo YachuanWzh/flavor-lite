@@ -207,7 +207,14 @@ function makePaint(enabled) {
 }
 function paintMode(mode, paint) { const value = mode || "default"; if (value === "plan") return paint.yellow(value); if (value === "acceptEdits") return paint.cyan(value); if (value === "bypass") return paint.red(value); return paint.green(value); }
 function twoCol(left, right, target) { return left + " ".repeat(Math.max(2, target - stringWidth(left))) + right; }
-function firstLine(text, max) { return truncateToWidth(String(text).split("\n", 1)[0].trim(), max); }
+function firstLine(text, max) {
+  // Tool output may carry its own terminal styling (Vitest commonly emits
+  // selective resets such as SGR 39 and 22). The preview is styled by this
+  // renderer already, so preserving nested SGR sequences only risks leaking
+  // unsupported control codes as visible text in partial ANSI terminals.
+  const plain = String(text).replace(SGR, "");
+  return truncateToWidth(plain.split("\n", 1)[0].trim(), max);
+}
 function summarize(args) { for (const key of ["path", "file_path", "command", "pattern", "query", "url", "text", "prompt", "input", "message", "target", "id"]) if (typeof args[key] === "string" && args[key]) return truncateToWidth(args[key], 72); const value = Object.values(args).find((entry) => typeof entry === "string" && entry); return typeof value === "string" ? truncateToWidth(value, 72) : ""; }
 function formatDuration(ms) { return ms < 1000 ? `${Math.max(1, Math.round(ms))}ms` : `${(ms / 1000).toFixed(ms < 10_000 ? 2 : 1)}s`; }
 function formatTokens(count) { return count >= 1000 ? `${(count / 1000).toFixed(1)}k` : String(count); }
