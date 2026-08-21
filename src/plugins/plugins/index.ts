@@ -6,8 +6,8 @@
  *   (user); project entries shadow user ones by manifest name.
  * - Each plugin dir holds a `flavor-plugin.json` manifest and an ESM entry
  *   (default `index.js`) whose default export is a Plugin or Plugin[].
- * - init() mounts everything once at startup; reload() unmounts and
- *   re-imports (cache-busted) so edits take effect without a restart.
+ * - init() imports only the selected startup profile; reload() verifies and
+ *   atomically takes over registrations so edits take effect without a gap.
  * - Optional directory watching (default on): new plugins appear in the
  *   catalog on their own and removed ones are unmounted; loaded plugins are
  *   never touched by a sync, so an in-flight run is never disturbed.
@@ -21,6 +21,7 @@ import { spawn } from "node:child_process";
 import { homedir, tmpdir } from "node:os";
 import { isAbsolute, join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
+import { createHash } from "node:crypto";
 import { z } from "zod";
 import { definePlugin, errorMessage } from "../../kernel";
 import type { Plugin, PluginContext } from "../../kernel/types";
@@ -28,6 +29,9 @@ import { Runtime } from "../../kernel/runtime";
 import type { CommandsService } from "../commands";
 import type { ToolRegistry } from "../tools";
 import { PLUGIN_TEMPLATE_FILES } from "./template";
+import { GeneratedPluginProcess } from "./generated-process";
+import type { HookBusService } from "../hooks";
+import type { PromptAssemble } from "../prompt";
 
 const MANIFEST_FILE = "flavor-plugin.json";
 /** Last-known-good copies kept per plugin for revert(). */
@@ -42,34 +46,7 @@ const GENERATED_FORBIDDEN = [
   { pattern: /\b(?:fetch|WebSocket)\s*\(/i, reason: "direct network access" },
   { pattern: /\.get\s*\(\s*["'](?:tools|commands)["']\s*\)\s*\.\s*execute\s*\(/i, reason: "nested execution bypass" },
 ] as const;
-const GENERATED_ALLOWED_INJECT = new Set(["hooks", "tools", "commands", "systemPrompt", "skills"]);
-const GENERATED_PREFLIGHT_SCRIPT = String.raw`
-const url = process.argv[1];
-const config = JSON.parse(process.argv[2] || "{}");
-const mod = await import(url);
-const exported = Array.isArray(mod.default) ? mod.default : [mod.default];
-const noop = () => {};
-const services = {
-  hooks: { hook: () => noop, waterfall: async (_name, value) => value },
-  tools: { register: () => noop, list: () => [], schemas: () => [], get: () => undefined },
-  commands: { register: () => noop, list: () => [], execute: async () => undefined },
-  systemPrompt: { add: () => noop, assemble: async () => "" },
-  skills: { discover: async () => [], usedInRun: async () => [] },
-};
-const ctx = {
-  cwd: process.cwd(),
-  logger: { debug: noop, info: noop, warn: noop, error: noop },
-  get(key) { if (!(key in services)) throw new Error("unsafe/missing preflight service: " + key); return services[key]; },
-  tryGet(key) { return services[key]; },
-  provide: () => noop,
-  effect: async (fn) => await fn(),
-};
-for (const plugin of exported) {
-  if (!plugin || typeof plugin.apply !== "function") throw new Error("invalid generated plugin export");
-  const dispose = await plugin.apply(ctx, config);
-  if (typeof dispose === "function") await dispose();
-}
-`;
+const GENERATED_ALLOWED_INJECT = new Set(["hooks", "tools", "commands", "systemPrompt", "skills", "capabilities"]);
 
 const triggersSchema = z.object({
   /** Case-insensitive substrings that recall the plugin (router L0). */
@@ -88,6 +65,8 @@ export type PluginTriggers = z.infer<typeof triggersSchema>;
 export const PLUGIN_CAPABILITIES = ["shell", "network", "files", "host"] as const;
 export type PluginCapability = (typeof PLUGIN_CAPABILITIES)[number];
 export type PluginOrigin = "user" | "generated";
+export type PluginActivation = "eager" | "dynamic" | "background" | "manual";
+export type PluginProfile = "minimal" | "coding" | "full";
 
 /** Governance view of the plugin that registered a tool (see ownerOfTool). */
 export interface ToolOwnerInfo {
@@ -98,6 +77,9 @@ export interface ToolOwnerInfo {
 }
 
 const manifestSchema = z.object({
+  manifestVersion: z.literal(1).default(1),
+  /** Compatible host plugin API major. flavor-lite implements API v1. */
+  apiVersion: z.string().default("1"),
   name: z.string().min(1),
   version: z.string().optional(),
   entry: z.string().optional(),
@@ -106,7 +88,9 @@ const manifestSchema = z.object({
    * eager (default): mounted at startup. dynamic: kept unloaded in the
    * catalog until the router recalls it (or /plugin reload targets it).
    */
-  activation: z.enum(["eager", "dynamic"]).default("eager"),
+  activation: z.enum(["eager", "dynamic", "background", "manual"]).default("eager"),
+  /** Profiles in which the plugin is visible. Omitted = all profiles. */
+  profiles: z.array(z.enum(["minimal", "coding", "full"])).optional(),
   /** Routing hints for the router plugin; never affect activation itself. */
   triggers: triggersSchema.optional(),
   /**
@@ -114,6 +98,31 @@ const manifestSchema = z.object({
    * cross-plugin dependencies without importing every candidate entry.
    */
   provides: z.array(z.string()).optional(),
+  requires: z
+    .object({
+      services: z.array(z.string()).optional(),
+      executables: z.array(z.string()).optional(),
+      environment: z.array(z.string()).optional(),
+    })
+    .optional(),
+  engines: z.object({ node: z.string().optional() }).optional(),
+  platforms: z.array(z.enum(["win32", "linux", "darwin"])).optional(),
+  resourceBudget: z
+    .object({
+      memoryMB: z.number().positive().optional(),
+      timeoutMs: z.number().int().positive().optional(),
+      maxOutputChars: z.number().int().positive().optional(),
+    })
+    .optional(),
+  lifecycle: z
+    .object({
+      state: z.enum(["active", "candidate", "quarantined"]).default("active"),
+      reason: z.string().optional(),
+      updatedAt: z.string().optional(),
+    })
+    .optional(),
+  /** Optional module, relative to the plugin directory, exercised by verify(). */
+  selfTest: z.string().optional(),
   /** Passed as the `config` argument of every plugin's apply(). */
   config: z.record(z.string(), z.unknown()).optional(),
   /**
@@ -159,7 +168,8 @@ export interface PluginStatus {
   scope: "project" | "user";
   status: PluginLoadStatus;
   /** dynamic plugins stay in the catalog until the router recalls them. */
-  activation: "eager" | "dynamic";
+  activation: PluginActivation;
+  apiVersion: string;
   description?: string;
   /** Routing hints from the manifest (router only). */
   triggers?: PluginTriggers;
@@ -174,6 +184,28 @@ export interface PluginStatus {
   generatedFrom?: string;
   /** Declared capabilities of generated plugins (shell/network/files/host). */
   capabilities?: PluginCapability[];
+  requires?: PluginManifest["requires"];
+  engines?: PluginManifest["engines"];
+  platforms?: PluginManifest["platforms"];
+  lifecycle?: PluginManifest["lifecycle"];
+}
+
+export interface PluginDoctorIssue {
+  level: "error" | "warning" | "info";
+  code: string;
+  message: string;
+  plugin?: string;
+}
+
+export interface PluginDoctorReport {
+  ok: boolean;
+  profile: PluginProfile;
+  node: string;
+  platform: NodeJS.Platform;
+  loaded: number;
+  unloaded: number;
+  errors: number;
+  issues: PluginDoctorIssue[];
 }
 
 export interface PluginsLoaderConfig {
@@ -185,6 +217,8 @@ export interface PluginsLoaderConfig {
   watch?: boolean;
   /** Debounce window for watch events in ms. Default 250. */
   watchDebounceMs?: number;
+  /** Plugin visibility/startup profile. Default coding. */
+  profile?: PluginProfile;
 }
 
 export interface PluginsLoaderService {
@@ -208,6 +242,10 @@ export interface PluginsLoaderService {
    * the plugin would register.
    */
   verify(name: string): Promise<VerifyReport>;
+  verifyAll(): Promise<VerifyReport[]>;
+  doctor(): Promise<PluginDoctorReport>;
+  explain(name: string): string;
+  config(name: string, value?: Record<string, unknown>): Promise<Record<string, unknown>>;
   /**
    * Restore the latest last-known-good snapshot over the plugin dir and
    * reload. Snapshots are taken on every successful activation.
@@ -257,6 +295,7 @@ class PluginsLoader implements PluginsLoaderService {
   private toolOwners = new Map<string, string>();
   private readonly watchEnabled: boolean;
   private readonly watchDebounceMs: number;
+  private readonly profile: PluginProfile;
   private readonly watchedRoots = new Set<string>();
   private watchers: FSWatcher[] = [];
   private syncTimer: NodeJS.Timeout | undefined;
@@ -269,9 +308,11 @@ class PluginsLoader implements PluginsLoaderService {
     private readonly roots: Array<{ root: string; scope: "project" | "user" }>,
     watchEnabled = true,
     watchDebounceMs = 250,
+    profile: PluginProfile = "coding",
   ) {
     this.watchEnabled = watchEnabled;
     this.watchDebounceMs = watchDebounceMs;
+    this.profile = profile;
   }
 
   async init(): Promise<void> {
@@ -288,16 +329,30 @@ class PluginsLoader implements PluginsLoaderService {
     if (name !== undefined) {
       const target = discovered.find((entry) => entry.manifest.name === name);
       if (target) {
-        await this.unload(name);
-        try {
-          await this.loadOne(target);
-        } catch (error) {
-          // Reload is an operator action: record the failure in the catalog
-          // instead of throwing, and leave the old version unmounted.
-          this.failImport(target, errorMessage(error));
-          if ((await this.snapshotList(name)).length > 0) {
-            this.ctx.logger.warn(`hint: /plugin revert ${name} restores the last good version`);
+        const previous = this.records.get(name);
+        if (previous?.status.status === "loaded") {
+          const report = await this.verify(name);
+          if (!report.ok) throw new Error(`replacement verification failed; old version kept active: ${report.error}`);
+          const replacements = await this.importEntry(target);
+          if (
+            replacements.length !== previous.pluginNames.length
+            || replacements.some((plugin, index) => plugin.name !== previous.pluginNames[index])
+          ) {
+            throw new Error("atomic reload requires replacement plugin names to match the active entry");
           }
+          await this.toolRegistry()?.whenIdle(30_000);
+          for (const plugin of replacements) {
+            await this.runtime.reload(plugin.name, plugin, target.manifest.config as never);
+          }
+          this.records.set(name, {
+            status: this.baseStatus(target, "loaded", replacements),
+            pluginNames: replacements.map((plugin) => plugin.name),
+          });
+          await this.snapshot(target).catch((error) => {
+            this.ctx.logger.warn(`plugin "${name}" snapshot failed: ${errorMessage(error)}`);
+          });
+        } else {
+          await this.loadOne(target);
         }
         return [name];
       }
@@ -332,6 +387,11 @@ class PluginsLoader implements PluginsLoaderService {
     const target = await this.discover(name);
     if (!target) {
       throw new Error(`plugin "${name}" not found (searched: ${this.roots.map((entry) => entry.root).join(", ")})`);
+    }
+    if (target.manifest.lifecycle?.state === "candidate" || target.manifest.lifecycle?.state === "quarantined") {
+      throw new Error(
+        `plugin "${name}" is ${target.manifest.lifecycle.state}${target.manifest.lifecycle.reason ? `: ${target.manifest.lifecycle.reason}` : ""}; use /plugin reload explicitly after review`,
+      );
     }
     await this.loadOne(target);
   }
@@ -407,6 +467,19 @@ class PluginsLoader implements PluginsLoaderService {
         .serviceOwners()
         .filter((info) => info.owner !== undefined && pluginNames.has(info.owner))
         .map((info) => info.key);
+      if (target.manifest.selfTest) {
+        const selfTestPath = resolve(target.dir, target.manifest.selfTest);
+        if (!existsSync(selfTestPath)) throw new Error(`selfTest entry not found: ${target.manifest.selfTest}`);
+        const selfTestModule = await import(`${pathToFileURL(selfTestPath).href}?v=${Date.now()}`) as {
+          default?: (context: { cwd: string; pluginDir: string }) => unknown | Promise<unknown>;
+        };
+        if (typeof selfTestModule.default !== "function") throw new Error("selfTest module must default-export a function");
+        const result = await withTimeout(
+          Promise.resolve(selfTestModule.default({ cwd: shadowCwd, pluginDir: target.dir })),
+          VERIFY_TIMEOUT_MS,
+        );
+        if (result === false) throw new Error("selfTest returned false");
+      }
       report.ok = true;
     } catch (error) {
       report.error = errorMessage(error);
@@ -423,6 +496,91 @@ class PluginsLoader implements PluginsLoaderService {
       await rm(shadowCwd, { recursive: true, force: true });
     }
     return report;
+  }
+
+  async verifyAll(): Promise<VerifyReport[]> {
+    const { discovered } = await this.scan();
+    const reports: VerifyReport[] = [];
+    for (const target of discovered) reports.push(await this.verify(target.manifest.name));
+    return reports;
+  }
+
+  async doctor(): Promise<PluginDoctorReport> {
+    const issues: PluginDoctorIssue[] = [];
+    const { discovered, scanErrors } = await this.scan();
+    for (const status of scanErrors) {
+      issues.push({ level: "error", code: "manifest", plugin: status.name, message: status.error ?? "invalid manifest" });
+    }
+    const provider = new Map<string, string>();
+    for (const target of discovered) {
+      const compatibility = manifestCompatibilityError(target.manifest);
+      if (compatibility) issues.push({ level: "error", code: "compatibility", plugin: target.manifest.name, message: compatibility });
+      for (const key of target.manifest.provides ?? []) {
+        const previous = provider.get(key);
+        if (previous) {
+          issues.push({ level: "error", code: "duplicate-provider", plugin: target.manifest.name, message: `service "${key}" also declared by ${previous}` });
+        } else provider.set(key, target.manifest.name);
+      }
+      for (const key of target.manifest.requires?.environment ?? []) {
+        if (!process.env[key]) issues.push({ level: "warning", code: "missing-env", plugin: target.manifest.name, message: `environment variable ${key} is not set` });
+      }
+      for (const executable of target.manifest.requires?.executables ?? []) {
+        if (!(await executableExists(executable))) issues.push({ level: "warning", code: "missing-executable", plugin: target.manifest.name, message: `executable "${executable}" was not found on PATH` });
+      }
+      if (target.manifest.lifecycle?.state && target.manifest.lifecycle.state !== "active") {
+        issues.push({ level: "info", code: "lifecycle", plugin: target.manifest.name, message: `plugin is ${target.manifest.lifecycle.state}${target.manifest.lifecycle.reason ? `: ${target.manifest.lifecycle.reason}` : ""}` });
+      }
+    }
+    for (const status of this.list().filter((entry) => entry.status === "error")) {
+      if (!issues.some((issue) => issue.plugin === status.name && issue.message === status.error)) {
+        issues.push({ level: "error", code: "load-error", plugin: status.name, message: status.error ?? "load failed" });
+      }
+    }
+    const prompt = this.ctx.tryGet("systemPrompt") as { inspect?: () => Promise<{ totalChars: number }> } | undefined;
+    if (prompt?.inspect) {
+      const info = await prompt.inspect();
+      issues.push({ level: "info", code: "prompt-size", message: `assembled prompt content: ${info.totalChars} chars` });
+    }
+    const toolCount = this.toolRegistry()?.list().length;
+    if (toolCount !== undefined) issues.push({ level: "info", code: "tool-count", message: `registered tools: ${toolCount}` });
+    const statuses = this.list();
+    return {
+      ok: !issues.some((issue) => issue.level === "error"),
+      profile: this.profile,
+      node: process.versions.node,
+      platform: process.platform,
+      loaded: statuses.filter((status) => status.status === "loaded").length,
+      unloaded: statuses.filter((status) => status.status === "unloaded").length,
+      errors: statuses.filter((status) => status.status === "error").length,
+      issues,
+    };
+  }
+
+  explain(name: string): string {
+    const status = this.records.get(name)?.status;
+    if (!status) return `plugin "${name}" not found`;
+    return [
+      `${status.name}@${status.version} (${status.status}, ${status.activation}, api v${status.apiVersion})`,
+      `scope: ${status.scope}; profile: ${this.profile}`,
+      `entry: ${status.dir}`,
+      `provides: ${status.provides.join(", ") || "-"}`,
+      `injects: ${status.inject.join(", ") || "-"}`,
+      `tools: ${status.triggers?.tools?.join(", ") || "-"}`,
+      `commands: ${status.triggers?.commands?.join(", ") || "-"}`,
+      `capabilities: ${status.capabilities?.join(", ") || "-"}`,
+      ...(status.error ? [`error: ${status.error}`] : []),
+    ].join("\n");
+  }
+
+  async config(name: string, value?: Record<string, unknown>): Promise<Record<string, unknown>> {
+    const target = await this.discover(name);
+    if (!target) throw new Error(`plugin "${name}" not found`);
+    if (value === undefined) return target.manifest.config ?? {};
+    const raw = JSON.parse((await readFile(join(target.dir, MANIFEST_FILE), "utf-8"))) as Record<string, unknown>;
+    raw.config = value;
+    await writeFile(join(target.dir, MANIFEST_FILE), `${JSON.stringify(raw, null, 2)}\n`, "utf-8");
+    await this.reload(name);
+    return value;
   }
 
   async revert(name: string): Promise<string> {
@@ -484,10 +642,31 @@ class PluginsLoader implements PluginsLoaderService {
             scope,
             status: "error",
             activation: "eager",
+            apiVersion: "?",
             error: `invalid ${MANIFEST_FILE}: ${errorMessage(error)}`,
             provides: [],
             inject: [],
             origin: "user",
+          });
+          continue;
+        }
+        const compatibility = manifestCompatibilityError(manifest);
+        if (compatibility) {
+          scanErrors.push({
+            name: manifest.name,
+            version: manifest.version ?? "0.0.0",
+            dir,
+            scope,
+            status: "error",
+            activation: manifest.activation,
+            apiVersion: manifest.apiVersion,
+            error: compatibility,
+            provides: manifest.provides ?? [],
+            inject: manifest.requires?.services ?? [],
+            origin: manifest.origin,
+            ...(manifest.requires ? { requires: manifest.requires } : {}),
+            ...(manifest.engines ? { engines: manifest.engines } : {}),
+            ...(manifest.platforms ? { platforms: manifest.platforms } : {}),
           });
           continue;
         }
@@ -498,14 +677,14 @@ class PluginsLoader implements PluginsLoaderService {
     return { discovered: [...discovered.values()], scanErrors };
   }
 
-  /**
-   * Full-reload load path: import every entry first, then activate eagers in
-   * dependency order (a plugin may inject a service another one needs, so
-   * scan order is not enough). Dynamic entries only join the catalog.
-   */
+  /** Import only startup entries. Dynamic/manual entries stay manifest-only until ensure(). */
   private async loadAll(discovered: DiscoveredPlugin[]): Promise<void> {
+    const visible = discovered.filter(
+      (target) => !target.manifest.profiles || target.manifest.profiles.includes(this.profile),
+    );
+    const startupTargets = visible.filter((target) => this.startsAtBoot(target.manifest));
     const imported: ImportedEntry[] = [];
-    for (const target of discovered) {
+    for (const target of startupTargets) {
       try {
         imported.push({ target, plugins: await this.importEntry(target) });
       } catch (error) {
@@ -513,36 +692,29 @@ class PluginsLoader implements PluginsLoaderService {
       }
     }
 
-    // Services claimed by dynamic plugins: an eager plugin needing one of
-    // these could never be satisfied deterministically, so fail loud.
-    const dynamicProvides = new Map<string, string>();
-    for (const entry of imported) {
-      if (entry.target.manifest.activation !== "dynamic") continue;
-      for (const plugin of entry.plugins) {
-        for (const key of plugin.provides ?? []) dynamicProvides.set(key, entry.target.manifest.name);
-      }
+    const deferredProvides = new Map<string, string>();
+    for (const target of visible) {
+      if (this.startsAtBoot(target.manifest)) continue;
+      for (const key of target.manifest.provides ?? []) deferredProvides.set(key, target.manifest.name);
     }
     const activeKeys = new Set(this.runtime.ctx.keys());
-
     const eager: ImportedEntry[] = [];
     for (const entry of imported) {
-      if (entry.target.manifest.activation === "dynamic") continue;
-      const blocked = entry.plugins
-        .flatMap((plugin) => plugin.inject ?? [])
-        .filter((key) => !activeKeys.has(key) && dynamicProvides.has(key));
-      const blocker = blocked[0];
+      const required = new Set([
+        ...(entry.target.manifest.requires?.services ?? []),
+        ...entry.plugins.flatMap((plugin) => plugin.inject ?? []),
+      ]);
+      const blocker = [...required].find((key) => !activeKeys.has(key) && deferredProvides.has(key));
       if (blocker !== undefined) {
         this.failImport(
           entry.target,
-          `eager plugin requires service "${blocker}" provided by dynamic plugin "${dynamicProvides.get(blocker)}" ` +
-            `\u2014 set that plugin's activation to "eager"`,
+          `startup plugin requires service "${blocker}" provided by deferred plugin "${deferredProvides.get(blocker)}"; set that plugin's activation to "eager"`,
         );
         continue;
       }
       eager.push(entry);
     }
 
-    // Duplicate providers among eager disk plugins fail loud per plugin.
     const provider = new Map<string, string>();
     const unique: ImportedEntry[] = [];
     for (const entry of eager) {
@@ -558,14 +730,19 @@ class PluginsLoader implements PluginsLoaderService {
 
     for (const entry of this.topoSort(unique)) await this.mountEntry(entry);
 
-    // Dynamic entries: catalogued, not mounted \u2014 the router recalls them.
-    for (const entry of imported) {
-      if (entry.target.manifest.activation !== "dynamic") continue;
-      this.records.set(entry.target.manifest.name, {
-        status: this.baseStatus(entry.target, "unloaded", entry.plugins),
+    for (const target of discovered) {
+      if (this.records.has(target.manifest.name)) continue;
+      this.records.set(target.manifest.name, {
+        status: this.baseStatus(target, "unloaded"),
         pluginNames: [],
       });
     }
+  }
+
+  private startsAtBoot(manifest: PluginManifest): boolean {
+    if (manifest.profiles && !manifest.profiles.includes(this.profile)) return false;
+    if (manifest.activation === "eager") return true;
+    return manifest.activation === "background" && this.profile !== "minimal";
   }
 
   /**
@@ -585,15 +762,17 @@ class PluginsLoader implements PluginsLoaderService {
       for (const key of candidate.manifest.provides ?? []) byProvidedKey.set(key, candidate);
     }
     const activeKeys = new Set(this.runtime.ctx.keys());
-    for (const plugin of plugins) {
-      for (const key of plugin.inject ?? []) {
-        if (activeKeys.has(key)) continue;
-        const providerTarget = byProvidedKey.get(key);
-        if (!providerTarget || providerTarget.manifest.name === manifest.name) continue;
-        if (this.records.get(providerTarget.manifest.name)?.status.status === "loaded") continue;
-        // A failed provider surfaces loudly via activation below.
-        await this.loadOne(providerTarget, [...visiting, manifest.name]).catch(() => {});
-      }
+    const required = new Set([
+      ...(manifest.requires?.services ?? []),
+      ...plugins.flatMap((plugin) => plugin.inject ?? []),
+    ]);
+    for (const key of required) {
+      if (activeKeys.has(key)) continue;
+      const providerTarget = byProvidedKey.get(key);
+      if (!providerTarget || providerTarget.manifest.name === manifest.name) continue;
+      if (this.records.get(providerTarget.manifest.name)?.status.status === "loaded") continue;
+      // A failed provider surfaces loudly via activation below.
+      await this.loadOne(providerTarget, [...visiting, manifest.name]).catch(() => {});
     }
 
     await this.mountEntry({ target, plugins });
@@ -606,7 +785,10 @@ class PluginsLoader implements PluginsLoaderService {
     if (!existsSync(entryPath)) throw new Error(`entry not found: ${manifest.entry ?? "index.js"}`);
     if (manifest.origin === "generated") {
       await auditGeneratedSource(dir);
-      await preflightGeneratedImport(entryPath, dir, manifest.config ?? {});
+      if ((manifest.provides?.length ?? 0) > 0) {
+        throw new Error("isolated generated plugins cannot provide host services; expose governed tools instead");
+      }
+      return [this.generatedProxy(target, entryPath)];
     }
 
     let mod: unknown;
@@ -617,16 +799,11 @@ class PluginsLoader implements PluginsLoaderService {
       throw new Error(`import failed: ${errorMessage(error)}`);
     }
     const plugins = normalizeExport((mod as { default?: unknown }).default);
-    if (manifest.origin === "generated") {
-      const unsafeInject = plugins.flatMap((plugin) => plugin.inject ?? []).find((key) => !GENERATED_ALLOWED_INJECT.has(key));
-      if (unsafeInject) {
-        throw new Error(
-          `generated plugin safety audit failed: service "${unsafeInject}" is not available to generated code; ` +
-          "expose the behavior as a governed tool instead",
-        );
-      }
+    const declared = [...new Set(manifest.provides ?? [])].sort();
+    const implemented = [...new Set(plugins.flatMap((plugin) => plugin.provides ?? []))].sort();
+    if (manifest.provides && declared.join("\0") !== implemented.join("\0")) {
+      throw new Error(`manifest provides [${declared.join(", ")}] does not match entry provides [${implemented.join(", ")}]`);
     }
-
     // Trigger patterns must compile, or the plugin is unusable for routing.
     for (const source of manifest.triggers?.patterns ?? []) {
       try {
@@ -636,6 +813,90 @@ class PluginsLoader implements PluginsLoaderService {
       }
     }
     return plugins;
+  }
+
+  private generatedProxy(target: DiscoveredPlugin, entryPath: string): Plugin<unknown> {
+    const manifest = target.manifest;
+    return {
+      name: manifest.name,
+      inject: ["hooks", "tools", "commands"],
+      provides: [],
+      async apply(ctx) {
+        const registry = ctx.get("tools") as ToolRegistry;
+        const ownTools = new Set<string>();
+        const capabilities = new Set(manifest.capabilities ?? []);
+        const processHost = new GeneratedPluginProcess(
+          entryPath,
+          target.dir,
+          manifest.config ?? {},
+          async (toolName, args) => {
+            if (ownTools.has(toolName)) return { content: "generated capability recursion is blocked", isError: true };
+            const tool = registry.get(toolName);
+            if (!tool) return { content: `capability tool "${toolName}" is unavailable`, isError: true };
+            const required =
+              tool.category === "write" ? "files"
+              : tool.category === "shell" ? "shell"
+              : tool.category === "control" ? "host"
+              : /^websearch$/i.test(tool.name) ? "network"
+              : undefined;
+            if (required && !capabilities.has(required as PluginCapability)) {
+              return { content: `generated plugin has not declared capability "${required}"`, isError: true };
+            }
+            return registry.execute(
+              { id: `generated:${manifest.name}:${Date.now()}`, name: toolName, args },
+              { cwd: ctx.cwd },
+            );
+          },
+          manifest.resourceBudget?.timeoutMs ?? 10_000,
+          manifest.resourceBudget?.memoryMB ?? 128,
+          manifest.resourceBudget?.maxOutputChars ?? 100_000,
+        );
+        const descriptor = await processHost.start();
+        if (descriptor.name !== manifest.name) {
+          await processHost.dispose();
+          throw new Error(`generated entry name "${descriptor.name}" must match manifest name "${manifest.name}"`);
+        }
+        const unsafeInject = descriptor.inject.find((key) => !GENERATED_ALLOWED_INJECT.has(key));
+        if (unsafeInject) {
+          await processHost.dispose();
+          throw new Error(`generated plugin requested unavailable service "${unsafeInject}"`);
+        }
+        if (descriptor.provides.length > 0) {
+          await processHost.dispose();
+          throw new Error("isolated generated plugins cannot provide host services");
+        }
+        const disposers: Array<() => void | Promise<void>> = [];
+        for (const tool of descriptor.tools) {
+          ownTools.add(tool.name);
+          disposers.push(registry.register({
+            ...tool,
+            async execute(args, execCtx) {
+              return processHost.tool(tool.name, args, {
+                cwd: execCtx.cwd,
+                ...(execCtx.runId ? { runId: execCtx.runId } : {}),
+                ...(execCtx.sessionId ? { sessionId: execCtx.sessionId } : {}),
+              });
+            },
+          }));
+        }
+        const commands = ctx.get("commands") as CommandsService;
+        for (const command of descriptor.commands) {
+          disposers.push(commands.register({ ...command, run: (args) => processHost.command(command.name, args) }));
+        }
+        if (descriptor.promptHooks > 0) {
+          const hooks = ctx.get("hooks") as HookBusService;
+          disposers.push(hooks.hook<PromptAssemble>("prompt/assemble", async (event, next) => {
+            const sections = await processHost.prompt({ cwd: event.cwd });
+            event.sections.push(...sections.map((section) => ({ ...section, source: section.source ?? manifest.name })));
+            return next(event);
+          }));
+        }
+        return async () => {
+          for (const dispose of disposers.reverse()) await dispose();
+          await processHost.dispose();
+        };
+      },
+    };
   }
 
   /** Activate an imported entry on the runtime; failures become error records. */
@@ -719,7 +980,10 @@ class PluginsLoader implements PluginsLoaderService {
   private async snapshot(target: DiscoveredPlugin): Promise<void> {
     if (!existsSync(target.dir)) return;
     const base = join(this.versionsRoot(), target.manifest.name);
-    let stamp = new Date().toISOString().replace(/[:.]/g, "-");
+    const hash = (await hashPluginDir(target.dir)).slice(0, 12);
+    const existing = await this.snapshotList(target.manifest.name);
+    if (existing.at(-1)?.endsWith(`_${hash}`)) return;
+    let stamp = `${new Date().toISOString().replace(/[:.]/g, "-")}_${hash}`;
     // Rapid successive loads must never clobber each other's snapshots.
     while (existsSync(join(base, stamp))) stamp = `${stamp}_`;
     await cp(target.dir, join(base, stamp), { recursive: true });
@@ -780,13 +1044,20 @@ class PluginsLoader implements PluginsLoaderService {
       scope,
       status,
       activation: manifest.activation,
+      apiVersion: manifest.apiVersion,
       ...(manifest.description ? { description: manifest.description } : {}),
       ...(manifest.triggers ? { triggers: manifest.triggers } : {}),
-      provides: plugins ? plugins.flatMap((plugin) => plugin.provides ?? []) : [],
-      inject: plugins ? [...new Set(plugins.flatMap((plugin) => plugin.inject ?? []))] : [],
+      provides: plugins ? plugins.flatMap((plugin) => plugin.provides ?? []) : (manifest.provides ?? []),
+      inject: plugins
+        ? [...new Set([...(manifest.requires?.services ?? []), ...plugins.flatMap((plugin) => plugin.inject ?? [])])]
+        : (manifest.requires?.services ?? []),
       origin: manifest.origin,
       ...(manifest.generatedFrom ? { generatedFrom: manifest.generatedFrom } : {}),
       ...(manifest.capabilities ? { capabilities: manifest.capabilities } : {}),
+      ...(manifest.requires ? { requires: manifest.requires } : {}),
+      ...(manifest.engines ? { engines: manifest.engines } : {}),
+      ...(manifest.platforms ? { platforms: manifest.platforms } : {}),
+      ...(manifest.lifecycle ? { lifecycle: manifest.lifecycle } : {}),
     };
   }
 
@@ -940,6 +1211,59 @@ class PluginsLoader implements PluginsLoaderService {
   }
 }
 
+async function hashPluginDir(root: string): Promise<string> {
+  const hash = createHash("sha256");
+  const visit = async (dir: string): Promise<void> => {
+    const entries = (await readdir(dir, { withFileTypes: true })).sort((a, b) => a.name.localeCompare(b.name));
+    for (const entry of entries) {
+      if (entry.name === ".versions" || entry.name === "node_modules") continue;
+      const path = join(dir, entry.name);
+      hash.update(path.slice(root.length).replace(/\\/g, "/"));
+      if (entry.isDirectory()) await visit(path);
+      else hash.update(await readFile(path));
+    }
+  };
+  await visit(root);
+  return hash.digest("hex");
+}
+
+function manifestCompatibilityError(manifest: PluginManifest): string | undefined {
+  if (!/^1(?:\.|$)/.test(manifest.apiVersion)) {
+    return `unsupported plugin apiVersion "${manifest.apiVersion}" (host supports v1)`;
+  }
+  if (manifest.platforms && !manifest.platforms.includes(process.platform as "win32" | "linux" | "darwin")) {
+    return `plugin does not support platform ${process.platform} (supports: ${manifest.platforms.join(", ")})`;
+  }
+  const range = manifest.engines?.node;
+  if (range && !satisfiesNodeRange(process.versions.node, range)) {
+    return `plugin requires Node ${range}; current Node is ${process.versions.node}`;
+  }
+  for (const source of manifest.triggers?.patterns ?? []) {
+    try {
+      new RegExp(source);
+    } catch (error) {
+      return `invalid triggers.patterns "${source}": ${errorMessage(error)}`;
+    }
+  }
+  return undefined;
+}
+
+/** Deliberately small engine matcher: exact major and >=/> ranges cover plugin manifests without adding semver. */
+function satisfiesNodeRange(current: string, range: string): boolean {
+  const now = current.split(".").map((part) => Number(part));
+  const match = /^\s*(>=|>)?\s*(\d+)(?:\.(\d+))?(?:\.(\d+))?/.exec(range);
+  if (!match) return true;
+  const wanted = [Number(match[2]), Number(match[3] ?? 0), Number(match[4] ?? 0)];
+  let comparison = 0;
+  for (let index = 0; index < 3; index += 1) {
+    comparison = (now[index] ?? 0) - (wanted[index] ?? 0);
+    if (comparison !== 0) break;
+  }
+  if (match[1] === ">") return comparison > 0;
+  if (match[1] === ">=") return comparison >= 0;
+  return (now[0] ?? 0) === wanted[0];
+}
+
 /**
  * Generated code is untrusted. It may register tools/hooks against the host,
  * but it cannot import host-effect modules or use ambient process/network
@@ -970,48 +1294,6 @@ async function auditGeneratedSource(root: string): Promise<void> {
       }
     }
   }
-}
-
-/** Import generated code in a killable, filesystem-read-only subprocess first. */
-async function preflightGeneratedImport(entryPath: string, root: string, config: Record<string, unknown>): Promise<void> {
-  const url = pathToFileURL(entryPath).href;
-  await new Promise<void>((resolvePromise, rejectPromise) => {
-    const child = spawn(
-      process.execPath,
-      [
-        "--permission",
-        `--allow-fs-read=${root}`,
-        "--input-type=module",
-        "--eval",
-        GENERATED_PREFLIGHT_SCRIPT,
-        url,
-        JSON.stringify(config),
-      ],
-      { cwd: root, windowsHide: true, stdio: ["ignore", "pipe", "pipe"] },
-    );
-    let stderr = "";
-    let settled = false;
-    let timer: NodeJS.Timeout | undefined;
-    const finish = (error?: Error): void => {
-      if (settled) return;
-      settled = true;
-      if (timer) clearTimeout(timer);
-      if (error) rejectPromise(error);
-      else resolvePromise();
-    };
-    child.stderr.on("data", (chunk) => {
-      stderr = `${stderr}${String(chunk)}`.slice(-4000);
-    });
-    child.on("error", (error) => finish(new Error(`generated plugin preflight failed: ${error.message}`)));
-    child.on("close", (code) => {
-      if (code === 0) finish();
-      else finish(new Error(`generated plugin preflight failed (exit ${code}): ${stderr.trim() || "unknown error"}`));
-    });
-    timer = setTimeout(() => {
-      child.kill();
-      finish(new Error(`generated plugin preflight timed out after ${VERIFY_TIMEOUT_MS}ms`));
-    }, VERIFY_TIMEOUT_MS);
-  });
 }
 
 /** One shadow service standing in for a missing dependency during verify(). */
@@ -1109,6 +1391,29 @@ function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
   });
 }
 
+async function executableExists(name: string): Promise<boolean> {
+  if (!/^[A-Za-z0-9._+-]+$/.test(name)) return false;
+  return new Promise<boolean>((resolvePromise) => {
+    const child = spawn(process.platform === "win32" ? "where.exe" : "which", [name], {
+      windowsHide: true,
+      stdio: "ignore",
+    });
+    let settled = false;
+    const finish = (value: boolean) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolvePromise(value);
+    };
+    const timer = setTimeout(() => {
+      child.kill();
+      finish(false);
+    }, 2_000);
+    child.on("error", () => finish(false));
+    child.on("close", (code) => finish(code === 0));
+  });
+}
+
 function normalizeExport(exported: unknown): Plugin<unknown>[] {
   if (exported === undefined || exported === null) {
     throw new Error("entry module must have a default export: a plugin or an array of plugins");
@@ -1142,7 +1447,7 @@ function registerPluginCommand(ctx: PluginContext, loader: PluginsLoader): () =>
   if (!commands) return () => {};
   return commands.register({
     name: "plugin",
-    description: "Manage plugins (/plugin list | reload [name] | eject <name> | new <name> | verify <name> | revert <name>)",
+    description: "Manage plugins (/plugin list | doctor | explain | config | reload | verify | revert)",
     async run(args) {
       const [sub, ...rest] = args.trim() === "" ? [] : args.trim().split(/\s+/);
       switch (sub ?? "list") {
@@ -1153,7 +1458,8 @@ function registerPluginCommand(ctx: PluginContext, loader: PluginsLoader): () =>
             .map((status) => {
               const flags =
                 `[${status.scope}]` +
-                `${status.activation === "dynamic" ? " [dynamic]" : ""}` +
+                `${status.activation !== "eager" ? ` [${status.activation}]` : ""}` +
+                `${status.lifecycle?.state && status.lifecycle.state !== "active" ? ` [${status.lifecycle.state}]` : ""}` +
                 `${status.origin === "generated" ? " [generated]" : ""}`;
               const head = `  ${status.name.padEnd(16)} ${status.version.padEnd(8)} ${status.status.padEnd(8)} ${flags}`;
               const caps = status.capabilities && status.capabilities.length > 0 ? `\n    capabilities: ${status.capabilities.join(", ")}` : "";
@@ -1164,6 +1470,31 @@ function registerPluginCommand(ctx: PluginContext, loader: PluginsLoader): () =>
               return head + detail;
             })
             .join("\n");
+        }
+        case "doctor": {
+          const report = await loader.doctor();
+          const head = `plugin doctor: ${report.ok ? "OK" : "FAILED"} | profile=${report.profile} node=${report.node} ${report.platform} | loaded=${report.loaded} unloaded=${report.unloaded} errors=${report.errors}`;
+          return [
+            head,
+            ...report.issues.map((issue) => `  ${issue.level.toUpperCase()} ${issue.code}${issue.plugin ? ` [${issue.plugin}]` : ""}: ${issue.message}`),
+          ].join("\n");
+        }
+        case "explain": {
+          const name = rest[0];
+          return name ? loader.explain(name) : "usage: /plugin explain <name>";
+        }
+        case "config": {
+          const name = rest[0];
+          if (!name) return "usage: /plugin config <name> [json-object]";
+          try {
+            if (rest.length === 1) return JSON.stringify(await loader.config(name), null, 2);
+            const value = JSON.parse(rest.slice(1).join(" ")) as unknown;
+            if (!value || typeof value !== "object" || Array.isArray(value)) return "config must be a JSON object";
+            await loader.config(name, value as Record<string, unknown>);
+            return `updated config and reloaded: ${name}`;
+          } catch (error) {
+            return `error: ${errorMessage(error)}`;
+          }
         }
         case "reload": {
           const target = rest[0];
@@ -1205,7 +1536,11 @@ function registerPluginCommand(ctx: PluginContext, loader: PluginsLoader): () =>
         }
         case "verify": {
           const name = rest[0];
-          if (!name) return "usage: /plugin verify <name>";
+          if (name === "--all") {
+            const reports = await loader.verifyAll();
+            return reports.map((report) => `${report.ok ? "OK" : "FAIL"} ${report.name}${report.error ? `: ${report.error}` : ""}`).join("\n");
+          }
+          if (!name) return "usage: /plugin verify <name|--all>";
           const report = await loader.verify(name);
           if (!report.ok) return `verify FAILED: ${name}\n  ${report.error ?? "unknown error"}`;
           return [
@@ -1225,7 +1560,7 @@ function registerPluginCommand(ctx: PluginContext, loader: PluginsLoader): () =>
           }
         }
         default:
-          return `unknown subcommand "${sub}" (use: list | reload [name] | eject <name> | new <name> | verify <name> | revert <name>)`;
+          return `unknown subcommand "${sub}" (use: list | doctor | explain | config | reload | eject | new | verify | revert)`;
       }
     },
   });
@@ -1248,6 +1583,7 @@ export const pluginsLoaderPlugin = definePlugin<PluginsLoaderConfig>({
         roots,
         config.watch ?? true,
         config.watchDebounceMs ?? 250,
+        config.profile ?? "coding",
       );
       const disposeService = ctx.provide("pluginsLoader", loader);
       const disposeCommand = registerPluginCommand(ctx, loader);

@@ -1,0 +1,6 @@
+{
+  "name": "flavor-eval-sum",
+  "private": true,
+  "type": "module",
+  "scripts": { "test": "node --test" }
+}

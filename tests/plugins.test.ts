@@ -1,3 +1,4 @@
+import { existsSync } from "node:fs";
 import { mkdtemp, mkdir, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -178,7 +179,7 @@ export default {
     expect(await commands.execute("/late")).toBe("late!");
   });
 
-  it("reload reports errors without leaving stale registrations", async () => {
+  it("reload rejects broken replacements and keeps the last good registrations active", async () => {
     await writePlugin("demo", { name: "demo" }, demoEntry("v1"));
     createStack();
     await loader.init();
@@ -186,10 +187,10 @@ export default {
     expect(tools.get("demo_tool")).toBeDefined();
 
     await writePlugin("demo", { name: "demo" }, "export default {"); // broken
-    await loader.reload("demo");
+    await expect(loader.reload("demo")).rejects.toThrow(/old version kept active/);
 
-    expect(loader.list().find((entry) => entry.name === "demo")?.status).toBe("error");
-    expect(tools.get("demo_tool")).toBeUndefined(); // old version unmounted
+    expect(loader.list().find((entry) => entry.name === "demo")?.status).toBe("loaded");
+    expect(tools.get("demo_tool")?.description).toBe("demo tool v1");
   });
 
   it("scaffold creates a plugin that loads and registers its command", async () => {
@@ -284,9 +285,9 @@ export default {
 
       // Break the plugin and fail a reload.
       await writePlugin("demo", { name: "demo" }, "export default {");
-      await loader.reload("demo");
-      expect(loader.list().find((entry) => entry.name === "demo")?.status).toBe("error");
-      expect(tools.get("demo_tool")).toBeUndefined();
+      await expect(loader.reload("demo")).rejects.toThrow(/old version kept active/);
+      expect(loader.list().find((entry) => entry.name === "demo")?.status).toBe("loaded");
+      expect(tools.get("demo_tool")?.description).toBe("demo tool v1");
 
       // A snapshot was taken when v1 loaded; revert brings it back.
       const snapshots = await readdir(join(tmp, ".flavorlite", "plugins", ".versions", "demo"));
@@ -307,7 +308,7 @@ export default {
       await loader.reload("demo");
       // Now break v3 and revert: v2 must come back, not v1.
       await writePlugin("demo", { name: "demo" }, "export default {");
-      await loader.reload("demo");
+      await expect(loader.reload("demo")).rejects.toThrow(/old version kept active/);
 
       await loader.revert("demo");
       const tools = runtime.ctx.get("tools") as ToolRegistry;
@@ -499,6 +500,31 @@ export default {
     expect(loader.list().find((entry) => entry.name === "dyn-echo")?.status).toBe("loaded");
   });
 
+  it("does not import a dynamic entry until ensure() activates it", async () => {
+    const marker = join(tmp, "imported.txt");
+    await writePlugin(
+      "lazy",
+      { name: "lazy", activation: "dynamic", triggers: { keywords: ["lazy"] } },
+      `import { writeFileSync } from "node:fs"; writeFileSync(${JSON.stringify(marker)}, "yes"); export default { name: "lazy", apply() {} };`,
+    );
+    createStack();
+    await loader.init();
+    expect(existsSync(marker)).toBe(false);
+    await loader.ensure("lazy");
+    expect(existsSync(marker)).toBe(true);
+  });
+
+  it("doctor reports ABI/runtime incompatibilities without crashing healthy plugins", async () => {
+    await writePlugin("healthy", { name: "healthy" }, `export default { name: "healthy", apply() {} };`);
+    await writePlugin("future", { name: "future", apiVersion: "2" }, `export default { name: "future", apply() {} };`);
+    createStack();
+    await loader.init();
+    const report = await loader.doctor();
+    expect(report.ok).toBe(false);
+    expect(report.issues).toEqual(expect.arrayContaining([expect.objectContaining({ plugin: "future", code: "manifest" })]));
+    expect(loader.list().find((entry) => entry.name === "healthy")?.status).toBe("loaded");
+  });
+
   describe("directory watching", () => {
     function createWatchStack(): void {
       runtime = Runtime.create({ cwd: tmp });
@@ -599,6 +625,9 @@ export default {
 
       const owner = loader.ownerOfTool("demo_tool");
       expect(owner).toEqual({ name: "demo", origin: "generated", capabilities: ["files"] });
+      const tools = runtime.ctx.get("tools") as ToolRegistry;
+      const result = await tools.execute({ id: "generated-rpc", name: "demo_tool", args: {} }, { cwd: tmp });
+      expect(result.content).toBe("demo v1");
       // Tools nobody registered through the loader have no owner.
       expect(loader.ownerOfTool("no_such_tool")).toBeUndefined();
     });

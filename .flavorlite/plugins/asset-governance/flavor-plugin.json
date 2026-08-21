@@ -1,0 +1,18 @@
+{
+  "manifestVersion": 1,
+  "apiVersion": "1",
+  "name": "asset-governance",
+  "version": "0.1.0",
+  "entry": "index.js",
+  "activation": "background",
+  "description": "Reversible decay and quarantine for generated skills/plugins using telemetry feedback.",
+  "provides": ["assetGovernance"],
+  "requires": { "services": ["hooks", "commands", "pluginsLoader", "telemetry"] },
+  "config": {
+    "sweepEveryRuns": 10,
+    "unusedSkillDays": 30,
+    "maxGeneratedSkills": 20,
+    "minPluginFeedback": 5,
+    "minPluginPrecision": 0.4
+  }
+}

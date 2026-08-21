@@ -17,3 +17,8 @@ coverage/
 # loader 快照为运行时产物，不入库
 .flavorlite/plugins/.versions/
 .flavor
+
+# Runtime evidence, evaluation, and evolution state
+.flavorlite/artifacts/
+.flavorlite/evals/
+.flavorlite/evolve/budget.json

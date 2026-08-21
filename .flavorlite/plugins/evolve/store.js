@@ -95,7 +95,7 @@ async function readJsonObject(file, fallback = {}) {
 }
 
 export class EvolveStore {
-  constructor({ cwd, maxSignals = 400, maxDetailChars = 300 } = {}) {
+  constructor({ cwd, maxSignals = 400, maxDetailChars = 300, maxRules = 50, maxRuleAgeDays = 90 } = {}) {
     this.dir = join(cwd, ".flavorlite", "evolve");
     this.signalsFile = join(this.dir, "signals.jsonl");
     this.patternsFile = join(this.dir, "patterns.jsonl");
@@ -106,6 +106,8 @@ export class EvolveStore {
     this.episodesFile = join(this.dir, "episodes.json");
     this.maxSignals = maxSignals;
     this.maxDetailChars = maxDetailChars;
+    this.maxRules = maxRules;
+    this.maxRuleAgeMs = maxRuleAgeDays * 86400000;
     // Serialize file mutations: tool hooks may fire in bursts.
     this.queue = Promise.resolve();
   }
@@ -221,8 +223,10 @@ export class EvolveStore {
     return this._enqueue(async () => {
       const data = await readJsonObject(this.rulesDataFile, { rules: [] });
       if (Array.isArray(data.rules) && data.rules.length > 0) {
+        const cutoff = Date.now() - this.maxRuleAgeMs;
         return data.rules
           .filter((rule) => rule?.active !== false && typeof rule?.text === "string")
+          .filter((rule) => (rule.helpful ?? 0) > 0 || Date.parse(rule.updatedAt ?? rule.createdAt ?? 0) >= cutoff)
           .sort((a, b) => String(b.updatedAt ?? b.createdAt).localeCompare(String(a.updatedAt ?? a.createdAt)))
           .slice(0, 12)
           .map((rule) => `- ${rule.text}`)
@@ -261,6 +265,10 @@ export class EvolveStore {
           ...(metadata.scope ? { scope: metadata.scope } : {}),
         };
         rules.push(rule);
+        if (rules.length > this.maxRules) {
+          rules.sort((a, b) => String(b.updatedAt ?? b.createdAt).localeCompare(String(a.updatedAt ?? a.createdAt)));
+          rules.length = this.maxRules;
+        }
       } else {
         rule.active = true;
         rule.updatedAt = now;

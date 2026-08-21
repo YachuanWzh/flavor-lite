@@ -56,7 +56,25 @@ export { ProviderError, normalizeProviderError, parseModelRef } from "./plugins/
 export type { ModelAdapter, ModelEvent, ModelRequest, ModelToolSchema, ProviderErrorCode, WireMessage } from "./plugins/llm/types";
 
 export { toolsPlugin, builtinTools } from "./plugins/tools";
-export type { AfterToolCall, BeforeToolCall, Tool, ToolCategory, ToolExecuteContext, ToolRegistry, ToolResult } from "./plugins/tools";
+export type {
+  AfterToolCall,
+  ArtifactRef,
+  BeforeToolCall,
+  Tool,
+  ToolCategory,
+  ToolDiagnostic,
+  ToolEvidence,
+  ToolExecuteContext,
+  ToolRegistry,
+  ToolResult,
+  ToolsPluginConfig,
+} from "./plugins/tools";
+
+export { artifactsPlugin } from "./plugins/artifacts";
+export type { ArtifactPutOptions, ArtifactService, ArtifactsPluginConfig } from "./plugins/artifacts";
+export { evidencePlugin } from "./plugins/evidence";
+export type { EvidenceService, RunEvaluation } from "./plugins/evidence";
+export { diagnosticsPlugin } from "./plugins/diagnostics";
 
 export { permissionPlugin, PERMISSION_MODES } from "./plugins/permission";
 export type { InteractionService, PermissionMode, PermissionPluginConfig, PermissionService } from "./plugins/permission";
@@ -65,7 +83,14 @@ export { sessionPlugin, rewriteSessionFile } from "./plugins/session";
 export type { SessionHandle, SessionHeader, SessionInfo, SessionLine, SessionPluginConfig, SessionService } from "./plugins/session";
 
 export { promptPlugin } from "./plugins/prompt";
-export type { PromptAssemble, PromptSection, PromptService } from "./plugins/prompt";
+export type {
+  PromptAssemble,
+  PromptInspection,
+  PromptInspectionSection,
+  PromptPluginConfig,
+  PromptSection,
+  PromptService,
+} from "./plugins/prompt";
 
 export { identityPlugin, securityPlugin, tasksPlugin, environmentPlugin, guidancePlugins } from "./plugins/guidance";
 
@@ -83,7 +108,11 @@ export { initPlugin } from "./plugins/init";
 export { pluginsLoaderPlugin } from "./plugins/plugins";
 export type {
   PluginLoadStatus,
+  PluginActivation,
+  PluginDoctorIssue,
+  PluginDoctorReport,
   PluginManifest,
+  PluginProfile,
   PluginsLoaderConfig,
   PluginsLoaderService,
   PluginStatus,
@@ -92,7 +121,7 @@ export type {
 export { routerPlugin, tokenize, fingerprint } from "./plugins/router";
 export type { RouterPluginConfig, RouterService } from "./plugins/router";
 export { telemetryPlugin } from "./plugins/telemetry";
-export type { TelemetryEvent, TelemetryPluginConfig, TelemetryQuery, TelemetryService } from "./plugins/telemetry";
+export type { TelemetryEvent, TelemetryPluginConfig, TelemetryProjection, TelemetryQuery, TelemetryService } from "./plugins/telemetry";
 
 // host composition
 export { createAgent } from "./host/bootstrap";
@@ -103,3 +132,6 @@ export { runRepl } from "./host/repl";
 export type { ReplOptions } from "./host/repl";
 export { TerminalInteraction, terminalInteractionPlugin } from "./host/interaction";
 export type { TerminalInteractionOptions, TerminalInteractionPluginConfig } from "./host/interaction";
+
+export { runEvalSuite } from "./evals";
+export type { EvalCase, EvalCheck, EvalResult, EvalSuiteResult } from "./evals";

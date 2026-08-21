@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "entry": "index.js",
   "description": "Start, poll, list and stop bounded background development processes with cursor-based logs.",
-  "activation": "eager",
+  "activation": "dynamic",
   "capabilities": ["shell", "host"],
   "provides": ["processManager"],
   "triggers": {

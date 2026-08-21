@@ -3,6 +3,7 @@
   "version": "0.2.0",
   "entry": "index.js",
   "description": "Distill successful multi-step sessions into reusable SKILL.md SOPs under .flavorlite/skills/ (generated skills are auto-discovered by the skills plugin).",
+  "activation": "background",
   "config": {
     "minToolCalls": 8,
     "maxGenerated": 20

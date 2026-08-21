@@ -139,4 +139,32 @@ describe("prompt assembly", () => {
     expect(prompt).toContain(dir);
     expect(prompt).toContain(new Date().toISOString().slice(0, 10));
   });
+
+  it("enforces a global prompt budget by priority and exposes inspection metadata", async () => {
+    const contributor = definePlugin({
+      name: "budgeted",
+      inject: ["hooks"],
+      apply(ctx) {
+        return ctx.effect(
+          () => (ctx.get("hooks") as HookBusService).hook<PromptAssemble>("prompt/assemble", async (event, next) => {
+            event.sections.push({ name: "low", content: "LLLLLLLLLL", priority: 1, source: "test" });
+            event.sections.push({ name: "high", content: "HHHHHHHHHH", priority: 100, source: "test" });
+            return next(event);
+          }),
+          "budgeted.install",
+        );
+      },
+    });
+    runtime = Runtime.create({ cwd: dir });
+    runtime.use(hooksPlugin).use(promptPlugin, { maxChars: 12 }).use(contributor);
+    runtime.start();
+
+    const service = runtime.ctx.get("systemPrompt") as PromptService;
+    const prompt = await service.assemble();
+    const inspection = await service.inspect();
+    expect(prompt).toContain("HHHHHHHHHH");
+    expect(inspection.totalChars).toBe(12);
+    expect(inspection.sections.find((section) => section.name === "low")).toMatchObject({ includedChars: 2, truncated: true });
+    expect(inspection.sections.find((section) => section.name === "high")).toMatchObject({ includedChars: 10, truncated: false });
+  });
 });

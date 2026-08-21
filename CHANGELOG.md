@@ -6,6 +6,34 @@ follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-08-21
+
+### Added
+
+- Plugin ABI v1 manifests with activation profiles, service/executable/env
+  requirements, Node/platform compatibility, resource budgets, lifecycle
+  state, self-tests, and operator-facing `doctor`, `explain`, and `config`.
+- Evidence-backed run evaluation, structured tool diagnostics and artifacts,
+  prompt/tool-output budgets, and inspectable runtime diagnostics.
+- Isolated subprocess execution plus a capability broker for generated
+  plugins; generated code is never imported into the host process.
+- Content-addressed plugin snapshots, atomic targeted hot reload, in-flight
+  tool leases, and automatic preservation of the last working version.
+- Versioned/redacted telemetry with deterministic projections, bounded
+  evolution budgets and circuit breaking, lifecycle quarantine, decay, and
+  asset governance for generated skills and plugins.
+- A dependency-free stdio MCP bridge and a fixture-based coding-agent eval
+  runner with persistent JSONL results.
+
+### Changed
+
+- Disk-plugin discovery is now genuinely lazy: dynamic and manual entries are
+  validated from their manifests without importing code until activation.
+- System prompts are priority-budgeted and expose section-level inspection;
+  oversized tool results keep concise transcript summaries and artifact refs.
+- Verification gates emit machine-checkable evidence, and run success is
+  derived from required evidence instead of completion text alone.
+
 ## [0.2.0] - 2026-08-20
 
 ### Added

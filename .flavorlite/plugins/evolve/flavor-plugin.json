@@ -3,7 +3,7 @@
   "version": "0.2.0",
   "description": "bounded recursive self-improvement: capture repeated failures, propose plugin-level fixes, verify with tests",
   "entry": "index.js",
-  "activation": "eager",
+  "activation": "background",
   "config": {
     "promptTop": 3,
     "minRepeats": 2,
@@ -14,6 +14,11 @@
     "learnMinSupport": 3,
     "learnMinPrecision": 0.75,
     "canaryRuns": 3,
+    "maxCandidatesPerDay": 3,
+    "maxVerificationsPerDay": 10,
+    "maxConsecutiveFailures": 3,
+    "maxRules": 50,
+    "maxRuleAgeDays": 90,
     "verificationCommands": ["npm test", "npm run typecheck", "npm run build"]
   }
 }

@@ -3,6 +3,7 @@
   "version": "0.1.0",
   "entry": "index.js",
   "activation": "dynamic",
+  "engines": { "node": ">=22.5" },
   "description": "Code graph for precise navigation: ast_search/ast_callers/ast_callees/ast_impact/ast_context tools plus /ast command, backed by a SQLite index under .flavorlite/astgraph/. Requires Node >= 22.5 (node:sqlite).",
   "triggers": {
     "keywords": ["ast", "代码图谱", "调用关系", "callers", "impact", "代码结构"],

@@ -10,6 +10,7 @@ import type { PluginContext } from "../../kernel/types";
 import type { ToolCall } from "../../shared/messages";
 import type { ModelToolSchema } from "../llm/types";
 import type { HookBusService } from "../hooks";
+import { currentOwnerScope } from "../../kernel/context";
 
 export type ToolCategory = "read" | "write" | "shell" | "control";
 
@@ -21,9 +22,44 @@ export interface ToolExecuteContext {
   onUpdate?: (data: unknown) => void;
 }
 
+export interface ArtifactRef {
+  id: string;
+  path: string;
+  mimeType?: string;
+  size?: number;
+  description?: string;
+}
+
+export interface ToolDiagnostic {
+  message: string;
+  severity?: "info" | "warning" | "error";
+  path?: string;
+  line?: number;
+  code?: string;
+}
+
+export interface ToolEvidence {
+  kind: "verification" | "test" | "typecheck" | "build" | "lint" | "diff" | "user" | "claim" | "custom";
+  status: "pass" | "fail" | "info";
+  summary: string;
+  source?: string;
+  required?: boolean;
+  data?: Record<string, unknown>;
+}
+
 export interface ToolResult {
   content: string;
   isError?: boolean;
+  /** Optional machine-readable payload; providers still receive content. */
+  data?: unknown;
+  /** Large or durable outputs stored outside the model transcript. */
+  artifacts?: ArtifactRef[];
+  diagnostics?: ToolDiagnostic[];
+  /** Evidence consumed by the run evaluator. */
+  evidence?: ToolEvidence[];
+  truncated?: boolean;
+  continuation?: string;
+  retryable?: boolean;
 }
 
 export interface Tool {
@@ -62,29 +98,51 @@ export interface ToolRegistry {
   schemas(): ModelToolSchema[];
   /** Execute a call through the before/after waterfalls. Never throws. */
   execute(toolCall: ToolCall, ctx: ToolExecuteContext): Promise<ToolResult>;
+  /** Settle when every currently executing tool call has returned. */
+  whenIdle(timeoutMs?: number): Promise<void>;
+  inFlight(): number;
+}
+
+export interface ToolsPluginConfig {
+  /** Hard cap for inline tool output. Full content is persisted as an artifact when the artifact service is mounted. */
+  maxOutputChars?: number;
+}
+
+interface ArtifactStoreLike {
+  put(content: string, options?: { runId?: string; mimeType?: string; description?: string }): Promise<ArtifactRef>;
 }
 
 class ToolRegistryImpl implements ToolRegistry {
-  private tools = new Map<string, Tool>();
+  private tools = new Map<string, { tool: Tool; owner?: string; registration: number }>();
+  private nextRegistration = 0;
+  private activeCalls = 0;
+  private idleWaiters = new Set<() => void>();
 
-  constructor(private readonly ctx: PluginContext) {}
+  constructor(
+    private readonly ctx: PluginContext,
+    private readonly maxOutputChars: number,
+  ) {}
 
   register(tool: Tool): () => void {
-    if (this.tools.has(tool.name)) {
+    const scope = currentOwnerScope();
+    const current = this.tools.get(tool.name);
+    const takeover = current !== undefined && scope?.replaceOwner !== undefined && current.owner === scope.replaceOwner;
+    if (current && !takeover) {
       throw new Error(`tool "${tool.name}" is already registered`);
     }
-    this.tools.set(tool.name, tool);
+    const registration = this.nextRegistration++;
+    this.tools.set(tool.name, { tool, owner: scope?.owner, registration });
     return () => {
-      this.tools.delete(tool.name);
+      if (this.tools.get(tool.name)?.registration === registration) this.tools.delete(tool.name);
     };
   }
 
   list(): Tool[] {
-    return [...this.tools.values()];
+    return [...this.tools.values()].map((entry) => entry.tool);
   }
 
   get(name: string): Tool | undefined {
-    return this.tools.get(name);
+    return this.tools.get(name)?.tool;
   }
 
   schemas(): ModelToolSchema[] {
@@ -97,7 +155,7 @@ class ToolRegistryImpl implements ToolRegistry {
 
   async execute(toolCall: ToolCall, execCtx: ToolExecuteContext): Promise<ToolResult> {
     const hooks = this.ctx.get("hooks") as HookBusService;
-    const tool = this.tools.get(toolCall.name);
+    const tool = this.tools.get(toolCall.name)?.tool;
 
     const before = await hooks.waterfall<BeforeToolCall>("tools/before-call", {
       toolCall,
@@ -110,7 +168,7 @@ class ToolRegistryImpl implements ToolRegistry {
     }
     // A before-call hook (e.g. the router's L2 recall) may have mounted the
     // tool mid-waterfall: re-resolve before giving up.
-    const resolved = tool ?? this.tools.get(toolCall.name);
+    const resolved = tool ?? this.tools.get(toolCall.name)?.tool;
     if (!resolved) {
       const known = this.list().map((entry) => entry.name).join(", ") || "none";
       return { content: `Tool "${toolCall.name}" not found. Available tools: ${known}`, isError: true };
@@ -118,7 +176,16 @@ class ToolRegistryImpl implements ToolRegistry {
 
     let result: ToolResult;
     try {
-      result = await resolved.execute(before.args, execCtx);
+      this.activeCalls += 1;
+      try {
+        result = await resolved.execute(before.args, execCtx);
+      } finally {
+        this.activeCalls -= 1;
+        if (this.activeCalls === 0) {
+          for (const resolveIdle of this.idleWaiters) resolveIdle();
+          this.idleWaiters.clear();
+        }
+      }
     } catch (error) {
       result = {
         content: error instanceof Error ? error.message : String(error),
@@ -126,6 +193,7 @@ class ToolRegistryImpl implements ToolRegistry {
       };
     }
 
+    result = await this.boundOutput(result, execCtx);
     const after = await hooks.waterfall<AfterToolCall>("tools/after-call", {
       toolCall,
       args: before.args,
@@ -134,14 +202,63 @@ class ToolRegistryImpl implements ToolRegistry {
     });
     return after.result;
   }
+
+  inFlight(): number {
+    return this.activeCalls;
+  }
+
+  async whenIdle(timeoutMs = 30_000): Promise<void> {
+    if (this.activeCalls === 0) return;
+    await new Promise<void>((resolvePromise, rejectPromise) => {
+      const timer = setTimeout(() => {
+        this.idleWaiters.delete(done);
+        rejectPromise(new Error(`timed out waiting for ${this.activeCalls} in-flight tool call(s)`));
+      }, timeoutMs);
+      const done = () => {
+        clearTimeout(timer);
+        resolvePromise();
+      };
+      this.idleWaiters.add(done);
+    });
+  }
+
+  private async boundOutput(result: ToolResult, execCtx: ToolExecuteContext): Promise<ToolResult> {
+    if (result.content.length <= this.maxOutputChars) return result;
+    const full = result.content;
+    const artifacts = [...(result.artifacts ?? [])];
+    const store = this.ctx.tryGet("artifacts") as ArtifactStoreLike | undefined;
+    if (store) {
+      try {
+        artifacts.push(
+          await store.put(full, {
+            ...(execCtx.runId ? { runId: execCtx.runId } : {}),
+            mimeType: "text/plain",
+            description: "Full tool output truncated from the model transcript",
+          }),
+        );
+      } catch (error) {
+        this.ctx.logger.warn(`failed to persist oversized tool output: ${error instanceof Error ? error.message : String(error)}`);
+      }
+    }
+    const suffix = artifacts.at(-1)?.path
+      ? `\n\n[output truncated; full artifact: ${artifacts.at(-1)!.path}]`
+      : "\n\n[output truncated]";
+    return {
+      ...result,
+      content: `${full.slice(0, Math.max(0, this.maxOutputChars - suffix.length))}${suffix}`,
+      truncated: true,
+      ...(artifacts.length > 0 ? { artifacts } : {}),
+    };
+  }
 }
 
-export const toolsPlugin = definePlugin({
+export const toolsPlugin = definePlugin<ToolsPluginConfig>({
   name: "tools",
   inject: ["hooks"],
   provides: ["tools"],
-  apply(ctx: PluginContext) {
-    return ctx.effect(() => ctx.provide("tools", new ToolRegistryImpl(ctx)), "tools.provide");
+  apply(ctx: PluginContext, config: ToolsPluginConfig = {}) {
+    const maxOutputChars = Math.max(1_000, config.maxOutputChars ?? 100_000);
+    return ctx.effect(() => ctx.provide("tools", new ToolRegistryImpl(ctx, maxOutputChars)), "tools.provide");
   },
 });
 

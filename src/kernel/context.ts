@@ -28,6 +28,11 @@ interface OwnerScope extends OwnerScopeExtras {
 
 const ownerStorage = new AsyncLocalStorage<OwnerScope | undefined>();
 
+/** Registration seams use this to participate in Runtime.reload takeovers. */
+export function currentOwnerScope(): Readonly<OwnerScope> | undefined {
+  return ownerStorage.getStore();
+}
+
 /** Run fn with an ambient owner scope; async continuations inherit it. */
 export function withOwnerScope<T>(owner: string | undefined, fn: () => T, extras?: OwnerScopeExtras): T {
   return ownerStorage.run(owner ? { owner, ...extras } : undefined, fn);

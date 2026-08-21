@@ -22,6 +22,7 @@ import type { ToolRegistry } from "../tools/registry";
 import type { LlmService } from "../llm";
 import type { PromptService } from "../prompt";
 import type { HookBusService } from "../hooks";
+import type { EvidenceService, RunEvaluation } from "../evidence";
 
 export type AgentEvent =
   | { type: "agent_start"; runId: string; sessionId?: string; model?: string }
@@ -76,6 +77,8 @@ export interface LoopAfterRun {
   outcome?: "success" | "provider_error" | "max_iterations" | "aborted";
   /** Conservative quality signal used by learning plugins. */
   successful?: boolean;
+  /** Evidence-backed evaluation when the evidence service is mounted. */
+  evaluation?: RunEvaluation;
   /** Tool calls executed this run (aborted placeholders excluded). */
   toolCalls: number;
   /** Tool calls whose result carried isError. */
@@ -119,6 +122,8 @@ class AgentServiceImpl implements AgentService {
     const maxIterations = options.maxIterations ?? DEFAULT_MAX_ITERATIONS;
     const session = options.session ?? (sessionService ? await sessionService.create() : undefined);
     const runId = randomUUID();
+    const evidence = this.ctx.tryGet("evidence") as EvidenceService | undefined;
+    evidence?.begin(runId);
     const messages: Message[] = session ? [...session.messages()] : [];
     const systemPrompt = await prompt.assemble();
 
@@ -238,6 +243,7 @@ class AgentServiceImpl implements AgentService {
         });
         stats.toolCalls += 1;
         if (result.isError) stats.toolErrors += 1;
+        if (result.evidence && result.evidence.length > 0) evidence?.record(runId, result.evidence);
         await this.record(session, messages, {
           role: "tool",
           toolCallId: toolCall.id,
@@ -267,15 +273,19 @@ class AgentServiceImpl implements AgentService {
     stats: RunStats,
   ): Promise<void> {
     try {
+      const evidence = this.ctx.tryGet("evidence") as EvidenceService | undefined;
+      const evaluation = evidence?.evaluate(runId, outcome, stats.toolErrors);
       await hooks.waterfall<LoopAfterRun>("loop/after-run", {
         runId,
         ...(sessionId ? { sessionId } : {}),
         iterations,
         reason,
         outcome,
-        successful: outcome === "success" && stats.toolErrors === 0,
+        successful: evaluation?.successful ?? (outcome === "success" && stats.toolErrors === 0),
+        ...(evaluation ? { evaluation } : {}),
         ...stats,
       });
+      evidence?.clear(runId);
     } catch (error) {
       this.ctx.logger.warn(`loop/after-run hook failed: ${error instanceof Error ? error.message : String(error)}`);
     }

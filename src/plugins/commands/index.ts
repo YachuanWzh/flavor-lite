@@ -6,6 +6,7 @@
 
 import { definePlugin } from "../../kernel";
 import type { PluginContext } from "../../kernel/types";
+import { currentOwnerScope } from "../../kernel/context";
 
 export interface Command {
   name: string;
@@ -23,24 +24,29 @@ export interface CommandsService {
 }
 
 class CommandsServiceImpl implements CommandsService {
-  private commands = new Map<string, Command>();
+  private commands = new Map<string, { command: Command; owner?: string; registration: number }>();
+  private nextRegistration = 0;
 
   register(command: Command): () => void {
-    if (this.commands.has(command.name)) {
+    const scope = currentOwnerScope();
+    const current = this.commands.get(command.name);
+    const takeover = current !== undefined && scope?.replaceOwner !== undefined && current.owner === scope.replaceOwner;
+    if (current && !takeover) {
       throw new Error(`command "/${command.name}" is already registered`);
     }
-    this.commands.set(command.name, command);
+    const registration = this.nextRegistration++;
+    this.commands.set(command.name, { command, owner: scope?.owner, registration });
     return () => {
-      this.commands.delete(command.name);
+      if (this.commands.get(command.name)?.registration === registration) this.commands.delete(command.name);
     };
   }
 
   list(): Command[] {
-    return [...this.commands.values()].sort((a, b) => a.name.localeCompare(b.name));
+    return [...this.commands.values()].map((entry) => entry.command).sort((a, b) => a.name.localeCompare(b.name));
   }
 
   get(name: string): Command | undefined {
-    return this.commands.get(name);
+    return this.commands.get(name)?.command;
   }
 
   async execute(line: string): Promise<string | undefined> {
@@ -49,7 +55,7 @@ class CommandsServiceImpl implements CommandsService {
     const space = trimmed.indexOf(" ");
     const name = (space === -1 ? trimmed : trimmed.slice(0, space)).slice(1);
     const args = space === -1 ? "" : trimmed.slice(space + 1).trim();
-    const command = this.commands.get(name);
+    const command = this.commands.get(name)?.command;
     if (!command) return `Unknown command "/${name}". Use /help to list commands.`;
     return command.run(args);
   }

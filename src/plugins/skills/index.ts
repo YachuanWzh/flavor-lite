@@ -8,7 +8,7 @@
  */
 
 import { homedir } from "node:os";
-import { join, resolve } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
 import { readFile, readdir } from "node:fs/promises";
 import { definePlugin } from "../../kernel";
 import type { PluginContext } from "../../kernel/types";
@@ -31,6 +31,7 @@ export interface SkillsService {
 const FRONT_MATTER = /^---\r?\n([\s\S]*?)\r?\n---/;
 const DESCRIPTION_LINE = /^description:\s*(.+)$/m;
 const NAME_LINE = /^name:\s*(.+)$/m;
+const QUARANTINED_LINE = /^quarantined:\s*true\s*$/mi;
 
 function parseSkillMeta(raw: string, fallbackName: string): { name: string; description: string } {
   const match = FRONT_MATTER.exec(raw);
@@ -64,6 +65,7 @@ class SkillsServiceImpl implements SkillsService {
         const path = join(root, entry, "SKILL.md");
         try {
           const raw = await readFile(path, "utf-8");
+          if (QUARANTINED_LINE.test(raw)) continue;
           const meta = parseSkillMeta(raw, entry);
           skills.set(entry, { name: meta.name, description: meta.description, path });
         } catch {
@@ -115,6 +117,12 @@ export const skillsPlugin = definePlugin({
           && /(?:^|[\\/])SKILL\.md$/i.test(path)
         ) {
           service.markUsed(event.context.runId, resolve(event.context.cwd, path));
+          const telemetry = ctx.tryGet("telemetry") as { record?: (event: Record<string, unknown>) => void } | undefined;
+          telemetry?.record?.({
+            type: "skill.used",
+            runId: event.context.runId,
+            skill: basename(dirname(resolve(event.context.cwd, path))),
+          });
         }
         return next(event);
       });

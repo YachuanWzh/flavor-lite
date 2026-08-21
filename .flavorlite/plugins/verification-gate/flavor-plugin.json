@@ -3,7 +3,7 @@
   "version": "0.1.1",
   "entry": "index.js",
   "description": "Detect and run repository-native type, lint, test and build checks with structured results.",
-  "activation": "eager",
+  "activation": "dynamic",
   "capabilities": ["shell"],
   "triggers": {
     "keywords": ["verify", "验证", "测试", "typecheck", "lint", "build"],

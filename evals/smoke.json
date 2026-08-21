@@ -1,0 +1,10 @@
+{
+  "id": "add-sum-validation",
+  "prompt": "Fix the implementation so sum only accepts finite numbers and update the README with that behavior. Run the tests.",
+  "fixture": "fixtures/sum-project",
+  "maxIterations": 20,
+  "maxToolErrors": 1,
+  "checks": [
+    { "command": "npm test", "timeoutMs": 60000 }
+  ]
+}

@@ -202,8 +202,8 @@ read/control 不设卡，network/host 仅声明展示。脚手架（`/evolve imp
 3. **triggers 回写**：`/evolve learn`（见 3.7）；
 4. **信号联动**：evolve 消费 error-monitor 高置信度分析（见 3.5）。
 
-待办：进化预算熔断（3.9）。manifest provenance（origin/generatedFrom）、
-统一 telemetry 服务、自产插件能力分级（3.8）均已落地。
+进化预算熔断（3.9）、manifest provenance（origin/generatedFrom）、统一
+telemetry 服务、自产插件能力分级（3.8）均已落地。
 
 ## 7. 批次三：晋升阶梯全通（✅ 已落地，spec 见 docs/specs/knowledge-promoter.md）
 
@@ -223,7 +223,19 @@ memory 积累 → /ladder to-skill → SKILL.md 草稿 → /distill promote → 
 2. **自产插件能力分级**（见 3.8）：origin 字段消费落地——loader 工具归属追踪 +
    permission manifest 契约门禁（未声明即拒、已声明强 ask）。
 
-待办仅剩：进化预算与熔断（3.9）。
+进化预算与熔断（3.9）现已落地：每日候选/验证上限持久化到
+`.flavorlite/evolve/budget.json`，连续失败触发熔断，`/evolve budget` 可审计，
+`/evolve resume` 由操作者恢复。候选插件先进入 `candidate`，回归或验证失败进入
+`quarantined`，只有 canary 接受后转为 `active`。
+
+## 9. 批次五：有界自治与资产治理（✅ 已落地）
+
+1. **规则衰减与配额**：长期无帮助的规则过期，规则总数受限；有正反馈的规则保留。
+2. **候选生命周期**：自产插件严格走 candidate → active/quarantined，不会自动加载未验收代码。
+3. **资产治理**：`asset-governance` 按使用与反馈精度隔离低价值 generated skill/plugin，
+   `/governance status|sweep|restore` 保留人工复活通道。
+4. **信号投影**：telemetry reducer 从版本化、脱敏事件流重建运行、工具、错误、阻断与
+   插件反馈统计，治理决策不依赖脆弱的临时内存。
 
 ## 附：相关现有资产索引
 

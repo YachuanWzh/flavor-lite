@@ -1,6 +1,6 @@
 {
   "name": "flavor-lite",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Everything is a plugin: a lightweight coding agent kernel in the spirit of dsh, with the best of flavor-code and pi.",
   "author": "YachuanWzh",
   "license": "MIT",
@@ -29,10 +29,10 @@
     "dev": "tsup --watch",
     "start": "node dist/cli.js",
     "typecheck": "tsc --noEmit",
-    "types": "tsc --emitDeclarationOnly --declaration --outDir dist",
+    "types": "tsc -p tsconfig.types.json",
     "test": "vitest run",
     "test:watch": "vitest",
-    "prepack": "npm run build"
+    "prepack": "npm run build && npm run types"
   },
   "dependencies": {
     "zod": "^4.4.3"

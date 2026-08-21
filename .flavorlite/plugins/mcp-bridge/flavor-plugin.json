@@ -1,0 +1,21 @@
+{
+  "manifestVersion": 1,
+  "apiVersion": "1",
+  "name": "mcp-bridge",
+  "version": "0.1.0",
+  "entry": "index.js",
+  "activation": "dynamic",
+  "description": "Zero-SDK MCP stdio bridge: discovers configured servers and exposes their tools through flavor-lite permissions.",
+  "provides": ["mcp"],
+  "requires": { "services": ["tools", "commands"] },
+  "capabilities": ["shell", "host", "network", "files"],
+  "triggers": {
+    "keywords": ["mcp", "model context protocol", "外部工具"],
+    "commands": ["mcp"]
+  },
+  "config": {
+    "path": ".flavorlite/mcp.json",
+    "requestTimeoutMs": 30000,
+    "autoConnect": []
+  }
+}

@@ -1,6 +1,11 @@
 {
+  "manifestVersion": 1,
+  "apiVersion": "1",
   "name": "my-plugin",
   "version": "0.1.0",
   "entry": "index.js",
-  "description": "Describe what this plugin does."
+  "description": "Describe what this plugin does.",
+  "activation": "dynamic",
+  "requires": { "services": ["hooks", "tools", "commands"] },
+  "triggers": { "tools": ["my-plugin_hello"], "commands": ["my-plugin"] }
 }

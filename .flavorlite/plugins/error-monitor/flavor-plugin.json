@@ -3,6 +3,7 @@
   "version": "0.2.1",
   "entry": "index.js",
   "description": "Monitors erroneous tool calls (especially Windows shell commands), records them with deduplication, has the background LLM analyze each new failure (with a confidence score), distills high-confidence analyses into long-term memory, and injects them into the system prompt to guide future tool calls.",
+  "activation": "background",
   "config": {
     "maxRecords": 200,
     "maxDetailChars": 500,

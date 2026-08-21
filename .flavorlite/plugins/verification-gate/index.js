@@ -153,11 +153,21 @@ export default {
         description: "Run repository-native verification checks after code changes. mode=quick runs focused checks; mode=full includes the full test/build suite.",
         category: "shell",
         inputSchema: { type: "object", properties: { mode: { type: "string", enum: ["quick", "full"] } } },
-        execute(args, execCtx) {
-          return toToolResult(
+        async execute(args, execCtx) {
+          const result = await toToolResult(
             () => verify(args.mode === "full" ? "full" : "quick", execCtx.signal),
             (content) => content.includes("FAILED"),
           );
+          return {
+            ...result,
+            evidence: [{
+              kind: "verification",
+              status: result.isError ? "fail" : result.content.includes("No verification checks") ? "info" : "pass",
+              summary: result.isError ? `Repository verification failed (${args.mode ?? "quick"})` : `Repository verification passed (${args.mode ?? "quick"})`,
+              source: "verification-gate",
+              required: true,
+            }],
+          };
         },
       }));
       disposers.push(ctx.get("commands").register({

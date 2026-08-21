@@ -3,6 +3,7 @@
   "version": "0.2.0",
   "entry": "index.js",
   "description": "promotion ladder: proposes memory->skill and skill->plugin promotions (/ladder)",
+  "activation": "background",
   "provides": ["knowledgePromoter"],
   "config": {
     "memoryTopicThreshold": 3,

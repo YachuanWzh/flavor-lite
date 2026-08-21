@@ -87,6 +87,8 @@ describe("telemetry plugin", () => {
     const events = await telemetry().events();
     expect(events.map((event) => event.type)).toEqual(["custom.a", "custom.b"]);
     expect(events[0]!.ts).toMatch(/^\d{4}-\d{2}-\d{2}T/);
+    expect(events[0]!.schemaVersion).toBe(1);
+    expect(events[0]!.eventId).toBeTruthy();
     expect(events[1]!.n).toBe(2);
     // The feed is plain JSONL on disk.
     const raw = await readFile(join(tmp, ".flavorlite", "telemetry.jsonl"), "utf-8");
@@ -174,5 +176,17 @@ describe("telemetry plugin", () => {
     telemetry().record({ type: "custom.a" });
     await telemetry().clear();
     expect(await telemetry().events()).toHaveLength(0);
+  });
+
+  it("redacts secret fields and reduces events into a stable projection", async () => {
+    mount();
+    telemetry().record({ type: "custom.secret", token: "do-not-store", inputTokens: 42 });
+    telemetry().record({ type: "router.recall", plugins: ["demo"] });
+    telemetry().record({ type: "router.feedback", entries: [{ plugin: "demo", used: true }] });
+    const events = await telemetry().events();
+    expect(events[0]!.token).toBe("[redacted]");
+    expect(events[0]!.inputTokens).toBe(42);
+    const projection = await telemetry().reduce();
+    expect(projection.perPlugin.demo).toEqual({ recalls: 1, used: 1, unused: 0 });
   });
 });

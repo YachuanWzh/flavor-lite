@@ -52,6 +52,9 @@ const MAX_TRIGGER_KEYWORDS = 16;
 const DEFAULT_LEARN_MIN_SUPPORT = 3;
 const DEFAULT_LEARN_MIN_PRECISION = 0.75;
 const DEFAULT_CANARY_RUNS = 3;
+const DEFAULT_MAX_CANDIDATES_PER_DAY = 3;
+const DEFAULT_MAX_VERIFICATIONS_PER_DAY = 10;
+const DEFAULT_MAX_CONSECUTIVE_FAILURES = 3;
 const GENERIC_PATTERN_TOOLS = new Set(["read", "grep", "glob", "shell", "write", "edit", "todowrite"]);
 
 const SUGGEST_SECTION = `# self-improvement suggestions (evolve plugin)
@@ -76,6 +79,61 @@ Rules below were distilled from past fixes and always apply:
 function sanitizePluginName(tool) {
   const base = String(tool ?? "fix").replace(/[^a-z0-9_-]/gi, "-").toLowerCase();
   return base.startsWith("fix-") ? base : `fix-${base}`;
+}
+
+async function readBudget(cwd) {
+  const file = join(cwd, ".flavorlite", "evolve", "budget.json");
+  const day = new Date().toISOString().slice(0, 10);
+  try {
+    const value = JSON.parse(await readFile(file, "utf-8"));
+    if (value.day === day) return { file, ...value };
+  } catch {
+    // missing/corrupt budget starts a fresh bounded day
+  }
+  return { file, day, candidates: 0, verifications: 0, consecutiveFailures: 0, halted: false };
+}
+
+async function writeBudget(value) {
+  await mkdir(join(value.file, ".."), { recursive: true });
+  const { file, ...data } = value;
+  await writeFile(file, `${JSON.stringify(data, null, 2)}\n`, "utf-8");
+}
+
+async function consumeBudget(cwd, limits, kind) {
+  const budget = await readBudget(cwd);
+  if (budget.halted) return { ok: false, budget, reason: "evolution is halted after repeated verification failures; use /evolve resume" };
+  if (kind === "candidate" && budget.candidates >= limits.maxCandidatesPerDay) {
+    return { ok: false, budget, reason: `daily candidate budget exhausted (${limits.maxCandidatesPerDay})` };
+  }
+  if (kind === "verification" && budget.verifications >= limits.maxVerificationsPerDay) {
+    return { ok: false, budget, reason: `daily verification budget exhausted (${limits.maxVerificationsPerDay})` };
+  }
+  if (kind === "candidate") budget.candidates += 1;
+  if (kind === "verification") budget.verifications += 1;
+  await writeBudget(budget);
+  return { ok: true, budget };
+}
+
+async function recordVerificationOutcome(cwd, limits, passed) {
+  const budget = await readBudget(cwd);
+  budget.consecutiveFailures = passed ? 0 : (budget.consecutiveFailures ?? 0) + 1;
+  if (budget.consecutiveFailures >= limits.maxConsecutiveFailures) budget.halted = true;
+  await writeBudget(budget);
+  return budget;
+}
+
+async function updatePluginLifecycle(loader, pluginName, state, reason) {
+  if (!pluginName) return;
+  const status = loader.list().find((entry) => entry.name === pluginName);
+  if (!status) return;
+  try {
+    const manifestFile = join(status.dir, "flavor-plugin.json");
+    const manifest = JSON.parse(await readFile(manifestFile, "utf-8"));
+    manifest.lifecycle = { state, reason, updatedAt: new Date().toISOString() };
+    await writeFile(manifestFile, `${JSON.stringify(manifest, null, 2)}\n`, "utf-8");
+  } catch {
+    // episode history remains authoritative when metadata cannot be written
+  }
 }
 
 /**
@@ -167,8 +225,17 @@ export default {
       const verificationCommands = Array.isArray(config.verificationCommands)
         ? config.verificationCommands.filter((command) => typeof command === "string" && command.trim())
         : [testCommand, "npm run typecheck", "npm run build"];
+      const evolutionLimits = {
+        maxCandidatesPerDay: Number.isFinite(config.maxCandidatesPerDay) ? Math.max(1, config.maxCandidatesPerDay) : DEFAULT_MAX_CANDIDATES_PER_DAY,
+        maxVerificationsPerDay: Number.isFinite(config.maxVerificationsPerDay) ? Math.max(1, config.maxVerificationsPerDay) : DEFAULT_MAX_VERIFICATIONS_PER_DAY,
+        maxConsecutiveFailures: Number.isFinite(config.maxConsecutiveFailures) ? Math.max(1, config.maxConsecutiveFailures) : DEFAULT_MAX_CONSECUTIVE_FAILURES,
+      };
 
-      const store = new EvolveStore({ cwd: ctx.cwd });
+      const store = new EvolveStore({
+        cwd: ctx.cwd,
+        maxRules: Number.isFinite(config.maxRules) ? Math.max(1, config.maxRules) : 50,
+        maxRuleAgeDays: Number.isFinite(config.maxRuleAgeDays) ? Math.max(1, config.maxRuleAgeDays) : 90,
+      });
       const disposers = [];
       // Success-call names of the current run (values never recorded);
       // flushed into trigram patterns on loop/after-run.
@@ -322,9 +389,10 @@ export default {
                 ? failures.some((call) => call.tool === sourceTool && String(call.at) >= String(episode.canaryStartedAt ?? ""))
                 : failures.some((call) => String(call.at) >= String(episode.canaryStartedAt ?? ""));
               if (regressed) {
-                if (episode.ruleId) await store.updateRule(episode.ruleId, { active: false });
+                if (episode.ruleId) await store.updateRule(episode.ruleId, { active: false, harmful: (episode.harmful ?? 0) + 1 });
                 if (episode.pluginName) {
                   await ctx.get("pluginsLoader").eject(episode.pluginName).catch(() => {});
+                  await updatePluginLifecycle(ctx.get("pluginsLoader"), episode.pluginName, "quarantined", "canary regression");
                 }
                 await store.updateEpisode(episode.id, "rejected", {
                   rejectedAt: new Date().toISOString(),
@@ -334,7 +402,9 @@ export default {
               }
               const count = (episode.canaryCount ?? 0) + 1;
               if (count >= canaryRuns) {
+                if (episode.ruleId) await store.updateRule(episode.ruleId, { helpful: (episode.helpful ?? 0) + 1, confidence: Math.min(1, 0.5 + count * 0.1) });
                 await store.updateEpisode(episode.id, "accepted", { canaryCount: count, acceptedAt: new Date().toISOString() });
+                if (episode.pluginName) await updatePluginLifecycle(ctx.get("pluginsLoader"), episode.pluginName, "active", "accepted after clean canary runs");
               } else {
                 await store.updateEpisode(episode.id, "canary", { canaryCount: count, lastCanaryRunId: event.runId });
               }
@@ -376,6 +446,8 @@ export default {
             required: ["suggestionId", "implementation"],
           },
           async execute(args) {
+            const budgetGate = await consumeBudget(ctx.cwd, evolutionLimits, "candidate");
+            if (!budgetGate.ok) return { content: `Evolution budget blocked this change: ${budgetGate.reason}`, isError: true };
             const suggestionId = String(args?.suggestionId ?? "");
             const implementation = String(args?.implementation ?? "");
             const kind = args?.kind === "prompt_rule" ? "prompt_rule" : "plugin";
@@ -450,6 +522,7 @@ export default {
               const manifest = JSON.parse(await readFile(manifestFile, "utf-8"));
               manifest.origin = "generated";
               manifest.generatedFrom = suggestion.id;
+              manifest.lifecycle = { state: "candidate", reason: "awaiting verification", updatedAt: new Date().toISOString() };
               await writeFile(manifestFile, `${JSON.stringify(manifest, null, 2)}\n`, "utf-8");
             } catch {
               // manifest missing: leave provenance to the caller
@@ -679,6 +752,8 @@ export default {
             }
 
             if (arg === "test" || arg.startsWith("test ")) {
+              const budgetGate = await consumeBudget(ctx.cwd, evolutionLimits, "verification");
+              if (!budgetGate.ok) return `Evolution budget blocked verification: ${budgetGate.reason}`;
               const suggestionId = arg.startsWith("test ") ? arg.slice(5).trim() : "";
               const episode = suggestionId
                 ? (await store.episodes(200)).find((entry) => entry.suggestionId === suggestionId)
@@ -696,8 +771,10 @@ export default {
                 const result = await runCommand(command, ctx.cwd, testTimeoutMs);
                 reports.push({ command, ok: result.ok, code: result.code, stdout: result.stdout.slice(-2000), stderr: result.stderr.slice(-2000) });
                 if (!result.ok) {
+                  const budget = await recordVerificationOutcome(ctx.cwd, evolutionLimits, false);
                   if (episode?.ruleId) await store.updateRule(episode.ruleId, { active: false });
                   if (episode?.pluginName) await loader.eject(episode.pluginName).catch(() => {});
+                  if (episode?.pluginName) await updatePluginLifecycle(loader, episode.pluginName, "quarantined", `verification failed: ${command}`);
                   if (episode) {
                     await store.updateEpisode(episode.id, "rejected", {
                       verification: reports,
@@ -705,9 +782,10 @@ export default {
                       reason: `verification failed: ${command}`,
                     });
                   }
-                  return `verification FAILED: ${command} (exit ${result.code})${result.stderr ? `\n${result.stderr.slice(-4000)}` : ""}`;
+                  return `verification FAILED: ${command} (exit ${result.code})${budget.halted ? "\nEvolution halted after repeated failures; use /evolve resume after review." : ""}${result.stderr ? `\n${result.stderr.slice(-4000)}` : ""}`;
                 }
               }
+              await recordVerificationOutcome(ctx.cwd, evolutionLimits, true);
               if (episode) await store.updateEpisode(episode.id, "verified", { verification: reports, verifiedAt: new Date().toISOString() });
               return `verification passed (${commandsToRun.length} command(s))${episode ? `; episode ${episode.id} is verified and ready for /evolve done ${suggestionId}` : ""}`;
             }
@@ -717,6 +795,24 @@ export default {
               return episodes.length === 0
                 ? "no evolution episodes yet"
                 : episodes.map((episode) => `[${episode.id}] ${episode.suggestionId} ${episode.status}${episode.pluginName ? ` plugin=${episode.pluginName}` : ""}`).join("\n");
+            }
+
+            if (arg === "budget") {
+              const budget = await readBudget(ctx.cwd);
+              return [
+                `evolution budget ${budget.day}${budget.halted ? " (HALTED)" : ""}`,
+                `  candidates: ${budget.candidates}/${evolutionLimits.maxCandidatesPerDay}`,
+                `  verifications: ${budget.verifications}/${evolutionLimits.maxVerificationsPerDay}`,
+                `  consecutive failures: ${budget.consecutiveFailures}/${evolutionLimits.maxConsecutiveFailures}`,
+              ].join("\n");
+            }
+
+            if (arg === "resume") {
+              const budget = await readBudget(ctx.cwd);
+              budget.halted = false;
+              budget.consecutiveFailures = 0;
+              await writeBudget(budget);
+              return "evolution resumed; failure counter reset";
             }
 
             if (arg.startsWith("baseline ")) {
@@ -786,6 +882,7 @@ export default {
               const episode = (await store.episodes(200)).find((entry) => entry.suggestionId === id);
               if (episode?.ruleId) await store.updateRule(episode.ruleId, { active: false });
               if (episode?.pluginName) await loader.eject(episode.pluginName).catch(() => {});
+              if (episode?.pluginName) await updatePluginLifecycle(loader, episode.pluginName, "quarantined", "dismissed by operator");
               if (episode) {
                 await store.updateEpisode(episode.id, "rejected", {
                   rejectedAt: new Date().toISOString(),
@@ -797,6 +894,8 @@ export default {
             }
 
             if (arg.startsWith("improve ")) {
+              const budgetGate = await consumeBudget(ctx.cwd, evolutionLimits, "candidate");
+              if (!budgetGate.ok) return `Evolution budget blocked this change: ${budgetGate.reason}`;
               const suggestionId = arg.slice(8).trim();
               const doneIds = new Set(await store.readDoneIds());
               const activeIds = new Set(await store.activeSuggestionIds());
@@ -822,6 +921,7 @@ export default {
                 const manifest = JSON.parse(await readFile(manifestFile, "utf-8"));
                 manifest.origin = "generated";
                 manifest.generatedFrom = suggestion.id;
+                manifest.lifecycle = { state: "candidate", reason: "awaiting verification", updatedAt: new Date().toISOString() };
                 await writeFile(manifestFile, `${JSON.stringify(manifest, null, 2)}\n`, "utf-8");
               } catch {
                 // manifest missing: leave provenance to the caller
@@ -837,10 +937,12 @@ export default {
             }
 
             return [
-              "usage: /evolve <signals|suggest|episodes|improve <id>|baseline <id> <command>|verify <plugin>|revert <plugin>|test [id]|clear|done <id>|dismiss <id>|export [limit]|learn>",
+              "usage: /evolve <signals|suggest|episodes|budget|resume|improve <id>|baseline <id> <command>|verify <plugin>|revert <plugin>|test [id]|clear|done <id>|dismiss <id>|export [limit]|learn>",
               "  signals   list recent failing tool results",
               "  suggest   aggregate repeated failures, recurring success trigrams and analyzed error-monitor records into suggestions",
               "  episodes  list trusted evolution episodes and their status",
+              "  budget    show daily candidate/verification limits and breaker state",
+              "  resume    manually reset a tripped evolution breaker",
               "  improve   scaffold a plugin dir for one suggestion",
               "  baseline  capture a red baseline for an episode",
               "  verify    sandbox dry-run a plugin before activating it",

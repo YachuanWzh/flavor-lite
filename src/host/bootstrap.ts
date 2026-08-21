@@ -21,6 +21,9 @@ import { initPlugin } from "../plugins/init";
 import { pluginsLoaderPlugin } from "../plugins/plugins";
 import { routerPlugin } from "../plugins/router";
 import { telemetryPlugin } from "../plugins/telemetry";
+import { artifactsPlugin } from "../plugins/artifacts";
+import { evidencePlugin } from "../plugins/evidence";
+import { diagnosticsPlugin } from "../plugins/diagnostics";
 import { loadConfig, type FlavorConfig } from "./config";
 
 export interface BootstrapOptions {
@@ -30,6 +33,8 @@ export interface BootstrapOptions {
   logger?: Logger;
   /** Extra plugins mounted after the defaults (custom providers, policies, hosts). */
   plugins?: Array<{ plugin: Plugin<unknown>; config?: unknown }>;
+  /** Diagnostics may compose the host without credentials. Default true. */
+  requireProvider?: boolean;
 }
 
 export interface AgentHandle {
@@ -65,7 +70,8 @@ export function createAgent(options: BootstrapOptions = {}): AgentHandle {
     // root never touches adapters or environment variables.
     .use(openaiProviderPlugin, config.openai ?? {})
     .use(anthropicProviderPlugin, config.anthropic ?? {})
-    .use(toolsPlugin);
+    .use(toolsPlugin, { maxOutputChars: config.maxToolOutputChars ?? 100_000 })
+    .use(artifactsPlugin, config.artifacts ?? {});
   // Guidance first so its sections lead the prompt; permission and tool
   // plugins contribute their own sections where they mount.
   for (const guidance of guidancePlugins) runtime.use(guidance);
@@ -73,16 +79,18 @@ export function createAgent(options: BootstrapOptions = {}): AgentHandle {
   runtime
     .use(permissionPlugin, { ...(config.mode ? { mode: config.mode as PermissionMode } : {}) })
     .use(sessionPlugin)
-    .use(promptPlugin)
+    .use(promptPlugin, { maxChars: config.maxPromptChars ?? 48_000 })
     .use(loopPlugin)
     .use(compactionPlugin, {})
     .use(skillsPlugin)
     .use(commandsPlugin)
+    .use(evidencePlugin)
     .use(initPlugin)
     // Disk plugin discovery (.flavorlite/plugins). Mounts last so loaded
     // plugins can inject every default service; hosts call init() after
     // start() since discovery is async.
-    .use(pluginsLoaderPlugin, { runtime })
+    .use(pluginsLoaderPlugin, { runtime, profile: config.profile ?? "coding" })
+    .use(diagnosticsPlugin)
     // On-demand recall + idle ejection for dynamic plugins. Mounted after
     // the loader so its hooks wrap every request and tool call.
     .use(routerPlugin)
@@ -95,7 +103,7 @@ export function createAgent(options: BootstrapOptions = {}): AgentHandle {
   // Generic provider check: whichever plugins registered adapters count,
   // built-in or third-party. Fail loud at startup, never mid-conversation.
   const llm = runtime.ctx.get("llm") as LlmService;
-  if (llm.providers().length === 0) {
+  if ((options.requireProvider ?? true) && llm.providers().length === 0) {
     throw new Error(
       "No model provider configured. Set OPENAI_API_KEY or ANTHROPIC_API_KEY (see .env.example), or mount a provider plugin.",
     );

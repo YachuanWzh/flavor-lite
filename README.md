@@ -14,7 +14,7 @@ steering messages, tool hooks), while staying small and fast.
 
 - **Zero SDK dependencies** — provider adapters are raw `fetch` + SSE (the only runtime dependency is `zod`)
 - **No second-pass review models** — one stream, straight to the terminal
-- **Eager topological startup** — plugin order resolved once, zero runtime dispatch overhead
+- **Profiled lazy startup** — only startup plugins are imported; dynamic and manual plugins stay manifest-only until recalled
 - **Real-time streaming** — text deltas render the instant they arrive
 - **Retries only where they pay** — network/rate-limit backoff before anything is emitted
 
@@ -53,6 +53,8 @@ src/
     llm/         capability seam: adapter registry, "provider:model" refs, pure fetch SSE;
                  provider plugins (provider:openai / provider:anthropic) self-register adapters from credentials
     tools/       capability seam: ToolRegistry + before/after-call waterfalls + 7 builtin tools
+    artifacts/   bounded full-output store; transcripts keep compact references
+    evidence/    required evidence ledger + deterministic run evaluation
     permission/  plan|default|acceptEdits|bypass + hard dangerous-command blocks (a tools hook) + mode-aware prompt section
     session/     JSONL persistence under .flavorlite/sessions (model-visible ⇔ logged)
     prompt/      pure assembler: runs prompt/assemble over empty sections, dedupes, joins
@@ -61,7 +63,9 @@ src/
     compaction/  proactive + reactive history trimming (loop hooks, no loop changes)
     skills/      SKILL.md discovery → prompt section
     commands/    slash-command registry seam
+    diagnostics/ /doctor-style prompt, artifact, and ownership inspection
     init/        FLAVOR.md project guide + /init generator
+  evals/       fixture-based coding-agent regression harness
   host/        config merge, terminal interaction, rendering, REPL, bootstrap
   cli.ts       thin binary: flags → createAgent() → REPL or one-shot
 ```
@@ -88,9 +92,11 @@ src/
 
 The kernel fails loud and stays observable: typed errors with stable codes
 and structured details, service ownership with explicit `{ override: true }`,
-declared `provides` contracts, atomic plugin reloads, bounded async
-activation, resource caps, an event bus, and `runtime.inspect()` /
-`runtime.plan()` for introspection.
+declared `provides` contracts, evidence-backed completion, atomic plugin
+reloads, bounded prompt/tool output, content-addressed rollback snapshots,
+versioned redacted telemetry, and `runtime.inspect()` / `runtime.plan()` for
+introspection. Generated plugins run in permission-restricted subprocesses and
+reach host capabilities only through the normal permission-aware tool broker.
 
 ### Self-evolution
 
@@ -105,12 +111,15 @@ forms — repeated memory topics become `SKILL.md` drafts, heavily used skills
 become plugin scaffolds (`/ladder to-skill`, `/ladder to-plugin`) — while
 `/evolve export` writes clean SFT trajectories, `/evolve learn` writes
 confirmed router-recall tokens back into plugin manifests, and `/evolve
-suggest` merges analyzed error-monitor records into its proposals. See
+suggest` merges analyzed error-monitor records into its proposals. Daily
+candidate/verification budgets, consecutive-failure circuit breaking,
+candidate quarantine, signal decay, and asset governance keep that loop
+bounded and reversible. See
 `docs/self-evolve.md` and the specs in `docs/specs/`.
 
 ### Extension points
 
-- Services: `hooks`, `llm`, `tools`, `permission`, `interaction`, `session`, `systemPrompt`, `agent`, `commands`, `skills`
+- Services: `hooks`, `llm`, `tools`, `artifacts`, `evidence`, `permission`, `interaction`, `session`, `systemPrompt`, `agent`, `commands`, `skills`, `telemetry`, `pluginsLoader`
 - Waterfall hooks: `tools/before-call`, `tools/after-call`, `prompt/assemble`, `loop/before-request`, `loop/compact`
 
 A plugin looks like this:
@@ -146,9 +155,33 @@ entry whose default export is a plain plugin object — full contract in
 
 ```text
 › /plugin new my-plugin     scaffold a plugin dir from the template
-› /plugin reload my-plugin  edit index.js, hot reload — no restart
+› /plugin reload my-plugin  verify + atomic takeover; old code survives failure
 › /plugin list              load status; broken plugins are isolated as "error"
+› /plugin doctor            ABI, dependency, platform, and collision diagnostics
+› /plugin explain my-plugin activation and compatibility rationale
 ```
+
+Disk manifests use ABI v1 and support `minimal`, `coding`, and `full`
+activation profiles. Dynamic/manual plugins are not imported at discovery,
+which keeps startup cost proportional to the selected profile. See
+[`docs/plugin-dev.md`](docs/plugin-dev.md) for the complete contract.
+
+### MCP and evaluations
+
+`mcp-bridge` exposes configured stdio MCP servers as ordinary permission-aware
+tools without adding an SDK dependency. Configure `.flavorlite/mcp.json`, then
+activate it with `/plugin reload mcp-bridge` or a matching request.
+
+Regression cases live in `evals/*.json` and use isolated fixture copies:
+
+```bash
+node dist/cli.js eval evals/smoke.json
+node dist/cli.js doctor --profile coding
+```
+
+Eval results append to `.flavorlite/evals/results.jsonl`; declared checks, tool
+errors, token counts, iteration counts, and duration are retained for trend
+comparison.
 
 Coding agents: the `create-flavor-plugin` skill (`.flavorlite/skills/`)
 teaches this workflow, so an agent can develop and hot-load a compliant
@@ -164,6 +197,10 @@ plugin end to end.
 | `/permissions [mode]` | show or switch permission mode |
 | `/sessions`, `/resume [id]`, `/new` | session management |
 | `/plugin list`, `/plugin reload [name]`, `/plugin new <name>` | disk plugin management with hot reload |
+| `/plugin doctor`, `/plugin explain <name>`, `/plugin verify --all` | compatibility, activation, and self-test diagnostics |
+| `/prompt inspect`, `/artifacts`, `/why <plugin-or-tool>` | inspect prompt budget, retained output, and ownership |
+| `/evidence show`, `/evolve budget`, `/governance status` | inspect completion evidence and self-evolution controls |
+| `/mcp list` | inspect configured MCP servers after bridge activation |
 | input while running | becomes a **steering** message for the next model request |
 | `Ctrl+C` while running | aborts the current turn (second press exits) |
 
@@ -177,11 +214,9 @@ Configuration merges from (low → high): `~/.flavorlite/config.json`,
 ## Development
 
 ```bash
-npm test          # 379 tests (27 files): kernel (42), loop, permission, session, compaction,
-                  # plus disk plugins, router, memory, error-monitor, subagent,
-                  # skill-distiller, task-planner, evolve, knowledge-promoter, ...
+npm test          # kernel, protocol, disk-plugin, evolution, and regression tests
 npm run typecheck # strict + noUncheckedIndexedAccess
-npm run build     # tsup → dist/ (index + cli)
+npm run build     # tsup → dist/ (index + cli); npm pack also emits declarations
 ```
 
 Requirements: Node 20+. See [CHANGELOG.md](CHANGELOG.md) for release notes.

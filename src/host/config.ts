@@ -16,6 +16,17 @@ const configSchema = z
     model: z.string().optional(),
     mode: z.enum(PERMISSION_MODES).optional(),
     maxIterations: z.number().int().positive().optional(),
+    maxPromptChars: z.number().int().positive().optional(),
+    maxToolOutputChars: z.number().int().positive().optional(),
+    profile: z.enum(["minimal", "coding", "full"]).optional(),
+    artifacts: z
+      .object({
+        path: z.string().optional(),
+        maxFiles: z.number().int().positive().optional(),
+        maxAgeDays: z.number().positive().optional(),
+      })
+      .partial()
+      .optional(),
     openai: z
       .object({
         apiKey: z.string().optional(),
@@ -91,6 +102,15 @@ function fromEnv(): FlavorConfig {
   if (env.FLAVOR_MODEL) config.model = env.FLAVOR_MODEL;
   if (env.FLAVOR_MODE && (PERMISSION_MODES as readonly string[]).includes(env.FLAVOR_MODE)) {
     config.mode = env.FLAVOR_MODE as PermissionMode;
+  }
+  if (env.FLAVOR_PROFILE && ["minimal", "coding", "full"].includes(env.FLAVOR_PROFILE)) {
+    config.profile = env.FLAVOR_PROFILE as "minimal" | "coding" | "full";
+  }
+  if (env.FLAVOR_MAX_PROMPT_CHARS && Number.isFinite(Number(env.FLAVOR_MAX_PROMPT_CHARS))) {
+    config.maxPromptChars = Number(env.FLAVOR_MAX_PROMPT_CHARS);
+  }
+  if (env.FLAVOR_MAX_TOOL_OUTPUT_CHARS && Number.isFinite(Number(env.FLAVOR_MAX_TOOL_OUTPUT_CHARS))) {
+    config.maxToolOutputChars = Number(env.FLAVOR_MAX_TOOL_OUTPUT_CHARS);
   }
   if (env.OPENAI_API_KEY || env.OPENAI_BASE_URL || env.FLAVOR_OPENAI_MODEL) {
     config.openai = {

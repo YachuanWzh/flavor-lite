@@ -14,6 +14,8 @@ import { renderEvent, yellow, type UiService } from "./host/render";
 import { terminalInteractionPlugin } from "./host/interaction";
 import { PERMISSION_MODES, type PermissionMode } from "./plugins/permission";
 import type { PluginsLoaderService } from "./plugins/plugins";
+import type { PluginProfile } from "./plugins/plugins";
+import { runEvalSuite } from "./evals";
 
 /** Discover and mount disk plugins (.flavorlite/plugins); failures stay isolated. */
 async function initDiskPlugins(handle: ReturnType<typeof createAgent>): Promise<void> {
@@ -31,6 +33,9 @@ interface CliArgs {
   resume?: string;
   prompt?: string;
   help: boolean;
+  doctor: boolean;
+  profile?: PluginProfile;
+  evalPath?: string;
 }
 
 const HELP = `flavor-lite — everything is a plugin
@@ -38,19 +43,22 @@ const HELP = `flavor-lite — everything is a plugin
 Usage:
   flavor-lite [options]
   flavor-lite -p "your task"      run one task and exit
+  flavor-lite doctor              inspect runtime and plugin compatibility
+  flavor-lite eval <file|dir>     run repository-task evaluation cases
 
 Options:
   -p, --print <prompt>   one-shot mode: run the prompt, stream output, exit
   -m, --model <ref>      model ref, "provider:model" form
   -M, --mode <mode>      permission mode: ${PERMISSION_MODES.join(" | ")}
   -r, --resume <id>      resume a previous session (default: latest)
+  --profile <name>       plugin profile: minimal | coding | full
   -h, --help             show this help
 
 Config sources (low → high): ~/.flavorlite/config.json, .flavorlite/flavor.json,
 environment (.env supported), CLI flags. See .env.example for API keys.`;
 
 function parseArgs(argv: string[]): CliArgs {
-  const args: CliArgs = { help: false };
+  const args: CliArgs = { help: false, doctor: false };
   for (let i = 0; i < argv.length; i++) {
     const flag = argv[i];
     const next = () => argv[++i];
@@ -76,6 +84,21 @@ function parseArgs(argv: string[]): CliArgs {
       case "--resume":
         args.resume = next() ?? "latest";
         break;
+      case "doctor":
+      case "--doctor":
+        args.doctor = true;
+        break;
+      case "eval":
+        args.evalPath = next() ?? "evals";
+        break;
+      case "--profile": {
+        const value = next();
+        if (!(["minimal", "coding", "full"] as string[]).includes(value ?? "")) {
+          throw new Error(`invalid --profile "${value}" (available: minimal, coding, full)`);
+        }
+        args.profile = value as PluginProfile;
+        break;
+      }
       case "-h":
       case "--help":
         args.help = true;
@@ -103,7 +126,39 @@ async function main(): Promise<void> {
   const overrides = {
     ...(args.model ? { model: args.model } : {}),
     ...(args.mode ? { mode: args.mode } : {}),
+    ...(args.profile ? { profile: args.profile } : {}),
   };
+
+  if (args.doctor) {
+    const handle = createAgent({ config: overrides, requireProvider: false });
+    try {
+      await initDiskPlugins(handle);
+      const loader = handle.runtime.ctx.get("pluginsLoader") as PluginsLoaderService;
+      const report = await loader.doctor();
+      console.log(
+        [
+          `flavor doctor: ${report.ok ? "OK" : "FAILED"}`,
+          `profile=${report.profile} node=${report.node} platform=${report.platform}`,
+          `plugins: ${report.loaded} loaded, ${report.unloaded} unloaded, ${report.errors} errors`,
+          ...report.issues.map((issue) => `${issue.level.toUpperCase()} ${issue.code}${issue.plugin ? ` [${issue.plugin}]` : ""}: ${issue.message}`),
+        ].join("\n"),
+      );
+      if (!report.ok) process.exitCode = 1;
+    } finally {
+      await handle.dispose();
+    }
+    return;
+  }
+
+  if (args.evalPath) {
+    const suite = await runEvalSuite(args.evalPath, { config: overrides });
+    for (const result of suite.results) {
+      console.log(`${result.passed ? "PASS" : "FAIL"} ${result.id} ${result.durationMs}ms tools=${result.toolCalls} errors=${result.toolErrors} tokens=${result.inputTokens + result.outputTokens}${result.error ? ` error=${result.error}` : ""}`);
+    }
+    console.log(`eval pass rate: ${(suite.passRate * 100).toFixed(1)}% (${suite.durationMs}ms)`);
+    if (!suite.passed) process.exitCode = 1;
+    return;
+  }
 
   if (args.prompt) {
     // One-shot: same plugin stack, one turn, no REPL chrome.

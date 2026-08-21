@@ -3,7 +3,7 @@
   "version": "0.1.1",
   "entry": "index.js",
   "description": "Apply guarded multi-file create, replace and delete operations as one rollback-capable transaction.",
-  "activation": "eager",
+  "activation": "dynamic",
   "capabilities": ["files"],
   "triggers": {
     "keywords": ["patch", "transaction", "批量修改", "原子修改"],

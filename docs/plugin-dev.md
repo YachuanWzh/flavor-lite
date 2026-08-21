@@ -37,9 +37,16 @@ Directories without a `flavor-plugin.json` are ignored.
 
 ```json
 {
+  "manifestVersion": 1,
+  "apiVersion": "1",
   "name": "my-plugin",
   "version": "0.1.0",
   "entry": "index.js",
+  "activation": "dynamic",
+  "profiles": ["coding", "full"],
+  "requires": { "services": ["hooks", "tools"] },
+  "engines": { "node": ">=22" },
+  "triggers": { "keywords": ["my capability"] },
   "description": "One sentence shown in /plugin list contexts.",
   "config": { "greeting": "hi" }
 }
@@ -47,17 +54,42 @@ Directories without a `flavor-plugin.json` are ignored.
 
 | Field | Required | Meaning |
 |---|---|---|
+| `manifestVersion` | no | Manifest format; currently `1` (default) |
+| `apiVersion` | no | Host ABI; currently `"1"` (default), incompatible values fail before import |
 | `name` | yes | Unique plugin identity (discovery key, reload key) |
 | `version` | no | Free-form, defaults to `0.0.0` |
 | `entry` | no | Entry file relative to the plugin dir; default `index.js` |
 | `description` | no | Human-readable summary |
 | `config` | no | JSON object passed as the `config` argument of every plugin's `apply(ctx, config)` |
+| `activation` | no | `eager`, `background`, `dynamic` (default), or `manual` |
+| `profiles` | no | Activation visibility in `minimal`, `coding`, and/or `full` |
+| `requires` | no | Required `services`, `executables`, and environment variable names |
+| `engines.node` | no | Supported Node range such as `>=22` |
+| `platforms` | no | Allowed `win32`, `linux`, or `darwin` hosts |
+| `provides` | no | Exact host services exported by the entry; checked against its default export |
+| `triggers` | no | Router keywords and regex patterns; syntax is checked before entry import |
+| `resourceBudget` | no | Generated-process memory, call timeout, and output-size limits |
+| `selfTest` | no | Optional verification command metadata |
+| `lifecycle` | no | `active`, `candidate`, or `quarantined`; only active entries auto-load |
 | `origin` | no | `"user"` (default, human-written) or `"generated"` (scaffolded by the agent). The permission engine holds generated plugins to tighter defaults |
 | `generatedFrom` | no | Provenance of a generated plugin: session id or ISO timestamp |
 | `capabilities` | no | Array of `"shell"` / `"network"` / `"files"` / `"host"` a generated plugin may exercise (see capability tiering below) |
 
-Invalid JSON or a missing `name` marks the plugin `error` in `/plugin list`;
-the rest of the host keeps running.
+Invalid JSON, ABI incompatibility, a bad trigger regex, or missing requirements
+mark the plugin `error` in `/plugin list`; the rest of the host keeps running.
+`/plugin doctor` reports these conditions without requiring an LLM provider,
+and `/plugin explain <name>` shows why an entry is loaded or deferred.
+
+### Activation and profiles
+
+- `eager`: imported during startup for the selected profile.
+- `background`: startup-loaded except in `minimal`; use for low-cost observers.
+- `dynamic`: manifest-only until router recall or explicit reload.
+- `manual`: manifest-only until explicitly reloaded.
+
+Discovery never imports deferred entries. This makes a large plugin catalog
+cheap: only manifests are parsed, while code and transitive dependencies stay
+cold. `FLAVOR_PROFILE=minimal|coding|full` or `--profile` selects the profile.
 
 ### Capability tiering for generated plugins
 
@@ -71,10 +103,15 @@ permission engine then applies a manifest contract to tools owned by
 - **Declared capability → forced approval.** The first call per
   plugin+capability+path-scope asks the user, even in `acceptEdits`.
   Only `bypass` skips the prompt (never the undeclared-capability block).
-- `"network"` and `"host"` are declared-and-displayed only — no per-call
-  seam observes them today; `/plugin list` shows them next to the plugin.
+- `"network"` and `"host"` are enforced by the generated-process capability
+  broker just like `"files"` and `"shell"`.
 
-`read` and `control` category tools are ungated. The scaffolds written by
+Generated entry modules are imported only in a permission-restricted child
+process. Their tools, commands, and prompt sections are JSON-RPC proxies; any
+host action must cross the capability broker and then the ordinary permission
+hooks. Generated plugins cannot provide arbitrary in-process services.
+
+`read` category tools remain permission-light. The scaffolds written by
 `/evolve improve` and `/ladder to-plugin` already stamp `origin` /
 `generatedFrom`; add `capabilities` yourself when the plugin needs them.
 
@@ -141,7 +178,9 @@ plugin loads):
 | Key | Service | Typical use |
 |---|---|---|
 | `hooks` | `hook(name, listener)` / `waterfall(name, value)` | Attach to any waterfall below |
-| `tools` | `register(tool)` → disposer | Add a model-callable tool |
+| `tools` | `register(tool)` → disposer | Add a model-callable tool; exposes ownership and in-flight leases |
+| `artifacts` | `put/read/list/prune` | Store complete large outputs outside the transcript |
+| `evidence` | `begin/record/evaluate/latest` | Record required verification evidence and evaluate a run |
 | `commands` | `register(command)` → disposer | Add a `/slash` command |
 | `systemPrompt` | `assemble()` | Read the assembled prompt |
 | `llm` | `providers()`, `defaultRef()`, `registerAdapter()` | New model providers |
@@ -151,7 +190,7 @@ plugin loads):
 | `skills` | `discover()` | Skill discovery |
 | `interaction` | terminal ask/confirm (when mounted) | Interactive prompts |
 | `pluginsLoader` | `init/reload/list/scaffold` | Meta: manage plugins |
-| `telemetry` | `record(event)` / `events(query?)` | Unified signal feed (.flavorlite/telemetry.jsonl); fire-and-forget, never throws |
+| `telemetry` | `record/events/reduce` | Versioned, redacted signal feed plus deterministic projection |
 | `repl` | `registerCompleter(provider)` → disposer | Add `/`-completion candidates in the REPL |
 
 `repl` exists only while the interactive REPL is running (not in one-shot
@@ -169,13 +208,20 @@ ctx.get("tools").register({
   category: "read",                      // read | write | shell | control
   inputSchema: { type: "object", properties: { /* JSON Schema */ } },
   async execute(args, execCtx) {         // execCtx: { cwd, signal?, onUpdate? }
-    return { content: "result text" };   // { content, isError? } — never throw
+    return {
+      content: "result text",
+      evidence: [{ kind: "test", ok: true, required: true, summary: "12 passed" }],
+      diagnostics: [],
+      artifacts: [],
+    }; // never throw for an expected tool failure
   },
 });
 ```
 
 `category` drives the permission engine: `read` is always allowed, `write` /
-`shell` follow the current permission mode.
+`shell` follow the current permission mode. If `content` exceeds the configured
+transcript budget, the full payload is stored through `artifacts` and the model
+receives a bounded preview plus a stable reference.
 
 ### Contributing to the system prompt
 
@@ -184,12 +230,20 @@ the `prompt/assemble` waterfall:
 
 ```js
 ctx.get("hooks").hook("prompt/assemble", async (event, next) => {
-  event.sections.push({ name: "my-plugin", content: "Instructions for the model." });
+  event.sections.push({
+    name: "my-plugin",
+    content: "Instructions for the model.",
+    priority: 60,
+    maxChars: 4000,
+    source: "my-plugin",
+  });
   return next(event);   // ALWAYS delegate unless you intentionally short-circuit
 });
 ```
 
-Same-name sections: last one wins. Section order follows mount order.
+Same-name sections: last one wins. Section order follows mount order. The
+assembler enforces per-section and global character budgets, dropping the
+lowest-priority material first; `/prompt inspect` explains the result.
 
 ## Waterfall hooks
 
@@ -207,15 +261,15 @@ short-circuit.
 
 ## Hot reload semantics
 
-- `/plugin reload <name>`: unmount (disposers run in reverse mount order) →
-  re-import the entry with a cache-busting query → remount. Your changes are
-  live immediately.
+- `/plugin reload <name>`: verify and activate the replacement first, wait for
+  old in-flight tool calls, then atomically transfer registrations. Your
+  changes are live without an availability gap.
 - `/plugin reload` (no name): full re-discovery; also picks up newly created
   plugin dirs and forgets removed ones.
-- Reload failures never crash the host: the previous version is already
-  unmounted, the new failure shows up in `/plugin list` as `error`.
-- Don't reload while a turn is mid-flight (a tool call of the old version may
-  still be running); prefer idle moments.
+- Reload failures never crash the host and leave the previous active version
+  untouched. Successful content-addressed snapshots support `/plugin revert`.
+- In-flight tool leases are drained before takeover, so targeted reload is safe
+  during a turn (subject to the configured timeout).
 - SDK hosts replacing a service provider that still has consumers should use
   `runtime.reload(name, plugin, config)`: the replacement activates first and
   takes over the old instance's registrations atomically — consumers never

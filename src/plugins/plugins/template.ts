@@ -16,10 +16,15 @@ export const PLUGIN_TEMPLATE_FILES: TemplateFile[] = [
     render: (name) =>
       JSON.stringify(
         {
+          manifestVersion: 1,
+          apiVersion: "1",
           name,
           version: "0.1.0",
           entry: "index.js",
           description: "Describe what this plugin does.",
+          activation: "dynamic",
+          requires: { services: ["hooks", "tools", "commands"] },
+          triggers: { tools: [`${name}_hello`], commands: [name] },
         },
         null,
         2,
