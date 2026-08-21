@@ -177,7 +177,7 @@ Configuration merges from (low → high): `~/.flavorlite/config.json`,
 ## Development
 
 ```bash
-npm test          # 320 tests: kernel (42), loop, permission, session, compaction,
+npm test          # 379 tests (27 files): kernel (42), loop, permission, session, compaction,
                   # plus disk plugins, router, memory, error-monitor, subagent,
                   # skill-distiller, task-planner, evolve, knowledge-promoter, ...
 npm run typecheck # strict + noUncheckedIndexedAccess

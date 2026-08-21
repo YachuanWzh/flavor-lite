@@ -17,15 +17,21 @@
 | 命令 | 用途 |
 |---|---|
 | `/evolve signals` | 查看捕获的失败信号 |
-| `/evolve suggest` | 查看达到阈值的改进建议 |
+| `/evolve suggest` | 查看达到阈值的改进建议(失败、成功 trigram、error-monitor 分析) |
+| `/evolve episodes` | 查看可信进化 episode 及其状态 |
 | `/evolve improve <id>` | 为建议生成修复插件脚手架 |
+| `/evolve baseline <id> <command>` | 为 episode 捕获失败基线(regression 必须先红) |
 | `/evolve verify <plugin>` | 沙箱 dry-run 验证候选插件 |
 | `/evolve revert <plugin>` | 恢复插件上一可用版本 |
-| `/evolve test` | 运行配置的测试命令 |
-| `/evolve done <id>` | 标记建议已处理 |
+| `/evolve test [id]` | 运行聚焦回归 + test/typecheck/build;标记 episode 已验证 |
+| `/evolve done <id>` | 标记建议已处理(接受已验证 episode) |
+| `/evolve dismiss <id>` | 关闭建议但不处理(支持 `em:` 记录) |
+| `/evolve export [limit]` | 导出有界的干净会话轨迹到 `.flavorlite/evolve/sft.jsonl` |
 | `/evolve learn` | 把已确认的路由触发词写回插件 manifest |
-| `/evolve export [count]` | 导出有界的干净会话轨迹 |
 | `/evolve clear` | 清理 signals、patterns 和 done markers |
+
+生命周期:`improve` → `baseline` → `verify`/`reload` → `test` → `done`,episode 会经历
+`implemented → verified → canary → accepted`;验证失败或 canary 回归会拒收并回退。
 
 ## Configuration
 
@@ -33,7 +39,15 @@
 |---|---:|---|
 | `promptTop` | `3` | 注入 prompt 的建议数量 |
 | `minRepeats` | `2` | 失败达到建议阈值的次数 |
+| `patternThreshold` | `3` | 成功 trigram 达到工具提议阈值的次数 |
+| `patternTop` | `2` | 注入 prompt 的 trigram 提议数量 |
 | `testCommand` | `npm test` | 候选修复验证命令 |
 | `testTimeoutMs` | `120000` | 验证超时 |
+| `verificationCommands` | `[testCommand, npm run typecheck, npm run build]` | `/evolve test` 依次运行的验证命令组 |
+| `canaryRuns` | `3` | episode 验收所需的干净 canary 运行次数 |
+| `emConfidence` | `0.7` | error-monitor 分析进入建议池的最低置信度 |
+| `exportLimit` | `20` | `/evolve export` 默认导出上限 |
+| `learnMinSupport` | `3` | `/evolve learn` 触发词候选的最小支持度 |
+| `learnMinPrecision` | `0.75` | `/evolve learn` 触发词候选的最小精度 |
 
 安全边界：只处理达到阈值的 suggestion；生成内容受插件目录治理；验证成功前不应启用候选；任何修改仍受普通 write 权限控制。卸载时所有服务、hook、工具和命令都会撤销。
